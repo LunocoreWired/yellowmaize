@@ -82,9 +82,9 @@ CUDNN_BENCHMARK = False
 # ══════════════════════════════════════════════════════════════════════════════
 BOUNCER_TARGET_PER_CLASS = 25_000  # 25k maize + 25k non-maize = 50k
 BOUNCER_IMG_SIZE = 224
-BOUNCER_BATCH_SIZE = 32
+BOUNCER_BATCH_SIZE = 40
 BOUNCER_EPOCHS = 15
-BOUNCER_LR = 1e-4
+BOUNCER_LR = 1.25e-4
 BOUNCER_WEIGHT_DECAY = 1e-4
 BOUNCER_VAL_SPLIT = 0.20  # internal 80/20
 BOUNCER_PATIENCE = 5

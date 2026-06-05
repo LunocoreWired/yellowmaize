@@ -41,19 +41,6 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from albumentations.pytorch import ToTensorV2
-from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    roc_auc_score,
-    roc_curve,
-)
-from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler, random_split
-from torchvision import models
-from torchvision.models import (
-    MobileNet_V2_Weights,
-    MobileNet_V3_Large_Weights,
-)
-
 from config import (
     BOUNCER_BATCH_SIZE,
     BOUNCER_CKPT_DIR,
@@ -74,6 +61,18 @@ from config import (
 )
 from image_utils import load_image_clahe  # EXIF correction + CLAHE
 from scripts.safe_collate import get_skip_count, reset_skip_counter, safe_collate
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    roc_curve,
+)
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler, random_split
+from torchvision import models
+from torchvision.models import (
+    MobileNet_V2_Weights,
+    MobileNet_V3_Large_Weights,
+)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SETUP
@@ -910,6 +909,12 @@ def main() -> None:
     for variant in ["mobilenet_v2", "mobilenet_v3_large", "edgevit_xxs"]:
         row = train_variant(variant)
         comparison_rows.append(row)
+
+        # ---TO PREVENT OOM CRASHES ---
+        import gc
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
     # ── Gabor+LBP baseline (no training) ─────────────────────────────────────
     print(f"\n{'─' * 60}")

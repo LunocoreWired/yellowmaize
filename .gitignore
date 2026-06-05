@@ -9,3 +9,6 @@ dataset/
 sam2/
 __pycache__/
 quarantine/
+checkpoints/
+data/
+logs/

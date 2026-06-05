@@ -1,0 +1,20 @@
+Yellow MAIze — Preprocessing Summary
+==================================================
+Total files scanned     : 321,915
+Rejected (all reasons)  : 70,209
+Flagged (review needed) : 329
+Final valid images      : 181,510
+
+Rejection reasons:
+  exact_duplicate_of                  69,346
+  cross_class_exact_duplicate            540
+  phash_near_duplicate                   302
+  too_large                               10
+  cross_class_near_duplicate               8
+  truncated_or_corrupt                     3
+
+Split breakdown:
+  Class           Train      Val     Test
+  HEALTHY        54,068   11,586   11,587
+  MSV            27,460    5,884    5,885
+  MLN            45,528    9,756    9,756
