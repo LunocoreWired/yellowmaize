@@ -330,34 +330,43 @@ def _popcount_array(x: np.ndarray) -> np.ndarray:
 
 
 def phash_dedup_within_class(paths: list[Path], cls: str,
-                              rejected: list[dict],
-                              executor: ProcessPoolExecutor) -> list[Path]:
+                              rejected: list[dict]) -> list[Path]:
     """
     Near-duplicate removal within one class.
 
-    Hashes are computed in parallel (reuses the caller's executor).
+    Hash computation is I/O + PIL decode → ThreadPoolExecutor (not Process).
+    Using a ProcessPoolExecutor here causes worker processes to re-evaluate the
+    module-level `try: import imagehash` and silently set PHASH_AVAILABLE=False
+    in the subprocess, returning None for every hash and skipping all dedup.
+
     Duplicate detection uses vectorised numpy XOR + popcount → O(n) per image
     against a growing array of kept hashes, vs the old O(n²) Python loop.
     """
     if not PHASH_AVAILABLE:
         return paths
 
-    # ── Compute hashes in parallel ────────────────────────────────────────────
-    args = [(p, cls) for p in paths]
+    max_workers = max(1, (os.cpu_count() or 1) - 2)
+
+    # ── Compute hashes in parallel (threads, not processes) ───────────────────
     hash_map: dict[Path, str] = {}
-    futures = {executor.submit(compute_phash, p): p for p in paths}
-    for fut in as_completed(futures):
-        p = futures[fut]
-        h = fut.result()
-        if h is not None:
-            hash_map[p] = h
-        else:
-            rejected.append({"path": str(p), "category": cls,
-                              "reason": "phash_failed"})
-            quarantine_file(p, "phash_failed", cls)
+    with ThreadPoolExecutor(max_workers=max_workers) as tex:
+        futures = {tex.submit(compute_phash, p): p for p in paths}
+        for fut in as_completed(futures):
+            p = futures[fut]
+            try:
+                h = fut.result()
+            except Exception as exc:
+                print(f"  [WARN] pHash failed for {p.name}: {exc}")
+                h = None
+            if h is not None:
+                hash_map[p] = h
+            else:
+                rejected.append({"path": str(p), "category": cls,
+                                  "reason": "phash_failed"})
+                quarantine_file(p, "phash_failed", cls)
 
     # ── Vectorised dedup ──────────────────────────────────────────────────────
-    kept: list[Path]   = []
+    kept: list[Path]    = []
     kept_ints: list[int] = []          # uint64 ints for XOR comparisons
 
     for p in paths:                    # iterate in original order for determinism
@@ -366,7 +375,7 @@ def phash_dedup_within_class(paths: list[Path], cls: str,
             continue                   # already logged above
         h_int = int(h, 16)
         if kept_ints:
-            arr      = np.array(kept_ints, dtype=np.uint64)
+            arr       = np.array(kept_ints, dtype=np.uint64)
             distances = _popcount_array(arr ^ np.uint64(h_int))
             if int(distances.min()) <= PHASH_HAMMING_THRESHOLD:
                 rejected.append({"path": str(p), "category": cls,
@@ -383,32 +392,39 @@ def phash_dedup_within_class(paths: list[Path], cls: str,
 # STEP 9 — CROSS-CLASS pHASH DUPLICATE
 # ══════════════════════════════════════════════════════════════════════════════
 def phash_cross_class_check(all_images: dict[str, list[Path]],
-                             rejected: list[dict],
-                             executor: ProcessPoolExecutor) -> dict[str, list[Path]]:
+                             rejected: list[dict]) -> dict[str, list[Path]]:
     """
     After within-class dedup, check for near-duplicates across classes.
     These are especially dangerous — same image, conflicting labels.
 
     Old approach: O(n²) nested Python loop.
     New approach:
-      - Compute any missing hashes in parallel.
+      - Compute hashes in parallel with ThreadPoolExecutor (avoids worker
+        re-import issues that silently break imagehash in ProcessPoolExecutor).
       - For each image, do a single vectorised XOR against ALL other-class hashes
         in one numpy call → effectively O(n) per image with tiny constants.
     """
     if not PHASH_AVAILABLE:
         return all_images
 
-    # ── Collect / compute hashes (reuse executor) ─────────────────────────────
+    max_workers = max(1, (os.cpu_count() or 1) - 2)
+
+    # ── Compute hashes in parallel (threads, not processes) ───────────────────
     flat: list[tuple[Path, str]] = [
         (p, cls) for cls, paths in all_images.items() for p in paths
     ]
-    futures = {executor.submit(compute_phash, p): (p, cls) for p, cls in flat}
     hash_map: dict[Path, tuple[str, str]] = {}   # path → (cls, hex_hash)
-    for fut in as_completed(futures):
-        p, cls = futures[fut]
-        h = fut.result()
-        if h is not None:
-            hash_map[p] = (cls, h)
+    with ThreadPoolExecutor(max_workers=max_workers) as tex:
+        futures = {tex.submit(compute_phash, p): (p, cls) for p, cls in flat}
+        for fut in as_completed(futures):
+            p, cls = futures[fut]
+            try:
+                h = fut.result()
+            except Exception as exc:
+                print(f"  [WARN] pHash failed for {p.name}: {exc}")
+                h = None
+            if h is not None:
+                hash_map[p] = (cls, h)
 
     # ── Build per-class uint64 arrays ─────────────────────────────────────────
     class_paths:  dict[str, list[Path]] = {cls: [] for cls in all_images}
@@ -665,30 +681,24 @@ def main() -> None:
         if removed > 0:
             print(f"    [{cls}] removed {removed:,} MD5 duplicates")
 
-    # ── Phases C & D share one long-lived executor to avoid repeated spawn cost ─
+    # ── Phase C: pHash near-duplicate within class (Step 8) ───────────────────
     print("\n  Phase C: pHash near-duplicate removal (within class, parallelised + vectorised) ...")
-    print("  Phase D: Cross-class pHash duplicate detection (vectorised) ...")
+    after_phash: dict[str, list[Path]] = {}
+    for cls in CLASSES:
+        paths = after_md5.get(cls, [])
+        before = len(paths)
+        after_phash[cls] = phash_dedup_within_class(paths, cls, all_rejected)
+        removed = before - len(after_phash[cls])
+        if removed > 0:
+            print(f"    [{cls}] removed {removed:,} pHash near-duplicates")
 
-    with ProcessPoolExecutor(max_workers=max_workers) as shared_executor:
-
-        # ── Phase C ───────────────────────────────────────────────────────────
-        after_phash: dict[str, list[Path]] = {}
-        for cls in CLASSES:
-            paths = after_md5.get(cls, [])
-            before = len(paths)
-            after_phash[cls] = phash_dedup_within_class(
-                paths, cls, all_rejected, shared_executor)
-            removed = before - len(after_phash[cls])
-            if removed > 0:
-                print(f"    [C] [{cls}] removed {removed:,} pHash near-duplicates")
-
-        # ── Phase D ───────────────────────────────────────────────────────────
-        after_crossclass = phash_cross_class_check(
-            after_phash, all_rejected, shared_executor)
-        for cls in CLASSES:
-            removed = len(after_phash.get(cls, [])) - len(after_crossclass.get(cls, []))
-            if removed > 0:
-                print(f"    [D] [{cls}] removed {removed:,} cross-class conflicts")
+    # ── Phase D: Cross-class pHash duplicate detection (Step 9) ───────────────
+    print("\n  Phase D: Cross-class pHash duplicate detection (vectorised) ...")
+    after_crossclass = phash_cross_class_check(after_phash, all_rejected)
+    for cls in CLASSES:
+        removed = len(after_phash.get(cls, [])) - len(after_crossclass.get(cls, []))
+        if removed > 0:
+            print(f"    [{cls}] removed {removed:,} cross-class conflicts")
 
     # ── Phase E: Stratified split ──────────────────────────────────────────────
     print("\n  Phase E: Stratified 70/15/15 split ...")
