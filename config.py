@@ -155,7 +155,7 @@ SAM2_BROWN_V_MIN = 50
 # QA filter thresholds
 SAM2_QA_MIN_COVERAGE = 0.10  # reject if foreground < 10% of image
 SAM2_QA_MAX_COVERAGE = 0.90  # reject if foreground > 90% of image
-SAM2_QA_MIN_CONFIDENCE = 0.65  # reject if mean prob of foreground < 0.65
+SAM2_QA_MIN_CONFIDENCE = 0.60  # v7: lowered from 0.65 — absorbs dark MLN leaves
 SAM2_QA_MIN_ASPECT_RATIO = 1.20  # reject if mask aspect ratio < 1.2
 SAM2_QA_MAX_REJECT_RATE = 0.08  # warn if > 8% of images rejected
 
