@@ -4,18 +4,20 @@
 ================================================================================
  PURPOSE:
    Pulls a mathematically reproducible, perfectly balanced stratified sample
-   (100 HEALTHY, 100 MSV, 100 MLN) from the Tier 1 dataset. 
-   Copies and RENAMES the raw images to include their ground-truth class, 
+   (100 HEALTHY, 100 MSV, 100 MLN) from the Tier 1 dataset.
+   Copies and RENAMES the raw images to include their ground-truth class,
    making manual annotation in Label Studio foolproof.
 ================================================================================
 """
 
 import shutil
 from pathlib import Path
+
 import pandas as pd
 
 # Import your existing configurations
-from config import TIER1_MANIFEST, DATA_DIR, CLASSES, SEED
+from config import CLASSES, DATA_DIR, SEED, TIER1_MANIFEST
+
 
 def main():
     print("=" * 72)
@@ -25,7 +27,7 @@ def main():
     # 1. Create the destination directory
     gold_dir = DATA_DIR / "label_studio_import"
     gold_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Clear out the old 150 images to prevent mixing
     print("  Clearing old export folder...")
     for item in gold_dir.iterdir():
@@ -54,19 +56,19 @@ def main():
 
     # 4. Copy and Rename the physical files
     print(f"\n  Copying and renaming {len(gold_df)} images to {gold_dir} ...")
-    
+
     success_count = 0
     new_filenames = []
 
     for _, row in gold_df.iterrows():
         src_path = Path(row["source_path"])
         category = row["category"]
-        
+
         # MAGIC TRICK: Prepend the category to the filename!
         # Example: MSV_original_filename.jpg
         dest_filename = f"{category}_{src_path.name}"
         dest_path = gold_dir / dest_filename
-        
+
         if src_path.exists():
             shutil.copy2(src_path, dest_path)
             new_filenames.append(dest_filename)
@@ -87,6 +89,7 @@ def main():
     print(f"  Folder ready for Label Studio: {gold_dir}")
     print(f"  Manifest saved to: {gold_manifest_path}")
     print("=" * 72)
+
 
 if __name__ == "__main__":
     main()
