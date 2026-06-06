@@ -138,9 +138,16 @@ yellowmaize/                               ← Project root (WSL2 working direct
 │   │   ├── mode_b/                        ← Factory mode B outputs
 │   │   ├── mode_c/                        ← Factory mode C outputs
 │   │   └── mode_d/                        ← Factory mode D outputs
-│   └── bouncer_dataset/
-│       ├── maize/                         ← 25k maize positives
-│       └── not_maize/                     ← 25k non-maize negatives
+│   ├── bouncer_dataset/
+│   │   ├── maize/                         ← 25k maize positives
+│   │   └── not_maize/                     ← 25k non-maize negatives
+│   ├── label_studio_import/               ← AUTO: sample_gold_standard.py output
+│   │   ├── {CLASS}_{filename}.jpg         ← 300 renamed images for upload
+│   │   └── _gold_standard_manifest_300.csv
+│   └── gold_standard/                     ← PUT LABEL STUDIO EXPORTS HERE
+│       ├── images/                        ← 300 gold standard images
+│       └── annotations/
+│           └── annotations.json           ← Label Studio JSON export (polygonlabels)
 │
 ├── checkpoints/                           ← AUTO-GENERATED
 │   ├── bouncer/
@@ -180,6 +187,9 @@ yellowmaize/                               ← Project root (WSL2 working direct
 │   ├── tier1_overlays/                    ← Teacher mask overlays
 │   ├── factory_summary.csv
 │   ├── factory_filter_breakdown.csv
+│   ├── gold_standard_iou_report.csv       ← AUTO: per-image IoU for SAM2/Teacher/Student
+│   ├── gold_standard_iou_summary.csv      ← AUTO: mean ± std per class + overall
+│   ├── gold_standard_overlays/            ← Comparison overlays (5 per class per artifact)
 │   ├── xai/
 │   │   ├── gradcam/
 │   │   ├── gradcamplusplus/
@@ -230,6 +240,8 @@ yellowmaize/                               ← Project root (WSL2 working direct
 ├── sample_15000.py                        ← Step 4
 ├── generate_tier1_masks.py               ← Step 5
 ├── validate_masks.py                      ← Step 6
+├── sample_gold_standard.py               ← Step 6b: extract 300-image gold standard set
+├── validate_gold_standard.py             ← Step 6c/6d/10b: SAM2→Teacher→Student IoU vs human
 ├── train_teacher.py                       ← Step 7
 ├── factory_master.py                      ← Step 8
 ├── train_student.py                       ← Step 9 + 10
@@ -1407,11 +1419,28 @@ python generate_tier1_masks.py
 python validate_masks.py
 # → review reports/tier1_overlays/ manually
 
+# STEP 6b: Extract 300-image gold standard set for human annotation
+python sample_gold_standard.py
+# → upload data/label_studio_import/ images to Label Studio
+# → annotate leaf silhouettes (polygonlabels)
+# → export JSON: Project → Export → JSON → rename to annotations.json
+# → place at: data/gold_standard/annotations/annotations.json
+# → copy same images to: data/gold_standard/images/
+
+# STEP 6c: Validate SAM2 masks against human annotations (run before Teacher)
+python validate_gold_standard.py --sam2-only
+# → review reports/gold_standard_iou_report.csv
+# → target: mean IoU ≥ GOLD_IOU_TARGET_MEAN (default 0.80)
+
 # STEP 7: Train all teacher variants
 python train_teacher.py
 
 # Generate Teacher charts (optional — can run at any time)
 python generate_charts.py --teacher
+
+# STEP 6d: Full chain validation — SAM2 + Teacher IoU vs human (run after Teacher)
+python validate_gold_standard.py
+# → reports/gold_standard_iou_summary.csv — thesis-ready chain comparison
 
 # STEP 8: Generate pseudo-labels (all 4 modes)
 python factory_master.py
@@ -1422,6 +1451,10 @@ python train_student.py --stage 1
 # STEP 10: Student Stage 2 — mode ablation (best encoder, 4 modes)
 # After Stage 1, check logs/student_comparison_stage1.csv for best encoder
 python train_student.py --stage 2 --encoder mobilenet_v2_cbam
+
+# STEP 10b: Final gold standard validation — full SAM2 → Teacher → Student chain
+python validate_gold_standard.py
+# → reports/gold_standard_iou_summary.csv — complete chain for thesis Chapter 3
 
 # Generate Student charts (optional — can run at any time)
 python generate_charts.py --student
@@ -1593,4 +1626,136 @@ matplotlib ≥ 3.7.0  (already in requirements.txt)
 pandas              (already in requirements.txt)
 numpy               (already in requirements.txt)
 No additional installs required.
+```
+
+---
+
+## PART 22 — GOLD STANDARD VALIDATION (sample_gold_standard.py + validate_gold_standard.py)
+
+### 22.1 Purpose
+Validate the pseudo-label foundation against human-annotated leaf silhouette masks.
+Required for thesis defense — without it, the committee can challenge whether
+SAM2 pseudo-masks were accurate enough to justify their use as Teacher training targets.
+
+Provides a chain comparison on the SAME 300 images:
+```
+SAM2 pseudo-mask → Teacher prediction → Student prediction
+       ↓                   ↓                    ↓
+     IoU vs           IoU vs               IoU vs
+   human mask        human mask           human mask
+```
+
+### 22.2 sample_gold_standard.py
+```
+Purpose:  Extract a reproducible stratified 300-image set for human annotation.
+          100 images per class (HEALTHY, MSV, MLN) from the Tier 1 manifest.
+          Renames files with class prefix so annotators know the ground-truth label.
+
+Output:
+  data/label_studio_import/
+    {CLASS}_{original_filename}.jpg      ← 300 renamed images
+    _gold_standard_manifest_300.csv      ← mini-manifest tracking all 300 images
+
+Config used:  TIER1_MANIFEST, DATA_DIR, CLASSES, SEED
+
+Human annotation workflow:
+  1. Upload data/label_studio_import/ images to Label Studio
+  2. Task: draw leaf silhouette polygons (polygonlabels type)
+  3. Export: Project → Export → JSON
+  4. Rename to annotations.json
+  5. Place at: data/gold_standard/annotations/annotations.json
+  6. Copy/symlink images to: data/gold_standard/images/
+```
+
+### 22.3 validate_gold_standard.py
+```
+Purpose:  Compute IoU between predicted masks (SAM2 / Teacher / Student)
+          and human-annotated polygons for the same 300 images.
+
+Inputs:
+  data/gold_standard/images/           ← 300 gold standard images
+  data/gold_standard/annotations/annotations.json  ← Label Studio JSON export
+  data/tier1_leaf_masks/{stem}_softmask.npy        ← SAM2 probability maps
+  checkpoints/teacher/teacher_model_best.pth       ← best Teacher
+  checkpoints/student/student_{enc}_{mode}_best.pth ← best Student
+
+Usage:
+  python validate_gold_standard.py              ← validate all three artifacts
+  python validate_gold_standard.py --sam2-only  ← SAM2 only (run before Teacher training)
+
+Run order:
+  Step 6c: --sam2-only  (after generate_tier1_masks.py, before train_teacher.py)
+  Step 6d: full run     (after train_teacher.py)
+  Step 10b: full run    (after train_student.py — for final thesis table)
+```
+
+### 22.4 Label Studio Annotation Parser
+```
+Accepts Label Studio JSON export format (polygonlabels type).
+Polygon points stored as percentage of image dimensions.
+Rasterized to binary mask at inference time using cv2.fillPoly().
+Multiple polygons per image merged via logical OR.
+Handles both list-of-tasks and single-task export formats.
+```
+
+### 22.5 IoU Computation
+```
+Binary IoU (Intersection over Union):
+  iou = intersection / union
+  Returns 0.0 if both masks are entirely empty (degenerate case).
+
+Thresholds (config.py):
+  GOLD_IOU_WARN_THRESHOLD = 0.75   ← per-image flag (below = suspicious)
+  GOLD_IOU_TARGET_MEAN    = 0.80   ← overall target (≥ this = foundation valid)
+```
+
+### 22.6 Metrics Reported
+```
+Per image:
+  sam2_iou, teacher_iou, student_iou  (−1 if unavailable)
+  *_warn flags (True if iou < GOLD_IOU_WARN_THRESHOLD)
+
+Per class (HEALTHY / MSV / MLN) per artifact:
+  mean IoU ± std, n, count below warning threshold
+
+Overall per artifact:
+  mean IoU ± std, n_total, n_below_warn, target_met (bool)
+
+Chain comparison table (thesis-ready):
+  Artifact | Overall mean IoU | Target met
+  SAM2     | x.xxxx           | Yes/No
+  Teacher  | x.xxxx           | Yes/No
+  Student  | x.xxxx           | Yes/No
+```
+
+### 22.7 Outputs
+```
+reports/gold_standard_iou_report.csv    ← per-image IoU for all 3 artifacts
+reports/gold_standard_iou_summary.csv   ← mean ± std per class + overall
+reports/gold_standard_overlays/         ← visual comparison PNGs (5 per class per artifact)
+  {stem}_sam2_overlay.jpg               ← Green=missed, Cyan=correct, Red=extra
+  {stem}_teacher_overlay.jpg
+  {stem}_student_overlay.jpg
+```
+
+### 22.8 Config Keys Required
+```
+GOLD_IMAGES_DIR         = DATA_DIR / "gold_standard" / "images"
+GOLD_ANNOTATION_FILE    = DATA_DIR / "gold_standard" / "annotations" / "annotations.json"
+GOLD_IOU_WARN_THRESHOLD = 0.75
+GOLD_IOU_TARGET_MEAN    = 0.80
+TEACHER_DEPLOYED_VARIANT = "efficientnet-b2"   ← variant used for Teacher inference
+```
+
+### 22.9 Thesis Reporting Template
+```
+Chapter 3 (Methodology):
+  "SAM2-generated pseudo-masks achieved a mean IoU of [value] ± [std] against
+   human-verified leaf silhouette annotations (n=300), validating their use as
+   pseudo-labels for Teacher model training."
+
+Chapter 4 (Results):
+  Table: Gold Standard IoU Chain Comparison
+  SAM2 → Teacher → Student progression shows [increasing/stable] IoU,
+  confirming pseudo-label quality is preserved through the distillation chain.
 ```
