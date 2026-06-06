@@ -217,6 +217,47 @@ def _apply_r3_area_filter(mask: np.ndarray) -> np.ndarray:
     return filtered
 
 
+def _compute_gabor_mask(img_rgb: np.ndarray, kernel_size: int, sigma: float,
+                       lambd: float, gamma: float, psi: float, theta: float) -> np.ndarray:
+    """Compute Gabor filter response for a single orientation."""
+    # Convert to grayscale
+    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    # Create Gabor kernel
+    kernel = cv2.getGaborKernel((kernel_size, kernel_size), sigma, theta, lambd, gamma, psi, ktype=cv2.CV_32F)
+    # Apply filter
+    filtered = cv2.filter2D(gray, cv2.CV_8UC3, kernel)
+    # Normalize to 0-255
+    filtered = np.abs(filtered)
+    if filtered.max() > 0:
+        filtered = 255 * (filtered / filtered.max())
+    return filtered.astype(np.uint8)
+
+
+def _compute_gabor_combined_mask(img_rgb: np.ndarray) -> np.ndarray:
+    """Compute combined Gabor mask from multiple orientations and frequencies."""
+    h, w = img_rgb.shape[:2]
+    combined = np.zeros((h, w), dtype=np.float32)
+
+    # Import Gabor parameters from config
+    from config import GABOR_KERNEL_SIZE, GABOR_SIGMA, GABOR_LAMBDA, GABOR_GAMMA, GABOR_PSI, GABOR_NORMS, GABOR_THETAS, GABOR_THRESHOLD
+
+    # Apply Gabor filters for each orientation and normalized frequency
+    for theta in GABOR_THETAS:
+        for norm_freq in GABOR_NORMS:
+            # Calculate lambda based on normalized frequency and image size
+            lambd = norm_freq * min(img_rgb.shape[:2]) * 0.1  # Scale appropriately
+            gabor_response = _compute_gabor_mask(
+                img_rgb, GABOR_KERNEL_SIZE, GABOR_SIGMA, lambd,
+                GABOR_GAMMA, GABOR_PSI, theta)
+            # Normalize and accumulate
+            combined += gabor_response.astype(np.float32) / 255.0
+
+    # Average and threshold
+    combined /= (len(GABOR_THETAS) * len(GABOR_NORMS))
+    binary_mask = (combined >= GABOR_THRESHOLD).astype(np.uint8)
+    return binary_mask
+
+
 def compute_hsv_hard_mask(img_rgb: np.ndarray,
                            silhouette: np.ndarray,
                            category: str) -> np.ndarray:
@@ -243,6 +284,12 @@ def compute_hsv_hard_mask(img_rgb: np.ndarray,
     # Remove green exclusion + apply leaf silhouette mask
     symptom &= (~green_excl).astype(np.uint8)
     symptom &= silhouette
+
+    # Apply Gabor filter for MSV texture enhancement (AND with existing HSV result)
+    if category == "MSV":
+        gabor_mask = _compute_gabor_combined_mask(img_rgb)
+        symptom &= gabor_mask
+
     return (symptom * 255).astype(np.uint8)
 
 
@@ -296,6 +343,12 @@ def compute_hsv_soft_confidence(img_rgb: np.ndarray,
     conf_map  = conf_accum / n_ranges
     conf_map *= (~green_excl).astype(np.float32)
     conf_map *= silhouette.astype(np.float32)
+
+    # Apply Gabor filter for MSV texture enhancement (AND with existing HSV result)
+    if category == "MSV":
+        gabor_mask = _compute_gabor_combined_mask(img_rgb).astype(np.float32)
+        conf_map *= gabor_mask
+
     return np.clip(conf_map, 0.0, 1.0)
 
 

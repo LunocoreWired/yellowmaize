@@ -440,10 +440,10 @@ Pass → Stage 2 neural classifier
 Pretrained weights: IMAGENET1K_V2
 Head: Linear(960→1)   [replaces ImageNet classifier]
 Loss: BCEWithLogitsLoss
-Optimizer: AdamW(lr=1e-4, weight_decay=1e-4)
+Optimizer: AdamW(lr=1.25e-4, weight_decay=1e-4)
 Scheduler: CosineAnnealingLR(T_max=15, eta_min=1e-6)
 Epochs: 15
-Batch: 64
+Batch: 40
 Val split: 80/20 (internal, seed=42)
 Early stop: patience=5, monitors val F1
 Checkpoint: best val F1 → bouncer_{variant}_best.pth
@@ -545,22 +545,33 @@ tier1_manifest.csv  → columns: dest_filename, source_path, category, split, ti
 
 ## PART 8 — SAM2 MASKING (generate_tier1_masks.py)
 
-### 8.1 Auto-Prompting Strategy
+### 8.1 Auto-Prompting Strategy (v3 — contour bbox)
 ```
 For each Tier 1 image:
 1. load_image_rgb(path) → EXIF-corrected uint8 RGB
 2. Convert to HSV: to_hsv(img_rgb)
-3. Green mask: H∈[30,90], S>40, V>40
-4. Find largest green connected component (cv2.connectedComponentsWithStats)
-5. Compute centroid (cx, cy) → foreground point prompt (label=1)
-6. Four corners (10px inset) → background point prompts (label=0)
-7. Run SAM2.predict(point_coords=..., point_labels=...)
-8. Select mask with highest SAM2 confidence score
-9. Convert logits → probability via sigmoid: 1/(1+exp(-logits))
-10. Store raw float32 probability map as .npy (NO binarization)
-11. Also store binarized (≥0.5) as uint8 .png for visualization
-
-Fallback: if no green component found (coverage < 10%) → log "no_green_region", skip
+3. Build combined tissue mask from THREE color ranges:
+   Green  (H=30–90)  — healthy leaf tissue
+   Yellow (H=15–38)  — MSV streak yellowing
+   Brown  (H=5–20)   — MLN necrotic / dead tissue
+   This ensures severely diseased MLN leaves with minimal green/yellow
+   are still detected via their necrotic brown tissue.
+4. Run cv2.connectedComponentsWithStats on the combined tissue mask.
+5. Take cv2.boundingRect() of the largest connected component.
+   This gives a tight [x, y, x2, y2] bounding box directly from the
+   tissue mask — no YOLO training required.
+6. Pass the bounding box as a SAM2 box prompt.
+   Box prompts are SAM2's strongest prompt type — they constrain the
+   search space far more precisely than point prompts, preventing the
+   model from expanding into background soil/sky.
+7. Fallback: if no tissue is detected (all three ranges below threshold),
+   use four image corners as background points + image center as a single
+   foreground point. QA filters catch bad results.
+8. Run SAM2.predict() with box= or point_coords=/point_labels=
+9. Select mask with highest SAM2 confidence score
+10. Convert logits → probability via sigmoid: 1/(1+exp(-logits))
+11. Store raw float32 probability map as .npy (NO binarization)
+12. Also store binarized (≥0.5) as uint8 .png for visualization
 ```
 
 ### 8.2 Three QA Filters
@@ -568,7 +579,7 @@ Fallback: if no green component found (coverage < 10%) → log "no_green_region"
 Filter 1 — Coverage range:
   binary = (prob_map >= 0.5)
   fg_coverage = binary.sum() / (H * W)
-  Reject if fg_coverage < 0.10 (too small — wrong object segmented)
+  Reject if fg_coverage < 0.03 (too small — wrong object segmented)
   Reject if fg_coverage > 0.90 (too large — background leaked in)
 
 Filter 2 — Mean foreground confidence:
@@ -578,7 +589,7 @@ Filter 2 — Mean foreground confidence:
 Filter 3 — Shape sanity:
   Fit bounding box to binary mask
   aspect = max(h,w) / min(h,w)
-  Reject if aspect < 1.2 (too round — wrong object)
+  Reject if aspect < 1.01 (too round — wrong object)
 
 Target: < 8% rejection rate
 If > 8% → warn, review QA report, consider adjusting prompting HSV ranges
@@ -705,6 +716,7 @@ Stage 5 — HSV symptom masking (mode-dependent):
   Convert to HSV: to_hsv(img_rgb)  [guaranteed RGB→HSV]
   Apply green exclusion zone first (remove healthy chlorophyll)
   Apply disease-specific HSV ranges (MSV: 4 bands, MLN: 5 bands)
+  **Apply Gabor filter for MSV texture enhancement (AND with HSV result)**
   Mode A: Otsu silhouette + hard binary
   Mode B: SAM2 hard binary silhouette + hard binary HSV
   Mode C: SAM2 soft float silhouette + hard binary HSV

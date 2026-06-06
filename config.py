@@ -10,6 +10,7 @@
 
 import os
 from pathlib import Path
+import numpy as np
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GLOBAL SEED — enforced in every training script for reproducibility
@@ -281,6 +282,19 @@ STUDENT_MAX_SEVERITY = 100.0  # for normalizing MAE
 
 # Label smoothing
 STUDENT_LABEL_SMOOTHING = 0.10
+
+# ════════════════════════════════════════════════════════════════════════════════
+# GABOR FILTER PARAMETERS (for MSV texture enhancement)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Gabor filters for capturing MSV streak directionality (parallel to leaf veins)
+GABOR_KERNEL_SIZE = 21          # Kernel size (must be odd)
+GABOR_SIGMA      = 4.0          # Standard deviation of Gaussian envelope
+GABOR_LAMBDA     = 10.0         # Wavelength of sinusoidal factor
+GABOR_GAMMA      = 0.5          # Spatial aspect ratio
+GABOR_PSI        = 0            # Phase offset
+GABOR_NORMS      = [0.1, 0.2, 0.3, 0.4]  # Normalized frequencies
+GABOR_THETAS     = [0, np.pi/4, np.pi/2, 3*np.pi/4]  # Orientations (0°, 45°, 90°, 135°)
+GABOR_THRESHOLD  = 0.3          # Threshold for Gabor response (0-1)
 
 # Asymmetric label smoothing prior matrix
 # Rows = true class [HEALTHY, MSV, MLN]
