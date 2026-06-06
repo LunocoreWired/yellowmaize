@@ -1,4 +1,5 @@
 # Yellow MAIze — Detailed Technical Blueprint
+
 ## Complete reference for code, pipeline, models, data, and architecture
 
 ---

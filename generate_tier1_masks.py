@@ -1,6 +1,6 @@
 """
 ================================================================================
- generate_tier1_masks.py — Phase 2: SAM2 Auto-Masking + QA  [v3]
+ generate_tier1_masks.py — Phase 2: SAM2 Auto-Masking + QA  [v5]
 ================================================================================
  PURPOSE:
    Apply SAM2 to all 15,000 Tier 1 images to generate precise binary leaf
@@ -8,25 +8,28 @@
      - float32 .npy  (raw SAM2 probability map — used as soft targets)
      - uint8 .png    (binarized at 0.5 — for visualization)
 
- AUTO-PROMPTING STRATEGY (v3 — contour bbox):
+ AUTO-PROMPTING STRATEGY (v4 — contour bbox + adaptive retry):
    For each image:
-   1. Convert to HSV. Build a combined tissue mask from THREE color ranges:
-        Green  (H=30–90)  — healthy leaf tissue
-        Yellow (H=15–38)  — MSV streak yellowing
-        Brown  (H=5–20)   — MLN necrotic / dead tissue  ← NEW in v3
-      This ensures severely diseased MLN leaves with minimal green/yellow
-      are still detected via their necrotic brown tissue.
-   2. Run cv2.connectedComponentsWithStats on the combined tissue mask.
-      Take cv2.boundingRect() of the largest connected component.
-      This gives a tight [x, y, x2, y2] bounding box directly from the
-      tissue mask — no YOLO training required.
-   3. Pass the bounding box as a SAM2 box prompt.
-      Box prompts are SAM2's strongest prompt type — they constrain the
-      search space far more precisely than point prompts, preventing the
-      model from expanding into background soil/sky.
-   4. Fallback: if no tissue is detected (all three ranges below threshold),
-      use four image corners as background points + image center as a single
-      foreground point. QA filters catch bad results.
+   1. Convert to HSV. Apply morphological closing to the tissue mask before
+      component analysis (NEW v4) — this fills small holes / fragmented blobs
+      caused by specular highlights or shadows, reducing center_fallback rate.
+      THREE color ranges are combined:
+        Green  (H=35–75, S≥50)  — healthy leaf tissue  ← tightened in v4
+        Yellow (H=15–38)        — MSV streak yellowing
+        Brown  (H=5–20)         — MLN necrotic / dead tissue
+      Green H_MAX lowered 90→75 and S_MIN raised 40→50 to exclude cogon grass
+      and background vegetation that share the 75–90 hue band.
+   2. Merge the N largest connected components within spatial proximity before
+      bbox derivation (NEW v4) — catches split leaves and avoids a single small
+      fragment anchoring the bbox away from the main leaf body.
+   3. Pass a box prompt to SAM2. Adaptive padding: larger pad for small
+      components so SAM2 sees edge context (NEW v4).
+   4. Two-attempt adaptive retry (NEW v4):
+        - If QA fails with coverage_high (>0.90): re-run with pad=0 (tighter box)
+        - If QA fails with coverage_low  (<0.03): re-run with pad=_RETRY_PAD_EXPAND
+      Only one retry is attempted per image to bound runtime.
+   5. Fallback: if no tissue is detected, use four corner background points +
+      image center foreground point. QA filters catch bad results.
 
  WHY BBOX > MULTI-POINT:
    - Box prompts encode both position AND spatial extent of the leaf.
@@ -35,20 +38,39 @@
      when the leaf extends beyond the centroid axis.
    - Still zero training required — bbox derived from existing HSV mask.
 
- QA FILTERS (v3 — unchanged from v2):
+ QA FILTERS (v5 — thresholds unchanged from v2/v3/v4):
    Filter 1 — Coverage range  : foreground must be 3%–90% of image
    Filter 2 — Mean confidence : mean prob of foreground region ≥ 0.65
    Filter 3 — Aspect ratio    : mask bounding box ratio ≥ 1.01
    Target rejection rate: < 8% of total images.
 
- CHANGELOG (v2 → v3):
-   [NEW]  Brown HSV range (H=5–20) for MLN necrotic tissue detection
-   [NEW]  get_leaf_bbox(): replaces get_leaf_centroid() — returns bbox not centroid
-   [NEW]  build_box_prompt(): replaces build_prompts() — uses SAM2 box= API
-   [NEW]  SAM2 predictor.predict() now uses box= instead of point_coords=
-   [NEW]  Strategy labels updated: *_bbox suffix (green_bbox, yellow_bbox, etc.)
-   [NEW]  center_fallback retains point-based prompting as last resort
-   [KEEP] All QA thresholds unchanged from v2
+ CHANGELOG (v4 → v5):
+   [NEW]  confidence_low retry: re-runs SAM2 with multimask_output=False
+          (single-mask mode) — on ambiguous MSV/MLN leaves SAM2 sometimes
+          picks a higher-confidence single mask than any of the three in
+          multimask mode. No box change; same image already loaded.
+   [NEW]  set_image() called only once per image (not once per retry) —
+          predictor caches the embedding; redundant calls wasted ~10 s/image
+   [NEW]  Progress log now prints per-reason rejection breakdown at every
+          500-image checkpoint — lets you diagnose dominant failure mid-run
+          without waiting for the final summary
+   [KEEP] All v4 changes: morphological closing, multi-component merge,
+          adaptive padding, coverage retry, tighter green range
+
+ CHANGELOG (v3 → v4 — kept for reference):
+   [NEW]  Morphological closing on tissue mask before connectedComponents
+   [NEW]  Multi-component merge: top-N components within proximity threshold
+   [NEW]  Adaptive bbox padding: pad scales with component size
+   [NEW]  Green HSV tightened: H_MAX 90→75, S_MIN 40→50 (excludes cogon)
+   [NEW]  Two-attempt retry: coverage_high → pad=0; coverage_low → expanded pad
+   [NEW]  Strategy labels reflect retry: *_retry suffix on second attempts
+
+ FIXES (v3 patch — all carried forward):
+   [FIX]  torch.inference_mode() around SAM2 inference
+   [FIX]  prob_map upscaled before sigmoid (correct H×W dimensions)
+   [FIX]  Dead code removed from build_box_prompt() bbox path
+   [FIX]  qa_check() docstring corrected (min coverage 0.03)
+   [FIX]  SEED used for reproducibility; REPORTS_DIR removed from imports
 
  OUTPUTS:
    data/tier1_leaf_masks/{stem}_softmask.npy   ← float32 probability map
@@ -58,17 +80,20 @@
 """
 
 import csv
+import random
 import time
 from collections import defaultdict
 from pathlib import Path
 
 import cv2
 import numpy as np
-from image_utils import load_image_rgb, to_hsv   # EXIF correction
+import torch                                     # FIX 1: needed for inference_mode
+from image_utils import load_image_rgb, to_hsv  # EXIF correction
 
 from config import (
     SEED,
-    TIER1_RAW_DIR, TIER1_MASKS_DIR, TIER1_QA_REPORT, REPORTS_DIR,
+    TIER1_RAW_DIR, TIER1_MASKS_DIR, TIER1_QA_REPORT,
+    # REPORTS_DIR removed — unused in this script   # FIX 5
     SAM2_CHECKPOINT, SAM2_CONFIG,
     SAM2_GREEN_H_MIN, SAM2_GREEN_H_MAX,
     SAM2_GREEN_S_MIN, SAM2_GREEN_V_MIN,
@@ -82,20 +107,55 @@ from config import (
     VALID_EXTENSIONS,
 )
 
-# ── v2 QA overrides ───────────────────────────────────────────────────────────
-# These shadow the config values with the relaxed v2 thresholds.
-# If you update config.py to match, these become no-ops.
-_QA_MIN_COVERAGE   = 0.03   # was SAM2_QA_MIN_COVERAGE (0.10)
-_QA_MAX_COVERAGE   = 0.90   # unchanged
-_QA_MIN_CONFIDENCE = 0.65   # unchanged
-_QA_MIN_ASPECT     = 1.01  # was SAM2_QA_MIN_ASPECT_RATIO (1.20)
+# ── v4 QA / prompting constants ───────────────────────────────────────────────
+# QA thresholds — same values as v3 (the *target* is to pass more images, not
+# to lower the bar; we improve the prompting so more images naturally pass).
+_QA_MIN_COVERAGE   = 0.03   # was SAM2_QA_MIN_COVERAGE (0.10) in config — v2 relaxation
+_QA_MAX_COVERAGE   = 0.90   # unchanged across versions
+_QA_MIN_CONFIDENCE = 0.65   # unchanged across versions
+_QA_MIN_ASPECT     = 1.01   # was SAM2_QA_MIN_ASPECT_RATIO (1.20) — v2 relaxation
+
+# Green HSV range — tightened in v4 to exclude cogon grass / background vegetation.
+# Cogon grass (Imperata cylindrica) sits in H=75–90; lowering H_MAX to 75 and
+# raising S_MIN to 50 removes it without losing healthy maize leaf response.
+# These shadow the config values; update config.py to SAM2_GREEN_H_MAX=75,
+# SAM2_GREEN_S_MIN=50 once validated in the overlay review.
+_GREEN_H_MIN = 35   # was SAM2_GREEN_H_MIN (30) — slight raise avoids warm yellows
+_GREEN_H_MAX = 75   # was SAM2_GREEN_H_MAX (90) — KEY: excludes cogon band 75–90
+_GREEN_S_MIN = 50   # was SAM2_GREEN_S_MIN (40) — excludes dull/background greens
+_GREEN_V_MIN = 40   # unchanged
+
+# Morphological closing kernel for tissue mask (NEW v4).
+# Fills holes from specular highlights and veins, connecting nearby fragments.
+# 15×15 ellipse chosen: large enough to bridge typical vein gaps (~10px),
+# small enough not to merge separate leaves in two-leaf frames.
+_MORPH_CLOSE_KSIZE = 15
+
+# Multi-component merge: union the top-N components whose centroids are within
+# this fraction of image diagonal of the largest component's centroid (NEW v4).
+# Prevents a single small fragment (e.g. a detached leaf tip) from pulling the
+# bbox; merges clearly-adjacent leaf segments.
+_MERGE_TOP_N          = 5      # consider at most 5 largest components for merging
+_MERGE_PROXIMITY_FRAC = 0.35   # centroid must be within 35% of image diagonal
+
+# Adaptive padding: base pad scales with sqrt(component_area) so small
+# components get proportionally more context for SAM2 (NEW v4).
+_PAD_BASE      = 8    # minimum padding in pixels (same as v3)
+_PAD_SCALE     = 0.02 # additional pad = _PAD_SCALE * sqrt(component_area)
+_PAD_MAX       = 40   # cap to avoid box exceeding image bounds excessively
+
+# Retry padding adjustments (NEW v4).
+# On coverage_high: use pad=0 (tighter box → SAM2 stays inside the leaf).
+# On coverage_low:  expand box by this many pixels on each side.
+_RETRY_PAD_TIGHT  = 0
+_RETRY_PAD_EXPAND = 30
 
 # Minimum fraction of image pixels that must be tissue-colored before
-# falling back to the center-of-image point prompt.
+# falling back to the center-of-image point prompt (unchanged from v3).
 _MIN_TISSUE_FRACTION = 0.05
 
-# Minimum pixel area for a connected component to be considered a valid leaf.
-# Prevents tiny noise blobs from driving the bbox.
+# Minimum pixel area for a connected component to be considered a valid leaf
+# (unchanged from v3).
 _MIN_COMPONENT_AREA_PX = 500
 
 
@@ -125,48 +185,44 @@ def load_sam2(checkpoint: Path, config: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# AUTO-PROMPTING  (v2 — disease-aware, multi-point foreground)
-# ══════════════════════════════════════════════════════════════════════════════
-
-# ══════════════════════════════════════════════════════════════════════════════
-# AUTO-PROMPTING  (v3 — contour bbox, disease-aware)
+# AUTO-PROMPTING  (v5 — contour bbox, disease-aware, adaptive retry + conf retry)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_leaf_bbox(
     img_rgb: np.ndarray,
+    pad_override: int | None = None,
 ) -> tuple[tuple[int, int, int, int] | None, str]:
     """
     Derive a tight bounding box around the dominant leaf-tissue region
-    using HSV color segmentation. No model training required.
+    using HSV color segmentation + morphological closing + multi-component
+    merge. No model training required.
 
-    THREE tissue ranges are combined (v3):
-      Green  (H=30–90)  — healthy leaf tissue
-      Yellow (H=15–38)  — MSV streak yellowing
-      Brown  (H=5–20)   — MLN necrotic / dead tissue
+    v4 changes vs v3:
+      - Green H range narrowed (H=35–75, S≥50) to exclude cogon grass
+      - Morphological closing fills holes/fragmentation before connectedComponents
+      - Top-N nearby components merged before bbox derivation (catches split leaves)
+      - Adaptive padding: larger pad for small components
+      - pad_override: bypasses adaptive padding (used by retry logic)
 
-    Detection logic:
-      1. Build per-range binary masks and OR them into a combined tissue mask.
-      2. Run connected-component analysis; pick the largest component whose
-         area exceeds _MIN_COMPONENT_AREA_PX.
-      3. Return cv2.boundingRect() of that component as (x1, y1, x2, y2).
-      4. If no qualifying component is found, return None → center_fallback.
-
-    Args:
-        img_rgb: H×W×3 uint8 RGB image (EXIF-corrected).
+    THREE tissue ranges combined:
+      Green  (H=_GREEN_H_MIN–_GREEN_H_MAX, S≥_GREEN_S_MIN) — healthy tissue
+      Yellow (H=SAM2_YELLOW_H_MIN–MAX)                     — MSV yellowing
+      Brown  (H=SAM2_BROWN_H_MIN–MAX)                      — MLN necrosis
 
     Returns:
-        bbox     : (x1, y1, x2, y2) in pixel coordinates, or None on fallback.
-        strategy : one of "green_bbox" | "yellow_bbox" | "brown_bbox" |
-                          "combined_bbox" | "center_fallback"
+        bbox     : (x1, y1, x2, y2) pixel coords, or None on fallback.
+        strategy : "green_bbox" | "yellow_bbox" | "brown_bbox" |
+                   "combined_bbox" | "center_fallback"
     """
     img_hsv  = to_hsv(img_rgb)
     h, s, v  = img_hsv[:, :, 0], img_hsv[:, :, 1], img_hsv[:, :, 2]
     total_px = img_rgb.shape[0] * img_rgb.shape[1]
+    img_h, img_w = img_rgb.shape[:2]
 
-    # ── 1. Build per-tissue masks ─────────────────────────────────────────────
+    # ── 1. Build per-tissue masks (v4: tighter green range) ───────────────────
     green_mask = (
-        (h >= SAM2_GREEN_H_MIN)  & (h <= SAM2_GREEN_H_MAX) &
-        (s >= SAM2_GREEN_S_MIN)  & (v >= SAM2_GREEN_V_MIN)
+        (h >= _GREEN_H_MIN) & (h <= _GREEN_H_MAX) &
+        (s >= _GREEN_S_MIN) & (v >= _GREEN_V_MIN)
     ).astype(np.uint8)
 
     yellow_mask = (
@@ -174,10 +230,9 @@ def get_leaf_bbox(
         (s >= SAM2_YELLOW_S_MIN) & (v >= SAM2_YELLOW_V_MIN)
     ).astype(np.uint8)
 
-    # Brown/necrotic: MLN dead tissue — low saturation allowed (ash/straw)
     brown_mask = (
-        (h >= SAM2_BROWN_H_MIN)  & (h <= SAM2_BROWN_H_MAX) &
-        (s >= SAM2_BROWN_S_MIN)  & (v >= SAM2_BROWN_V_MIN)
+        (h >= SAM2_BROWN_H_MIN) & (h <= SAM2_BROWN_H_MAX) &
+        (s >= SAM2_BROWN_S_MIN) & (v >= SAM2_BROWN_V_MIN)
     ).astype(np.uint8)
 
     green_frac  = green_mask.sum()  / total_px
@@ -188,11 +243,10 @@ def get_leaf_bbox(
     has_yellow = yellow_frac >= _MIN_TISSUE_FRACTION
     has_brown  = brown_frac  >= _MIN_TISSUE_FRACTION
 
-    # ── 2. Combine detected ranges into a single tissue mask ──────────────────
     if not (has_green or has_yellow or has_brown):
-        # No tissue detected at all — fall back to center point prompt
         return None, "center_fallback"
 
+    # ── 2. Build combined tissue mask ─────────────────────────────────────────
     tissue_mask = np.zeros_like(green_mask)
     active = []
     if has_green:
@@ -205,36 +259,70 @@ def get_leaf_bbox(
         tissue_mask = np.clip(tissue_mask + brown_mask, 0, 1).astype(np.uint8)
         active.append("brown")
 
-    strategy = ("combined_bbox" if len(active) > 1
-                else f"{active[0]}_bbox")
+    strategy = ("combined_bbox" if len(active) > 1 else f"{active[0]}_bbox")
 
-    # ── 3. Largest qualifying connected component ─────────────────────────────
-    num_labels, labels_map, stats, _ = cv2.connectedComponentsWithStats(
+    # ── 3. Morphological closing (NEW v4) ─────────────────────────────────────
+    # Fills holes from highlights/veins; connects nearby tissue fragments.
+    # 15×15 ellipse: bridges typical vein gaps without merging separate leaves.
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (_MORPH_CLOSE_KSIZE, _MORPH_CLOSE_KSIZE)
+    )
+    tissue_mask = cv2.morphologyEx(tissue_mask, cv2.MORPH_CLOSE, kernel)
+
+    # ── 4. Connected-component analysis ───────────────────────────────────────
+    num_labels, labels_map, stats, centroids = cv2.connectedComponentsWithStats(
         tissue_mask, connectivity=8)
 
     if num_labels < 2:
         return None, "center_fallback"
 
-    # Filter components below minimum area, then pick the largest
     component_areas = stats[1:, cv2.CC_STAT_AREA]   # exclude background (label 0)
     valid_indices   = np.where(component_areas >= _MIN_COMPONENT_AREA_PX)[0]
 
     if len(valid_indices) == 0:
         return None, "center_fallback"
 
-    best_label = 1 + int(valid_indices[np.argmax(component_areas[valid_indices])])
-    x = int(stats[best_label, cv2.CC_STAT_LEFT])
-    y = int(stats[best_label, cv2.CC_STAT_TOP])
-    w = int(stats[best_label, cv2.CC_STAT_WIDTH])
-    h_box = int(stats[best_label, cv2.CC_STAT_HEIGHT])
+    sorted_valid = valid_indices[np.argsort(-component_areas[valid_indices])]
+    best_label   = 1 + int(sorted_valid[0])
 
-    img_h, img_w = img_rgb.shape[:2]
-    pad = 8   # small padding so SAM2 sees the leaf edge in context
+    # ── 5. Multi-component merge (NEW v4) ─────────────────────────────────────
+    # Merge top-N components within _MERGE_PROXIMITY_FRAC × image diagonal of
+    # the largest component's centroid — catches split/two-segment leaves.
+    img_diag       = (img_h ** 2 + img_w ** 2) ** 0.5
+    prox_threshold = _MERGE_PROXIMITY_FRAC * img_diag
+    anchor_cx, anchor_cy = centroids[best_label]
+    merged_labels  = [best_label]
 
-    x1 = max(0,     x - pad)
-    y1 = max(0,     y - pad)
-    x2 = min(img_w, x + w + pad)
-    y2 = min(img_h, y + h_box + pad)
+    for rank_idx in sorted_valid[1: _MERGE_TOP_N]:
+        lbl    = 1 + int(rank_idx)
+        cx, cy = centroids[lbl]
+        dist   = ((cx - anchor_cx) ** 2 + (cy - anchor_cy) ** 2) ** 0.5
+        if dist <= prox_threshold:
+            merged_labels.append(lbl)
+
+    merged_mask = np.isin(labels_map, merged_labels).astype(np.uint8)
+
+    rows = np.any(merged_mask, axis=1)
+    cols = np.any(merged_mask, axis=0)
+    if not rows.any() or not cols.any():
+        return None, "center_fallback"
+
+    row_min = int(np.where(rows)[0][0])
+    row_max = int(np.where(rows)[0][-1])
+    col_min = int(np.where(cols)[0][0])
+    col_max = int(np.where(cols)[0][-1])
+
+    # ── 6. Adaptive padding (NEW v4) ──────────────────────────────────────────
+    if pad_override is not None:
+        pad = pad_override
+    else:
+        merged_area = int(merged_mask.sum())
+        pad = min(int(_PAD_BASE + _PAD_SCALE * (merged_area ** 0.5)), _PAD_MAX)
+
+    x1 = max(0,     col_min - pad)
+    y1 = max(0,     row_min - pad)
+    x2 = min(img_w, col_max + pad)
+    y2 = min(img_h, row_max + pad)
 
     return (x1, y1, x2, y2), strategy
 
@@ -262,15 +350,15 @@ def build_box_prompt(
         point_labels : (N,)  int32  array or None
         (unused)     : None  (reserved for future multi-box support)
     """
-    h, w = img_rgb.shape[:2]
-    pad  = 10
-
+    # FIX 4: h, w, pad were dead code in the bbox path — moved inside fallback
     if bbox is not None:
         x1, y1, x2, y2 = bbox
         box = np.array([[x1, y1, x2, y2]], dtype=np.float32)
         return box, None, None, None
 
     # center_fallback: single foreground point + four background corners
+    h, w = img_rgb.shape[:2]
+    pad  = 10
     cx, cy = w // 2, h // 2
     point_coords = np.array([
         [cx,       cy      ],   # center foreground
@@ -284,19 +372,20 @@ def build_box_prompt(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# QA FILTERS  (v2 — relaxed thresholds)
+# QA FILTERS  (v5 — thresholds unchanged from v2/v3/v4)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def qa_check(prob_map: np.ndarray) -> tuple[bool, str]:
     """
     Apply three QA filters to a SAM2 probability map.
 
-    v2 threshold changes:
-      - Min coverage    : 0.10 → 0.05   (diseased leaves have sparser tissue)
-      - Min aspect ratio: 1.20 → 1.05   (overhead/square-frame leaves)
+    v2 threshold changes (FIX 3 — corrected from stale docstring):
+      - Min coverage    : 0.10 → 0.03   (diseased leaves have sparser tissue)
+      - Min aspect ratio: 1.20 → 1.01   (overhead/square-frame leaves)
 
     Args:
-        prob_map: H×W float32 sigmoid probability map from SAM2.
+        prob_map: H×W float32 sigmoid probability map from SAM2,
+                  upscaled to original image resolution.
 
     Returns:
         passed : True if all filters pass.
@@ -342,14 +431,21 @@ def qa_check(prob_map: np.ndarray) -> tuple[bool, str]:
 def main() -> None:
     t_global = time.time()
 
+    # FIX 5: Seed all RNGs for reproducibility
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
     print("=" * 72)
-    print("  Yellow MAIze | Phase 2: SAM2 Tier 1 Masking  [v3]")
+    print("  Yellow MAIze | Phase 2: SAM2 Tier 1 Masking  [v5]")
     print("=" * 72)
     print("  QA thresholds (v3 — unchanged from v2):")
     print(f"    Coverage     : {_QA_MIN_COVERAGE:.0%} – {_QA_MAX_COVERAGE:.0%}")
     print(f"    Confidence   : ≥ {_QA_MIN_CONFIDENCE:.2f}")
     print(f"    Aspect ratio : ≥ {_QA_MIN_ASPECT:.2f}")
-    print("  Prompting      : contour bbox (green+yellow+brown HSV) → SAM2 box=")
+    print("  Prompting      : contour bbox → SAM2 box= + coverage retry + single-mask conf retry")
     print()
 
     # ── Preflight checks ──────────────────────────────────────────────────────
@@ -406,32 +502,17 @@ def main() -> None:
             n_rejected += 1
             continue
 
-        # ── Auto-prompting (v3: contour bbox, disease-aware) ─────────────────
+        # ── Auto-prompting (v4: contour bbox, disease-aware, adaptive pad) ──────
         bbox, strategy = get_leaf_bbox(img_rgb)
         strategy_counts[strategy] += 1
         box, point_coords, point_labels, _ = build_box_prompt(img_rgb, bbox)
 
-        # ── SAM2 inference ────────────────────────────────────────────────────
+        # ── SAM2 inference helpers ────────────────────────────────────────────
+        # set_image() is called ONCE per image — SAM2 caches the embedding.
+        # Retries reuse the cached embedding; do NOT call set_image() again.
         try:
-            predictor.set_image(img_rgb)
-            if box is not None:
-                # Primary path: bounding box prompt (strongest SAM2 input)
-                masks, scores, logits = predictor.predict(
-                    box=box,
-                    multimask_output=True,
-                )
-            else:
-                # Fallback path: center point + corner background points
-                masks, scores, logits = predictor.predict(
-                    point_coords=point_coords,
-                    point_labels=point_labels,
-                    multimask_output=True,
-                )
-            # Pick the candidate mask with highest SAM2 score
-            best_idx = int(np.argmax(scores))
-            # logits → sigmoid probability
-            prob_map = (1.0 / (1.0 + np.exp(-logits[best_idx]))).squeeze()
-            prob_map = prob_map.astype(np.float32)
+            with torch.inference_mode():
+                predictor.set_image(img_rgb)
         except Exception as exc:
             reason = "sam2_error"
             qa_rows.append({
@@ -447,15 +528,119 @@ def main() -> None:
             n_rejected += 1
             continue
 
-        # ── QA filters ────────────────────────────────────────────────────────
+        def predict_prob(box, point_coords, point_labels, multimask=True):
+            """
+            Run SAM2 predict() and return an upscaled float32 prob_map.
+            Assumes predictor.set_image() has already been called for this image.
+            """
+            with torch.inference_mode():
+                if box is not None:
+                    masks, scores, logits = predictor.predict(
+                        box=box,
+                        multimask_output=multimask,
+                    )
+                else:
+                    masks, scores, logits = predictor.predict(
+                        point_coords=point_coords,
+                        point_labels=point_labels,
+                        multimask_output=multimask,
+                    )
+            best_idx  = int(np.argmax(scores))
+            logit_map = logits[best_idx].squeeze()
+            h_orig, w_orig = img_rgb.shape[:2]
+            if logit_map.shape != (h_orig, w_orig):
+                logit_map = cv2.resize(
+                    logit_map, (w_orig, h_orig),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+            return (1.0 / (1.0 + np.exp(-logit_map))).astype(np.float32)
+
+        # ── First SAM2 pass (multimask=True) ─────────────────────────────────
+        try:
+            prob_map = predict_prob(box, point_coords, point_labels, multimask=True)
+        except Exception as exc:
+            reason = "sam2_error"
+            qa_rows.append({
+                "filename":        img_path.name,
+                "category":        category,
+                "status":          "sam2_error",
+                "reason":          f"sam2_error:{str(exc)[:80]}",
+                "prompt_strategy": strategy,
+                "coverage":        -1,
+                "mean_conf":       -1,
+            })
+            reject_reasons[reason] += 1
+            n_rejected += 1
+            continue
+
+        # ── Adaptive retries (NEW v4/v5) ──────────────────────────────────────
+        # Retry order (each attempt only fires if the previous still failed):
+        #   1. coverage_high  → tighter box (pad=0)         [v4]
+        #   2. coverage_low   → expanded box (+30px)        [v4]
+        #   3. confidence_low → single-mask mode (multimask=False)  [NEW v5]
+        #      SAM2 multimask mode picks from three candidates; on ambiguous
+        #      MSV/MLN leaves the best-of-three is still low-confidence.
+        #      Single-mask mode commits to one prediction, often scoring higher.
+        #      Same box/points — no bbox recomputation needed.
+        # center_fallback images skip bbox retries (1 & 2) since padding
+        # adjustments don't help point prompts; they still get retry 3.
+
         passed, reason = qa_check(prob_map)
 
+        if not passed and bbox is not None:
+            reason_key = reason.split(":")[0]
+
+            if reason_key == "coverage_high":
+                retry_bbox, retry_strategy = get_leaf_bbox(
+                    img_rgb, pad_override=_RETRY_PAD_TIGHT)
+                if retry_bbox is not None:
+                    retry_box, _, _, _ = build_box_prompt(img_rgb, retry_bbox)
+                    try:
+                        prob_map = predict_prob(retry_box, None, None, multimask=True)
+                        passed, reason = qa_check(prob_map)
+                        if passed:
+                            strategy = retry_strategy + "_retry_tight"
+                            strategy_counts[strategy] += 1
+                    except Exception:
+                        pass
+
+            elif reason_key == "coverage_low":
+                retry_bbox, retry_strategy = get_leaf_bbox(
+                    img_rgb, pad_override=_RETRY_PAD_EXPAND)
+                if retry_bbox is not None:
+                    retry_box, _, _, _ = build_box_prompt(img_rgb, retry_bbox)
+                    try:
+                        prob_map = predict_prob(retry_box, None, None, multimask=True)
+                        passed, reason = qa_check(prob_map)
+                        if passed:
+                            strategy = retry_strategy + "_retry_expand"
+                            strategy_counts[strategy] += 1
+                    except Exception:
+                        pass
+
+        # Retry 3: confidence_low → single-mask mode [NEW v5]
+        # Fires for any image (bbox or fallback) still failing on confidence.
+        if not passed and reason.split(":")[0] == "confidence_low":
+            try:
+                prob_map_single = predict_prob(box, point_coords, point_labels,
+                                               multimask=False)
+                passed_single, reason_single = qa_check(prob_map_single)
+                if passed_single:
+                    prob_map = prob_map_single
+                    passed   = passed_single
+                    reason   = reason_single
+                    strategy = strategy + "_singlemask"
+                    strategy_counts[strategy] += 1
+            except Exception:
+                pass   # keep original QA outcome
+
+        # ── Final QA outcome ──────────────────────────────────────────────────
         binary    = (prob_map >= 0.5).astype(np.uint8)
         coverage  = float(binary.sum()) / (prob_map.shape[0] * prob_map.shape[1])
         mean_conf = float(prob_map[binary == 1].mean()) if binary.sum() > 0 else 0.0
 
         if not passed:
-            reason_key = reason.split(":")[0]   # strip numeric detail for bucketing
+            reason_key = reason.split(":")[0]
             reject_reasons[reason_key] += 1
             qa_rows.append({
                 "filename":        img_path.name,
@@ -499,6 +684,14 @@ def main() -> None:
                 f"rejected {n_rejected:,} ({reject_rate*100:.1f}%)  |  "
                 f"ETA {eta / 60:.1f} min"
             )
+            # Per-reason breakdown so you can diagnose the dominant failure
+            # without waiting for the end-of-run summary.
+            if reject_reasons:
+                reason_parts = "  ".join(
+                    f"{r}:{c}" for r, c in
+                    sorted(reject_reasons.items(), key=lambda x: -x[1])
+                )
+                print(f"         reasons → {reason_parts}")
 
     # ── Write QA report ───────────────────────────────────────────────────────
     if qa_rows:
@@ -519,7 +712,7 @@ def main() -> None:
     print(f"  Elapsed         : {elapsed_min:.1f} min")
     print(f"  QA report       : {TIER1_QA_REPORT}")
 
-    # -- Rejection breakdown
+    # ── Rejection breakdown ───────────────────────────────────────────────────
     if reject_reasons:
         print(f"\n  Rejection breakdown:")
         print(f"  {'Reason':<32} {'Count':>7}  {'%':>6}")
@@ -527,7 +720,7 @@ def main() -> None:
         for reason, count in sorted(reject_reasons.items(), key=lambda x: -x[1]):
             print(f"  {reason:<32} {count:>7,}  {count / max(total, 1) * 100:>5.1f}%")
 
-    # -- Prompt strategy breakdown
+    # ── Prompt strategy breakdown ─────────────────────────────────────────────
     if strategy_counts:
         print(f"\n  Prompt strategy breakdown:")
         print(f"  {'Strategy':<32} {'Count':>7}  {'%':>6}")
@@ -539,9 +732,13 @@ def main() -> None:
     if reject_rate > SAM2_QA_MAX_REJECT_RATE:
         print(f"  [WARN] Rejection rate {reject_rate * 100:.1f}% still exceeds the "
               f"{SAM2_QA_MAX_REJECT_RATE * 100:.0f}% target.")
-        print("         Check the rejection breakdown above and review the QA report.")
-        print("         If 'center_fallback' is high, check HSV ranges in config.py.")
-        print("         (SAM2_GREEN/YELLOW/BROWN_H_MIN/MAX)")
+        print("         Read the rejection reason breakdown above — tune the dominant cause:")
+        print("           coverage_high  → tighten _GREEN_H_MAX (75) or _GREEN_S_MIN (50)")
+        print("           coverage_low   → raise _RETRY_PAD_EXPAND (30) or lower _MIN_TISSUE_FRACTION (0.05)")
+        print("           center_fallback→ lower _MIN_COMPONENT_AREA_PX (500) or increase _MORPH_CLOSE_KSIZE (15)")
+        print("           confidence_low → lower _QA_MIN_CONFIDENCE below 0.65 (last resort)")
+        print("           sam2_error     → check GPU memory / SAM2 install")
+        print("         Review overlays in reports/tier1_overlays for visual confirmation.")
     else:
         print(f"  [OK] Rejection rate within acceptable range "
               f"({reject_rate * 100:.1f}% ≤ {SAM2_QA_MAX_REJECT_RATE * 100:.0f}%).")
