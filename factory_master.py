@@ -128,32 +128,12 @@ def load_teacher() -> nn.Module:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STAGE 1 — BOUNCER GATE
+# Shared helpers imported from scripts/bouncer_inference.py — single source
+# of truth used by both factory_master.py and train_bouncer.py.
 # ══════════════════════════════════════════════════════════════════════════════
 
-def heuristic_prefilter(img_rgb: np.ndarray) -> bool:
-    """
-    Bypassing the flawed green OpenCV heuristic.
-    Passing all images directly to the neural Bouncer.
-    """
-    return True
+from scripts.bouncer_inference import heuristic_prefilter, neural_bouncer  # noqa: E402
 
-
-BOUNCER_TF = A.Compose([
-    A.LongestMaxSize(max_size=224),
-    A.PadIfNeeded(224, 224, border_mode=0, value=0),
-    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ToTensorV2(),
-])
-
-
-@torch.no_grad()
-def neural_bouncer(img_rgb: np.ndarray,
-                   model: nn.Module,
-                   threshold: float) -> bool:
-    tensor = BOUNCER_TF(image=img_rgb)["image"].unsqueeze(0).to(DEVICE)
-    logit  = model(tensor).squeeze()
-    prob   = torch.sigmoid(logit).item()
-    return prob >= threshold
 
 
 # ══════════════════════════════════════════════════════════════════════════════

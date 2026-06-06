@@ -321,7 +321,6 @@ def find_best_threshold(
     best_thresh = min(best_thresh, 0.70)
 
     preds = (probs >= best_thresh).astype(int)
-    cm = confusion_matrix(labels, preds)
     preds_at_best = (probs >= best_thresh).astype(int)
     auc = roc_auc_score(labels, probs)
     cm = confusion_matrix(labels, preds_at_best)
@@ -592,50 +591,12 @@ def train_variant(variant_name: str) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# TWO-STAGE INFERENCE HELPERS (mirrored from factory_master.py)
-# Defined here so evaluate_admission_rate() can run standalone without
-# importing factory_master, which has heavy Teacher/SAM2 dependencies.
+# TWO-STAGE INFERENCE HELPERS
+# Imported from scripts/bouncer_inference.py — single source of truth shared
+# with factory_master.py. No SAM2/Teacher dependencies pulled in.
 # ══════════════════════════════════════════════════════════════════════════════
 
-import albumentations as _A
-from albumentations.pytorch import ToTensorV2 as _ToTensorV2
-
-
-# Pre-filter is intentionally a passthrough — the green-coverage heuristic
-# produced too many false rejections on valid maize images under variable
-# tropical lighting. Neural Bouncer handles the full discrimination.
-def heuristic_prefilter(img_rgb: np.ndarray) -> bool:
-    """
-    Lightweight pre-filter before neural Bouncer inference.
-    Currently a passthrough (always returns True).
-    The OpenCV green-coverage heuristic was removed after causing false
-    rejections on yellow/bleached MSV leaves; neural classifier is
-    sufficient and fast enough at 224×224.
-    """
-    return True
-
-
-# Inference transform — identical to val transform in make_transforms()
-_BOUNCER_INFER_TF = _A.Compose(
-    [
-        _A.LongestMaxSize(max_size=BOUNCER_IMG_SIZE),
-        _A.PadIfNeeded(BOUNCER_IMG_SIZE, BOUNCER_IMG_SIZE, border_mode=0),
-        _A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-        _ToTensorV2(),
-    ]
-)
-
-
-@torch.no_grad()
-def neural_bouncer(img_rgb: np.ndarray, model: nn.Module, threshold: float) -> bool:
-    """
-    Run the trained neural Bouncer on a single EXIF-corrected RGB image.
-    Returns True (maize) if sigmoid(logit) >= threshold.
-    """
-    tensor = _BOUNCER_INFER_TF(image=img_rgb)["image"].unsqueeze(0).to(DEVICE)
-    logit = model(tensor).squeeze()
-    prob = torch.sigmoid(logit).item()
-    return prob >= threshold
+from scripts.bouncer_inference import heuristic_prefilter, neural_bouncer
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -938,7 +899,6 @@ def main() -> None:
         }
     )
 
-    # ── Save comparison CSV ───────────────────────────────────────────────────
     # ── Save comparison CSV ───────────────────────────────────────────────────
     comp_path = LOGS_DIR / "bouncer_comparison.csv"
     with open(comp_path, "w", newline="", encoding="utf-8") as f:
