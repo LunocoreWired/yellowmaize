@@ -41,23 +41,27 @@
 ### Phase Overview
 
 ```
-Phase 0-pre  partition_dataset.py       → global_split_manifest.csv (70/15/15)
-Phase 0a     create_bouncer_dataset.py  → 50k binary bouncer dataset
-Phase 0b     train_bouncer.py           → bouncer_best.pth
-Phase 1      sample_15000.py            → 15k Tier 1 images
-Phase 2      generate_tier1_masks.py    → SAM2 float .npy masks + QA
-Phase 2b     validate_masks.py          → QA report + overlays
-Phase 3      train_teacher.py           → teacher_model_best.pth
-Phase 4      factory_master.py          → pseudo_masks/ (4 modes)
-Phase 5a     train_student.py --stage 1 → encoder ablation (5 variants, Mode B)
-Phase 5b     train_student.py --stage 2 → mode ablation (best encoder, 4 modes)
-             generate_charts.py         → reports/charts/ (run any time after training)
-Phase 6      select_best_pipeline.py    → checkpoints/final/ + summary
-Phase 7      evaluate_xai.py            → 3-way XAI comparison
-Phase 8      evaluate_severity.py       → inter-rater reliability
-Phase 9      export_tflite.py           → student_model.tflite
-Phase 10     build_deployment_package.py→ exports/deploy/ (both TFLite models)
-Phase 11     generate_report.py         → evaluation_report.html
+Phase 0-pre  partition_dataset.py           → global_split_manifest.csv (70/15/15)
+Phase 0a     create_bouncer_dataset.py       → 50k binary bouncer dataset
+Phase 0b     train_bouncer.py               → bouncer_best.pth
+Phase 1      sample_15000.py                → 15k Tier 1 images
+Phase 2      generate_tier1_masks.py        → SAM2 float .npy masks + QA
+Phase 2b     validate_masks.py              → QA report + overlays
+Phase 2c     sample_gold_standard.py        → 300-image gold standard set for human annotation
+Phase 2d     validate_gold_standard.py      → SAM2 IoU vs human masks (--sam2-only)
+Phase 3      train_teacher.py               → teacher_model_best.pth
+Phase 2e     validate_gold_standard.py      → SAM2 + Teacher IoU vs human masks (full run)
+Phase 4      factory_master.py              → pseudo_masks/ (4 modes)
+Phase 5a     train_student.py --stage 1     → encoder ablation (5 variants, Mode B)
+Phase 5b     train_student.py --stage 2     → mode ablation (best encoder, 4 modes)
+             generate_charts.py             → reports/charts/ (run any time after training)
+Phase 5c     validate_gold_standard.py      → full chain: SAM2→Teacher→Student IoU (final thesis table)
+Phase 6      select_best_pipeline.py        → checkpoints/final/ + summary
+Phase 7      evaluate_xai.py                → 3-way XAI comparison
+Phase 8      evaluate_severity.py           → inter-rater reliability
+Phase 9      export_tflite.py               → student_model.tflite
+Phase 10     build_deployment_package.py    → exports/deploy/ (both TFLite models)
+Phase 11     generate_report.py             → evaluation_report.html
 ```
 
 ### Execution order (run in this order)
@@ -73,14 +77,20 @@ python generate_charts.py --bouncer      # bouncer comparison + training curves
 python sample_15000.py
 python generate_tier1_masks.py
 python validate_masks.py             # review overlays before Teacher training
+python sample_gold_standard.py       # extract 300-image gold standard set
+                                     # → annotate in Label Studio (polygonlabels)
+                                     # → export JSON → data/gold_standard/annotations/annotations.json
+python validate_gold_standard.py --sam2-only   # SAM2 IoU vs human (before Teacher)
 python train_teacher.py
 python generate_charts.py --teacher      # teacher comparison + training curves
+python validate_gold_standard.py         # SAM2 + Teacher IoU chain vs human
 python factory_master.py
 python train_student.py --stage 1
 python train_student.py --stage 2 --encoder mobilenet_v2_cbam
 python generate_charts.py --student      # all student charts
 # or regenerate everything at once:
 python generate_charts.py
+python validate_gold_standard.py         # final chain: SAM2→Teacher→Student (thesis table)
 python select_best_pipeline.py       # auto-updates config.py
 python evaluate_xai.py
 python evaluate_severity.py --sample # fill rater scores, then:
@@ -205,8 +215,6 @@ Outputs: `preprocessing_report.csv`, `preprocessing_flagged.csv`, `preprocessing
 | **EfficientNet-B2 + UNet** | Efficient CNN (recommended) | ~7.7M |
 | SegFormer-B2 (mit_b2) via smp | Hierarchical ViT | ~25M |
 | EfficientNet-B2 + DeepLabV3+ | Decoder comparison (ASPP) | ~7.7M |
-
-**Hyperparameters:**
 - Input: 512×512 (larger than Student for boundary detail)
 - Batch: 8, Epochs: 30
 - Optimizer: AdamW (lr=5e-5, weight_decay=1e-4)
@@ -422,6 +430,39 @@ Self-contained single HTML file (all charts base64 embedded). Dark-themed. 9 sec
 8. Severity reliability (Kappa + Spearman ρ)
 9. Deployment summary (TFLite sizes, latency, deployment package contents)
 
+### 4.13 Gold Standard Validation (Phases 2c–2e, 5c)
+
+**Purpose:** Validate pseudo-label quality against 300 human-annotated leaf silhouette masks (100 per class). Provides a thesis-defensible chain comparison: SAM2 → Teacher → Student, all measured against the same human ground truth.
+
+**sample_gold_standard.py:**
+- Stratified sample: 100 HEALTHY + 100 MSV + 100 MLN from Tier 1 manifest (seed=42)
+- Renames files with class prefix (e.g. `MSV_image045.jpg`) for annotator clarity
+- Output: `data/label_studio_import/` — upload to Label Studio for polygon annotation
+
+**validate_gold_standard.py:**
+- Parses Label Studio JSON export (polygonlabels, % coordinates → rasterized binary masks)
+- Computes binary IoU per image for each of: SAM2 probability maps, Teacher predictions, Student predictions
+- Usage: `--sam2-only` flag skips model loading (run before Teacher training)
+
+**Config keys required:**
+```
+GOLD_IMAGES_DIR         = DATA_DIR / "gold_standard" / "images"
+GOLD_ANNOTATION_FILE    = DATA_DIR / "gold_standard" / "annotations" / "annotations.json"
+GOLD_IOU_WARN_THRESHOLD = 0.75   ← per-image flag threshold
+GOLD_IOU_TARGET_MEAN    = 0.80   ← overall validation target
+TEACHER_DEPLOYED_VARIANT = "efficientnet-b2"
+```
+
+**Run at three points:**
+1. After `generate_tier1_masks.py` — `--sam2-only` to validate SAM2 foundation
+2. After `train_teacher.py` — full run for SAM2 + Teacher chain
+3. After `train_student.py` — full run for complete SAM2 → Teacher → Student chain (thesis table)
+
+**Outputs:**
+- `reports/gold_standard_iou_report.csv` — per-image IoU for all 3 artifacts
+- `reports/gold_standard_iou_summary.csv` — mean ± std per class + overall
+- `reports/gold_standard_overlays/` — 5 comparison overlay PNGs per class per artifact (Green=missed, Cyan=correct, Red=extra)
+
 ---
 
 ## 5. Evaluation Metrics (Complete List)
@@ -483,12 +524,12 @@ Cohen's Kappa (inter-rater), Spearman ρ (HSV vs human)
 
 ---
 
-## 8. File Inventory (20 files, ~9,000 lines total)
+## 8. File Inventory (22 files, ~10,000 lines total)
 
 ```
 yellowmaize/
 ├── __init__.py                      Root package marker
-├── config.py                        All hyperparameters (295 lines)
+├── config.py                        All hyperparameters (295+ lines; includes GOLD_* keys)
 ├── image_utils.py                   EXIF correction, CLAHE, channel safety
 ├── requirements.txt                 All dependencies
 ├── partition_dataset.py             10-step preprocessing + 70/15/15 split
@@ -497,7 +538,9 @@ yellowmaize/
 ├── sample_15000.py                  Stratified 15k Tier 1 sampler
 ├── generate_tier1_masks.py          SAM2 auto-prompting + QA filters
 ├── validate_masks.py                QA report + qualitative overlays
-├── train_teacher.py                 3-variant teacher + test evaluation
+├── sample_gold_standard.py          Extract 300-image gold standard set for Label Studio
+├── validate_gold_standard.py        IoU validation: SAM2→Teacher→Student vs human masks
+├── train_teacher.py                 4-variant teacher + test evaluation
 ├── factory_master.py                4-mode pseudo-label factory + summary
 ├── train_student.py                 5-variant student + all metrics + test eval
 ├── generate_charts.py               Chart generator — reads logs/ CSVs → reports/charts/ PNGs
