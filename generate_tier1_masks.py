@@ -1,6 +1,6 @@
 """
 ================================================================================
- generate_tier1_masks.py — Phase 2: SAM2 Auto-Masking + QA  [v5]
+ generate_tier1_masks.py — Phase 2: SAM2 Auto-Masking + QA  [v6]
 ================================================================================
  PURPOSE:
    Apply SAM2 to all 15,000 Tier 1 images to generate precise binary leaf
@@ -8,7 +8,7 @@
      - float32 .npy  (raw SAM2 probability map — used as soft targets)
      - uint8 .png    (binarized at 0.5 — for visualization)
 
- AUTO-PROMPTING STRATEGY (v4 — contour bbox + adaptive retry):
+ AUTO-PROMPTING STRATEGY (v6 — contour bbox + background corner points + adaptive retry):
    For each image:
    1. Convert to HSV. Apply morphological closing to the tissue mask before
       component analysis (NEW v4) — this fills small holes / fragmented blobs
@@ -38,11 +38,35 @@
      when the leaf extends beyond the centroid axis.
    - Still zero training required — bbox derived from existing HSV mask.
 
- QA FILTERS (v5 — thresholds unchanged from v2/v3/v4):
+ QA FILTERS (v6 — thresholds unchanged from v2/v3/v4/v5):
    Filter 1 — Coverage range  : foreground must be 3%–90% of image
    Filter 2 — Mean confidence : mean prob of foreground region ≥ 0.65
    Filter 3 — Aspect ratio    : mask bounding box ratio ≥ 1.01
    Target rejection rate: < 8% of total images.
+
+ CHANGELOG (v5 → v6):
+   [FIX]  ROOT CAUSE OF coverage_high (16.7% of all images, 84% of rejections):
+          MSV leaves are heavily yellow-streaked, often nearly entirely yellow.
+          The yellow tissue mask spans most of the image → bbox covers 80%+ of
+          frame → SAM2, given a box covering most of the image with no other
+          guidance, expands the mask to fill the frame. The previous
+          coverage_high retry used pad=0, which only removes added padding —
+          useless when the tissue mask itself is already huge.
+   [NEW]  Background corner points (_MAX_BBOX_COVERAGE = 0.65):
+          When the bbox derived from the tissue mask covers more than 65% of
+          image area, four background-label points (label=0) are injected at
+          the image corners alongside the box prompt. SAM2 supports combined
+          box + points prompts — the box constrains the search region, the
+          background points prevent mask expansion into the corners/background.
+          This is the primary fix for MSV coverage_high failures.
+   [NEW]  force_bg_points on coverage_high retry:
+          All coverage_high retries now explicitly force background corner
+          points even if the tightened bbox has dropped below 65% threshold,
+          because if the first pass produced coverage_high, we know the image
+          is prone to over-segmentation.
+   [NEW]  _MAX_BBOX_COVERAGE = 0.65 and _BG_CORNER_PAD = 15 constants.
+   [KEEP] All v5 changes: confidence_low single-mask retry, set_image() once,
+          per-checkpoint reason breakdown.
 
  CHANGELOG (v4 → v5):
    [NEW]  confidence_low retry: re-runs SAM2 with multimask_output=False
@@ -149,6 +173,15 @@ _PAD_MAX       = 40   # cap to avoid box exceeding image bounds excessively
 # On coverage_low:  expand box by this many pixels on each side.
 _RETRY_PAD_TIGHT  = 0
 _RETRY_PAD_EXPAND = 30
+
+# Background corner points — injected when bbox is too large (NEW v6).
+# When the bbox area covers more than _MAX_BBOX_COVERAGE of the image, SAM2
+# gets four background-label (label=0) points at the image corners alongside
+# the box prompt. This prevents mask expansion into corners/background on MSV
+# images where the yellow tissue mask spans most of the frame.
+# All coverage_high retries also force background points (force_bg_points=True).
+_MAX_BBOX_COVERAGE = 0.65   # bbox area fraction threshold
+_BG_CORNER_PAD    = 15      # pixels from image edge for corner point placement
 
 # Minimum fraction of image pixels that must be tissue-colored before
 # falling back to the center-of-image point prompt (unchanged from v3).
@@ -439,13 +472,13 @@ def main() -> None:
         torch.cuda.manual_seed_all(SEED)
 
     print("=" * 72)
-    print("  Yellow MAIze | Phase 2: SAM2 Tier 1 Masking  [v5]")
+    print("  Yellow MAIze | Phase 2: SAM2 Tier 1 Masking  [v6]")
     print("=" * 72)
     print("  QA thresholds (v3 — unchanged from v2):")
     print(f"    Coverage     : {_QA_MIN_COVERAGE:.0%} – {_QA_MAX_COVERAGE:.0%}")
     print(f"    Confidence   : ≥ {_QA_MIN_CONFIDENCE:.2f}")
     print(f"    Aspect ratio : ≥ {_QA_MIN_ASPECT:.2f}")
-    print("  Prompting      : contour bbox → SAM2 box= + coverage retry + single-mask conf retry")
+    print("  Prompting      : contour bbox + bg corner pts (>65% bbox) → SAM2 box= + retries")
     print()
 
     # ── Preflight checks ──────────────────────────────────────────────────────
@@ -528,17 +561,47 @@ def main() -> None:
             n_rejected += 1
             continue
 
-        def predict_prob(box, point_coords, point_labels, multimask=True):
+        def predict_prob(box, point_coords, point_labels,
+                         multimask=True, force_bg_points=False):
             """
             Run SAM2 predict() and return an upscaled float32 prob_map.
             Assumes predictor.set_image() has already been called for this image.
+
+            v6: When the bbox covers > _MAX_BBOX_COVERAGE of image area (or when
+            force_bg_points=True), four background-label corner points are injected
+            alongside the box prompt. This tells SAM2 explicitly that the image
+            corners are background, preventing mask expansion on MSV images where
+            the yellow tissue mask spans most of the frame.
             """
+            h_img, w_img = img_rgb.shape[:2]
             with torch.inference_mode():
                 if box is not None:
-                    masks, scores, logits = predictor.predict(
-                        box=box,
-                        multimask_output=multimask,
-                    )
+                    # Check whether bbox covers enough of the frame to warrant
+                    # background corner points (NEW v6).
+                    x1, y1, x2, y2 = box[0]
+                    bbox_frac = (x2 - x1) * (y2 - y1) / (h_img * w_img)
+                    use_bg_pts = force_bg_points or (bbox_frac > _MAX_BBOX_COVERAGE)
+
+                    if use_bg_pts:
+                        cp = _BG_CORNER_PAD
+                        bg_pts = np.array([
+                            [cp,          cp],
+                            [w_img - cp,  cp],
+                            [cp,          h_img - cp],
+                            [w_img - cp,  h_img - cp],
+                        ], dtype=np.float32)
+                        bg_lbl = np.zeros(4, dtype=np.int32)
+                        masks, scores, logits = predictor.predict(
+                            box=box,
+                            point_coords=bg_pts,
+                            point_labels=bg_lbl,
+                            multimask_output=multimask,
+                        )
+                    else:
+                        masks, scores, logits = predictor.predict(
+                            box=box,
+                            multimask_output=multimask,
+                        )
                 else:
                     masks, scores, logits = predictor.predict(
                         point_coords=point_coords,
@@ -547,10 +610,9 @@ def main() -> None:
                     )
             best_idx  = int(np.argmax(scores))
             logit_map = logits[best_idx].squeeze()
-            h_orig, w_orig = img_rgb.shape[:2]
-            if logit_map.shape != (h_orig, w_orig):
+            if logit_map.shape != (h_img, w_img):
                 logit_map = cv2.resize(
-                    logit_map, (w_orig, h_orig),
+                    logit_map, (w_img, h_img),
                     interpolation=cv2.INTER_LINEAR,
                 )
             return (1.0 / (1.0 + np.exp(-logit_map))).astype(np.float32)
@@ -596,7 +658,12 @@ def main() -> None:
                 if retry_bbox is not None:
                     retry_box, _, _, _ = build_box_prompt(img_rgb, retry_bbox)
                     try:
-                        prob_map = predict_prob(retry_box, None, None, multimask=True)
+                        # force_bg_points=True: if the first pass produced
+                        # coverage_high, this image is prone to over-segmentation —
+                        # always inject corner background points on retry (NEW v6).
+                        prob_map = predict_prob(retry_box, None, None,
+                                               multimask=True,
+                                               force_bg_points=True)
                         passed, reason = qa_check(prob_map)
                         if passed:
                             strategy = retry_strategy + "_retry_tight"
@@ -733,7 +800,7 @@ def main() -> None:
         print(f"  [WARN] Rejection rate {reject_rate * 100:.1f}% still exceeds the "
               f"{SAM2_QA_MAX_REJECT_RATE * 100:.0f}% target.")
         print("         Read the rejection reason breakdown above — tune the dominant cause:")
-        print("           coverage_high  → tighten _GREEN_H_MAX (75) or _GREEN_S_MIN (50)")
+        print("           coverage_high  → lower _MAX_BBOX_COVERAGE (0.65) or raise _BG_CORNER_PAD (15)")
         print("           coverage_low   → raise _RETRY_PAD_EXPAND (30) or lower _MIN_TISSUE_FRACTION (0.05)")
         print("           center_fallback→ lower _MIN_COMPONENT_AREA_PX (500) or increase _MORPH_CLOSE_KSIZE (15)")
         print("           confidence_low → lower _QA_MIN_CONFIDENCE below 0.65 (last resort)")
