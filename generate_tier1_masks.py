@@ -1,6 +1,6 @@
 """
 ================================================================================
- generate_tier1_masks.py — Phase 2: SAM2 Auto-Masking + QA  [v2]
+ generate_tier1_masks.py — Phase 2: SAM2 Auto-Masking + QA  [v3]
 ================================================================================
  PURPOSE:
    Apply SAM2 to all 15,000 Tier 1 images to generate precise binary leaf
@@ -8,36 +8,47 @@
      - float32 .npy  (raw SAM2 probability map — used as soft targets)
      - uint8 .png    (binarized at 0.5 — for visualization)
 
- AUTO-PROMPTING STRATEGY:
+ AUTO-PROMPTING STRATEGY (v3 — contour bbox):
    For each image:
-   1. Convert to HSV. Detect BOTH healthy-green AND yellowed/necrotic tissue.
-      Yellow detection is critical: MSV and MLN destroy green tissue, so the
-      v1 green-only approach rejected exactly the images we most need masks for.
-   2. Pick the best available centroid (green → yellow → combined → center).
-      Center-of-image is used as a last-resort fallback instead of rejecting.
-   3. Use four image corners (10px inset) → background prompts (label=0).
-   Fully automatic, deterministic, and reproducible.
+   1. Convert to HSV. Build a combined tissue mask from THREE color ranges:
+        Green  (H=30–90)  — healthy leaf tissue
+        Yellow (H=15–38)  — MSV streak yellowing
+        Brown  (H=5–20)   — MLN necrotic / dead tissue  ← NEW in v3
+      This ensures severely diseased MLN leaves with minimal green/yellow
+      are still detected via their necrotic brown tissue.
+   2. Run cv2.connectedComponentsWithStats on the combined tissue mask.
+      Take cv2.boundingRect() of the largest connected component.
+      This gives a tight [x, y, x2, y2] bounding box directly from the
+      tissue mask — no YOLO training required.
+   3. Pass the bounding box as a SAM2 box prompt.
+      Box prompts are SAM2's strongest prompt type — they constrain the
+      search space far more precisely than point prompts, preventing the
+      model from expanding into background soil/sky.
+   4. Fallback: if no tissue is detected (all three ranges below threshold),
+      use four image corners as background points + image center as a single
+      foreground point. QA filters catch bad results.
 
- QA FILTERS (v2 — relaxed vs v1):
-   Filter 1 — Coverage range  : foreground must be 5%–90% of image
-                                 (was 10% — diseased leaves are sparse)
+ WHY BBOX > MULTI-POINT:
+   - Box prompts encode both position AND spatial extent of the leaf.
+   - Prevents mask leaking past sharp color edges (common on MSV leaves).
+   - Captures full leaf length including tips, which point prompts miss
+     when the leaf extends beyond the centroid axis.
+   - Still zero training required — bbox derived from existing HSV mask.
+
+ QA FILTERS (v3 — unchanged from v2):
+   Filter 1 — Coverage range  : foreground must be 3%–90% of image
    Filter 2 — Mean confidence : mean prob of foreground region ≥ 0.65
-                                 (unchanged)
-   Filter 3 — Aspect ratio    : mask bounding box ratio ≥ 1.05
-                                 (was 1.20 — overhead shots can be squarish)
+   Filter 3 — Aspect ratio    : mask bounding box ratio ≥ 1.01
    Target rejection rate: < 8% of total images.
 
- CHANGELOG (v1 → v2):
-   [FIX]  get_leaf_centroid: adds yellow HSV range (H=15–45) for MSV/MLN tissue
-   [FIX]  Minimum leaf-tissue coverage threshold: 0.10 → 0.05
-   [FIX]  Center-of-image fallback instead of immediate rejection
-   [FIX]  Aspect ratio QA threshold: 1.20 → 1.05
-   [FIX]  Coverage QA threshold: 0.10 → 0.05
-   [FIX]  Duplicate REPORTS_DIR import removed
-   [NEW]  prompt_strategy field in QA report (green/yellow/combined/center)
-   [NEW]  Per-reason rejection breakdown in summary
-   [NEW]  Prompt strategy breakdown in summary
-   [NEW]  Running rejection rate shown in progress log
+ CHANGELOG (v2 → v3):
+   [NEW]  Brown HSV range (H=5–20) for MLN necrotic tissue detection
+   [NEW]  get_leaf_bbox(): replaces get_leaf_centroid() — returns bbox not centroid
+   [NEW]  build_box_prompt(): replaces build_prompts() — uses SAM2 box= API
+   [NEW]  SAM2 predictor.predict() now uses box= instead of point_coords=
+   [NEW]  Strategy labels updated: *_bbox suffix (green_bbox, yellow_bbox, etc.)
+   [NEW]  center_fallback retains point-based prompting as last resort
+   [KEEP] All QA thresholds unchanged from v2
 
  OUTPUTS:
    data/tier1_leaf_masks/{stem}_softmask.npy   ← float32 probability map
@@ -61,6 +72,10 @@ from config import (
     SAM2_CHECKPOINT, SAM2_CONFIG,
     SAM2_GREEN_H_MIN, SAM2_GREEN_H_MAX,
     SAM2_GREEN_S_MIN, SAM2_GREEN_V_MIN,
+    SAM2_YELLOW_H_MIN, SAM2_YELLOW_H_MAX,
+    SAM2_YELLOW_S_MIN, SAM2_YELLOW_V_MIN,
+    SAM2_BROWN_H_MIN,  SAM2_BROWN_H_MAX,
+    SAM2_BROWN_S_MIN,  SAM2_BROWN_V_MIN,
     SAM2_QA_MIN_COVERAGE, SAM2_QA_MAX_COVERAGE,
     SAM2_QA_MIN_CONFIDENCE, SAM2_QA_MIN_ASPECT_RATIO,
     SAM2_QA_MAX_REJECT_RATE,
@@ -75,17 +90,13 @@ _QA_MAX_COVERAGE   = 0.90   # unchanged
 _QA_MIN_CONFIDENCE = 0.65   # unchanged
 _QA_MIN_ASPECT     = 1.01  # was SAM2_QA_MIN_ASPECT_RATIO (1.20)
 
-# ── Yellow/necrotic HSV detection ranges (v2 addition) ────────────────────────
-# Covers MSV streak yellowing and MLN necrotic discoloration.
-# H=15–45 → yellow-green through yellow in OpenCV's 0–179 hue scale.
-_YELLOW_H_MIN = 15
-_YELLOW_H_MAX = 45
-_YELLOW_S_MIN = 40    # exclude washed-out whites/greys
-_YELLOW_V_MIN = 60    # exclude dark shadows
-
-# Minimum fraction of image that must be leaf-colored before falling back
-# to the center-of-image prompt.
+# Minimum fraction of image pixels that must be tissue-colored before
+# falling back to the center-of-image point prompt.
 _MIN_TISSUE_FRACTION = 0.05
+
+# Minimum pixel area for a connected component to be considered a valid leaf.
+# Prevents tiny noise blobs from driving the bbox.
+_MIN_COMPONENT_AREA_PX = 500
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -117,132 +128,159 @@ def load_sam2(checkpoint: Path, config: str):
 # AUTO-PROMPTING  (v2 — disease-aware, multi-point foreground)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def get_leaf_centroid(img_rgb: np.ndarray) -> tuple[tuple[int, int], str]:
+# ══════════════════════════════════════════════════════════════════════════════
+# AUTO-PROMPTING  (v3 — contour bbox, disease-aware)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_leaf_bbox(
+    img_rgb: np.ndarray,
+) -> tuple[tuple[int, int, int, int] | None, str]:
     """
-    Find the centroid of the dominant leaf-tissue region.
+    Derive a tight bounding box around the dominant leaf-tissue region
+    using HSV color segmentation. No model training required.
 
-    Detection priority:
-      1. Combined green + yellow mask (mixed healthy/diseased tissue)
-      2. Green-only  (clearly healthy leaf)
-      3. Yellow-only (heavily diseased, minimal green remains)
-      4. Center of image (last resort — still lets SAM2 attempt segmentation)
+    THREE tissue ranges are combined (v3):
+      Green  (H=30–90)  — healthy leaf tissue
+      Yellow (H=15–38)  — MSV streak yellowing
+      Brown  (H=5–20)   — MLN necrotic / dead tissue
 
-    Why the fallback matters:
-      MSV and MLN destroy green tissue. A heavily infected leaf can have
-      near-zero green pixels, so the v1 green-only approach was silently
-      rejecting diseased images before SAM2 even ran. The center-of-image
-      fallback keeps those images in the pipeline and lets SAM2 — which
-      has much richer visual priors — decide whether the mask is valid.
+    Detection logic:
+      1. Build per-range binary masks and OR them into a combined tissue mask.
+      2. Run connected-component analysis; pick the largest component whose
+         area exceeds _MIN_COMPONENT_AREA_PX.
+      3. Return cv2.boundingRect() of that component as (x1, y1, x2, y2).
+      4. If no qualifying component is found, return None → center_fallback.
 
     Args:
-        img_rgb: H×W×3 uint8 RGB image (EXIF-corrected by load_image_rgb).
+        img_rgb: H×W×3 uint8 RGB image (EXIF-corrected).
 
     Returns:
-        centroid : (cx, cy) pixel coordinates for the foreground prompt.
-        strategy : diagnostic label logged to the QA report.
-                   One of: "green_centroid" | "yellow_centroid" |
-                            "combined_centroid" | "center_fallback"
+        bbox     : (x1, y1, x2, y2) in pixel coordinates, or None on fallback.
+        strategy : one of "green_bbox" | "yellow_bbox" | "brown_bbox" |
+                          "combined_bbox" | "center_fallback"
     """
-    img_hsv  = to_hsv(img_rgb)       # image_utils guarantees RGB→HSV
+    img_hsv  = to_hsv(img_rgb)
     h, s, v  = img_hsv[:, :, 0], img_hsv[:, :, 1], img_hsv[:, :, 2]
     total_px = img_rgb.shape[0] * img_rgb.shape[1]
 
-    # ── 1. Healthy-green mask ─────────────────────────────────────────────────
+    # ── 1. Build per-tissue masks ─────────────────────────────────────────────
     green_mask = (
-        (h >= SAM2_GREEN_H_MIN) & (h <= SAM2_GREEN_H_MAX) &
-        (s >= SAM2_GREEN_S_MIN) &
-        (v >= SAM2_GREEN_V_MIN)
+        (h >= SAM2_GREEN_H_MIN)  & (h <= SAM2_GREEN_H_MAX) &
+        (s >= SAM2_GREEN_S_MIN)  & (v >= SAM2_GREEN_V_MIN)
     ).astype(np.uint8)
 
-    # ── 2. Yellowed / necrotic mask ───────────────────────────────────────────
-    # Captures MSV streak yellowing and MLN necrotic patches that are
-    # invisible to the green-only detector.
     yellow_mask = (
-        (h >= _YELLOW_H_MIN) & (h <= _YELLOW_H_MAX) &
-        (s >= _YELLOW_S_MIN) &
-        (v >= _YELLOW_V_MIN)
+        (h >= SAM2_YELLOW_H_MIN) & (h <= SAM2_YELLOW_H_MAX) &
+        (s >= SAM2_YELLOW_S_MIN) & (v >= SAM2_YELLOW_V_MIN)
     ).astype(np.uint8)
 
-    green_frac  = int(green_mask.sum())  / total_px
-    yellow_frac = int(yellow_mask.sum()) / total_px
-    has_green   = green_frac  >= _MIN_TISSUE_FRACTION
-    has_yellow  = yellow_frac >= _MIN_TISSUE_FRACTION
+    # Brown/necrotic: MLN dead tissue — low saturation allowed (ash/straw)
+    brown_mask = (
+        (h >= SAM2_BROWN_H_MIN)  & (h <= SAM2_BROWN_H_MAX) &
+        (s >= SAM2_BROWN_S_MIN)  & (v >= SAM2_BROWN_V_MIN)
+    ).astype(np.uint8)
 
-    # ── 3. Choose tissue mask ─────────────────────────────────────────────────
-    if has_green and has_yellow:
-        tissue_mask = np.clip(green_mask + yellow_mask, 0, 1).astype(np.uint8)
-        strategy    = "combined_centroid"
-    elif has_green:
-        tissue_mask = green_mask
-        strategy    = "green_centroid"
-    elif has_yellow:
-        tissue_mask = yellow_mask
-        strategy    = "yellow_centroid"
-    else:
-        # No qualifying tissue found — fall back to image center.
-        # SAM2 will still run; QA filters decide the outcome.
-        cy = img_rgb.shape[0] // 2
-        cx = img_rgb.shape[1] // 2
-        return (cx, cy), "center_fallback"
+    green_frac  = green_mask.sum()  / total_px
+    yellow_frac = yellow_mask.sum() / total_px
+    brown_frac  = brown_mask.sum()  / total_px
 
-    # ── 4. Centroid of largest connected component ────────────────────────────
-    num_labels, _, stats, centroids = cv2.connectedComponentsWithStats(
+    has_green  = green_frac  >= _MIN_TISSUE_FRACTION
+    has_yellow = yellow_frac >= _MIN_TISSUE_FRACTION
+    has_brown  = brown_frac  >= _MIN_TISSUE_FRACTION
+
+    # ── 2. Combine detected ranges into a single tissue mask ──────────────────
+    if not (has_green or has_yellow or has_brown):
+        # No tissue detected at all — fall back to center point prompt
+        return None, "center_fallback"
+
+    tissue_mask = np.zeros_like(green_mask)
+    active = []
+    if has_green:
+        tissue_mask = np.clip(tissue_mask + green_mask, 0, 1).astype(np.uint8)
+        active.append("green")
+    if has_yellow:
+        tissue_mask = np.clip(tissue_mask + yellow_mask, 0, 1).astype(np.uint8)
+        active.append("yellow")
+    if has_brown:
+        tissue_mask = np.clip(tissue_mask + brown_mask, 0, 1).astype(np.uint8)
+        active.append("brown")
+
+    strategy = ("combined_bbox" if len(active) > 1
+                else f"{active[0]}_bbox")
+
+    # ── 3. Largest qualifying connected component ─────────────────────────────
+    num_labels, labels_map, stats, _ = cv2.connectedComponentsWithStats(
         tissue_mask, connectivity=8)
 
     if num_labels < 2:
-        # Pixel count passed but no discrete component found (edge case).
-        cy = img_rgb.shape[0] // 2
-        cx = img_rgb.shape[1] // 2
-        return (cx, cy), "center_fallback"
+        return None, "center_fallback"
 
-    best_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    cx = int(centroids[best_label][0])
-    cy = int(centroids[best_label][1])
-    return (cx, cy), strategy
+    # Filter components below minimum area, then pick the largest
+    component_areas = stats[1:, cv2.CC_STAT_AREA]   # exclude background (label 0)
+    valid_indices   = np.where(component_areas >= _MIN_COMPONENT_AREA_PX)[0]
+
+    if len(valid_indices) == 0:
+        return None, "center_fallback"
+
+    best_label = 1 + int(valid_indices[np.argmax(component_areas[valid_indices])])
+    x = int(stats[best_label, cv2.CC_STAT_LEFT])
+    y = int(stats[best_label, cv2.CC_STAT_TOP])
+    w = int(stats[best_label, cv2.CC_STAT_WIDTH])
+    h_box = int(stats[best_label, cv2.CC_STAT_HEIGHT])
+
+    img_h, img_w = img_rgb.shape[:2]
+    pad = 8   # small padding so SAM2 sees the leaf edge in context
+
+    x1 = max(0,     x - pad)
+    y1 = max(0,     y - pad)
+    x2 = min(img_w, x + w + pad)
+    y2 = min(img_h, y + h_box + pad)
+
+    return (x1, y1, x2, y2), strategy
 
 
-def build_prompts(
+def build_box_prompt(
     img_rgb: np.ndarray,
-    centroid: tuple[int, int],
-) -> tuple[np.ndarray, np.ndarray]:
+    bbox: tuple[int, int, int, int] | None,
+) -> tuple[np.ndarray | None, np.ndarray | None,
+           np.ndarray | None, np.ndarray | None]:
     """
-    Build SAM2 point prompts.
+    Build SAM2 prompt arrays from a bounding box.
 
-    Foreground (label=1):
-      - centroid of dominant leaf-tissue blob
-      - upper-half midpoint (centroid_x, midpoint between top and centroid_y)
-      - lower-half midpoint (centroid_x, midpoint between centroid_y and bottom)
-      Using three foreground points better anchors long, narrow maize leaves
-      whose full length a single centroid may fail to capture.
+    Primary path (bbox is not None):
+      Returns box=np.array([[x1,y1,x2,y2]]) and no point prompts.
+      SAM2 box prompts are the strongest single-prompt type — they encode
+      both position and spatial extent, preventing mask leakage past leaf edges.
 
-    Background (label=0): four corners, 10px inset from each edge.
+    Fallback path (bbox is None — center_fallback):
+      Returns a single center foreground point + four background corner points.
+      This mirrors the v2 behavior for images where no tissue was detected.
+
+    Returns:
+        box          : (1,4) float32 array or None
+        point_coords : (N,2) float32 array or None
+        point_labels : (N,)  int32  array or None
+        (unused)     : None  (reserved for future multi-box support)
     """
-    h, w  = img_rgb.shape[:2]
-    pad   = 10
-    cx, cy = centroid
+    h, w = img_rgb.shape[:2]
+    pad  = 10
 
-    # Three foreground points along the leaf's vertical axis
-    upper_y = (0 + cy) // 2          # midpoint between top edge and centroid
-    lower_y = (cy + h) // 2          # midpoint between centroid and bottom edge
+    if bbox is not None:
+        x1, y1, x2, y2 = bbox
+        box = np.array([[x1, y1, x2, y2]], dtype=np.float32)
+        return box, None, None, None
 
-    fg_points = np.array([
-        [cx, cy     ],   # centroid (primary anchor)
-        [cx, upper_y],   # upper-half midpoint
-        [cx, lower_y],   # lower-half midpoint
+    # center_fallback: single foreground point + four background corners
+    cx, cy = w // 2, h // 2
+    point_coords = np.array([
+        [cx,       cy      ],   # center foreground
+        [pad,      pad     ],   # top-left background
+        [w - pad,  pad     ],   # top-right background
+        [pad,      h - pad ],   # bottom-left background
+        [w - pad,  h - pad ],   # bottom-right background
     ], dtype=np.float32)
-    fg_labels = np.array([1, 1, 1], dtype=np.int32)
-
-    bg_points = np.array([
-        [pad,     pad    ],   # top-left
-        [w - pad, pad    ],   # top-right
-        [pad,     h - pad],   # bottom-left
-        [w - pad, h - pad],   # bottom-right
-    ], dtype=np.float32)
-    bg_labels = np.array([0, 0, 0, 0], dtype=np.int32)
-
-    all_points = np.vstack([fg_points, bg_points])
-    all_labels = np.concatenate([fg_labels, bg_labels])
-    return all_points, all_labels
+    point_labels = np.array([1, 0, 0, 0, 0], dtype=np.int32)
+    return None, point_coords, point_labels, None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -305,13 +343,13 @@ def main() -> None:
     t_global = time.time()
 
     print("=" * 72)
-    print("  Yellow MAIze | Phase 2: SAM2 Tier 1 Masking  [v2]")
+    print("  Yellow MAIze | Phase 2: SAM2 Tier 1 Masking  [v3]")
     print("=" * 72)
-    print("  QA thresholds (v2):")
-    print(f"    Coverage     : {_QA_MIN_COVERAGE:.0%} – {_QA_MAX_COVERAGE:.0%}  "
-          f"(v1 was 10% – 90%)")
-    print(f"    Confidence   : ≥ {_QA_MIN_CONFIDENCE:.2f}  (unchanged)")
-    print(f"    Aspect ratio : ≥ {_QA_MIN_ASPECT:.2f}  (v1 was 1.20)")
+    print("  QA thresholds (v3 — unchanged from v2):")
+    print(f"    Coverage     : {_QA_MIN_COVERAGE:.0%} – {_QA_MAX_COVERAGE:.0%}")
+    print(f"    Confidence   : ≥ {_QA_MIN_CONFIDENCE:.2f}")
+    print(f"    Aspect ratio : ≥ {_QA_MIN_ASPECT:.2f}")
+    print("  Prompting      : contour bbox (green+yellow+brown HSV) → SAM2 box=")
     print()
 
     # ── Preflight checks ──────────────────────────────────────────────────────
@@ -368,19 +406,27 @@ def main() -> None:
             n_rejected += 1
             continue
 
-        # ── Auto-prompting (v2: disease-aware) ───────────────────────────────
-        centroid, strategy = get_leaf_centroid(img_rgb)
+        # ── Auto-prompting (v3: contour bbox, disease-aware) ─────────────────
+        bbox, strategy = get_leaf_bbox(img_rgb)
         strategy_counts[strategy] += 1
-        points, labels = build_prompts(img_rgb, centroid)
+        box, point_coords, point_labels, _ = build_box_prompt(img_rgb, bbox)
 
         # ── SAM2 inference ────────────────────────────────────────────────────
         try:
             predictor.set_image(img_rgb)
-            masks, scores, logits = predictor.predict(
-                point_coords=points,
-                point_labels=labels,
-                multimask_output=True,
-            )
+            if box is not None:
+                # Primary path: bounding box prompt (strongest SAM2 input)
+                masks, scores, logits = predictor.predict(
+                    box=box,
+                    multimask_output=True,
+                )
+            else:
+                # Fallback path: center point + corner background points
+                masks, scores, logits = predictor.predict(
+                    point_coords=point_coords,
+                    point_labels=point_labels,
+                    multimask_output=True,
+                )
             # Pick the candidate mask with highest SAM2 score
             best_idx = int(np.argmax(scores))
             # logits → sigmoid probability
@@ -494,7 +540,8 @@ def main() -> None:
         print(f"  [WARN] Rejection rate {reject_rate * 100:.1f}% still exceeds the "
               f"{SAM2_QA_MAX_REJECT_RATE * 100:.0f}% target.")
         print("         Check the rejection breakdown above and review the QA report.")
-        print("         If 'center_fallback' is high, consider adding a bbox prompt.")
+        print("         If 'center_fallback' is high, check HSV ranges in config.py.")
+        print("         (SAM2_GREEN/YELLOW/BROWN_H_MIN/MAX)")
     else:
         print(f"  [OK] Rejection rate within acceptable range "
               f"({reject_rate * 100:.1f}% ≤ {SAM2_QA_MAX_REJECT_RATE * 100:.0f}%).")
