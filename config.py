@@ -135,10 +135,10 @@ CLAHE_TILE_GRID = (8, 8)  # local region size for histogram equalization
 # ══════════════════════════════════════════════════════════════════════════════
 # Auto-prompting HSV range for foreground detection.
 # GREEN: healthy leaf tissue
-SAM2_GREEN_H_MIN = 30
-SAM2_GREEN_H_MAX = 90
-SAM2_GREEN_S_MIN = 40
-SAM2_GREEN_V_MIN = 40
+SAM2_GREEN_H_MIN = 35   # was 30 — raised to avoid warm yellows
+SAM2_GREEN_H_MAX = 75   # was 90 — excludes cogon grass band (H=75–90)
+SAM2_GREEN_S_MIN = 50   # was 40 — excludes dull/background greens
+SAM2_GREEN_V_MIN = 40   # unchanged
 
 # YELLOW: MSV chlorotic streaks / early-stage yellowing
 SAM2_YELLOW_H_MIN = 15
@@ -153,11 +153,11 @@ SAM2_BROWN_S_MIN = 30
 SAM2_BROWN_V_MIN = 50
 
 # QA filter thresholds
-SAM2_QA_MIN_COVERAGE = 0.10  # reject if foreground < 10% of image
-SAM2_QA_MAX_COVERAGE = 0.90  # reject if foreground > 90% of image
-SAM2_QA_MIN_CONFIDENCE = 0.60  # v7: lowered from 0.65 — absorbs dark MLN leaves
-SAM2_QA_MIN_ASPECT_RATIO = 1.20  # reject if mask aspect ratio < 1.2
-SAM2_QA_MAX_REJECT_RATE = 0.08  # warn if > 8% of images rejected
+SAM2_QA_MIN_COVERAGE = 0.03   # reject if foreground < 3% of image (close-up leaves fill frame)
+SAM2_QA_MAX_COVERAGE = 0.99   # was 0.90 — raised after data showed 2,537 valid close-up masks wrongly rejected
+SAM2_QA_MIN_CONFIDENCE = 0.50 # was 0.60/0.65 — lowered after data showed diseased leaves cluster at 0.51–0.64
+SAM2_QA_MIN_ASPECT_RATIO = 1.01  # was 1.20 — overhead/square-frame leaves are valid
+SAM2_QA_MAX_REJECT_RATE = 0.08   # warn if > 8% of images rejected
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TEACHER
