@@ -78,7 +78,9 @@ python sample_15000.py
 python generate_tier1_masks.py
 python validate_masks.py             # review overlays before Teacher training
 python sample_gold_standard.py       # extract 300-image gold standard set
-                                     # → annotate in Label Studio (polygonlabels)
+                                     # → images auto-copied to data/gold_standard/images/
+                                     # → upload that folder to Label Studio
+                                     # → annotate leaf silhouettes (polygonlabels)
                                      # → export JSON → data/gold_standard/annotations/annotations.json
 python validate_gold_standard.py --sam2-only   # SAM2 IoU vs human (before Teacher)
 python train_teacher.py
@@ -463,7 +465,11 @@ Self-contained single HTML file (all charts base64 embedded). Dark-themed. 9 sec
 **sample_gold_standard.py:**
 - Stratified sample: 100 HEALTHY + 100 MSV + 100 MLN from Tier 1 manifest (seed=42)
 - Renames files with class prefix (e.g. `MSV_image045.jpg`) for annotator clarity
-- Output: `data/label_studio_import/` — upload to Label Studio for polygon annotation
+- Output: `data/gold_standard/images/` — upload directly to Label Studio for polygon annotation
+- Also writes `data/gold_standard/gold_manifest.csv` (column: `gold_filename`)
+- Hash guard: SHA-256 hash of `tier1_manifest.csv` written to `_manifest_hash.txt` on first run.
+  If `sample_15000.py` is re-run after annotation begins, subsequent runs abort with a clear
+  error instead of silently producing a mismatched 300-image set.
 
 **validate_gold_standard.py:**
 - Parses Label Studio JSON export (polygonlabels, % coordinates → rasterized binary masks)
@@ -473,6 +479,7 @@ Self-contained single HTML file (all charts base64 embedded). Dark-themed. 9 sec
 **Config keys required:**
 ```
 GOLD_IMAGES_DIR         = DATA_DIR / "gold_standard" / "images"
+GOLD_MANIFEST           = DATA_DIR / "gold_standard" / "gold_manifest.csv"
 GOLD_ANNOTATION_FILE    = DATA_DIR / "gold_standard" / "annotations" / "annotations.json"
 GOLD_IOU_WARN_THRESHOLD = 0.75   ← per-image flag threshold
 GOLD_IOU_TARGET_MEAN    = 0.80   ← overall validation target
