@@ -1,5 +1,4 @@
 # Yellow MAIze — Detailed Technical Blueprint
-
 ## Complete reference for code, pipeline, models, data, and architecture
 
 ---
@@ -228,6 +227,7 @@ yellowmaize/                               ← Project root (WSL2 working direct
 │
 ├── scripts/
 │   ├── __init__.py
+│   ├── bouncer_inference.py           ← Shared bouncer inference (heuristic + neural); used by factory_master.py and train_bouncer.py
 │   └── safe_collate.py                    ← DataLoader corruption guard
 │
 ├── __init__.py                            ← Root package marker
@@ -441,10 +441,10 @@ Pass → Stage 2 neural classifier
 Pretrained weights: IMAGENET1K_V2
 Head: Linear(960→1)   [replaces ImageNet classifier]
 Loss: BCEWithLogitsLoss
-Optimizer: AdamW(lr=1.25e-4, weight_decay=1e-4)
+Optimizer: AdamW(lr=1e-4, weight_decay=1e-4)
 Scheduler: CosineAnnealingLR(T_max=15, eta_min=1e-6)
 Epochs: 15
-Batch: 40
+Batch: 64
 Val split: 80/20 (internal, seed=42)
 Early stop: patience=5, monitors val F1
 Checkpoint: best val F1 → bouncer_{variant}_best.pth
@@ -469,7 +469,16 @@ Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225])
 After training, load best checkpoint.
 Run on val split, collect sigmoid scores + true labels.
 Plot ROC curve (fpr, tpr, thresholds).
-Select threshold = argmax(specificity) subject to maize recall ≥ 0.95
+Select threshold = argmax(geometric_mean(recall × specificity)^0.5)
+  subject to maize recall ≥ 0.95.
+Hard cap: threshold = min(selected_threshold, 0.70).
+
+FIX (v2): Previously maximised specificity alone, which caused near-1.0
+thresholds on high-performing models (ROC AUC ~1.0), resulting in 88%+
+filter rates at inference. Geometric mean balances both metrics and
+produces a usable production threshold. Hard cap at 0.70 as additional
+safeguard — a model with AUC ~1.0 needs no higher threshold.
+
 Report: threshold value, specificity, maize recall, ROC-AUC, TP/FP/TN/FN
 ```
 
@@ -510,7 +519,31 @@ Report:
 Output: logs/bouncer_admission_rate_{variant}.csv
 ```
 
-### 6.9 Metrics Reported
+### 6.9 Shared Bouncer Inference (scripts/bouncer_inference.py)
+```
+Single source of truth for inference helpers shared by train_bouncer.py
+and factory_master.py. Extracting here ensures any future changes to the
+threshold logic or transform pipeline are made in one place only.
+
+heuristic_prefilter(img_rgb) → bool
+  Lightweight pre-filter before neural inference.
+  Currently a PASSTHROUGH (always returns True).
+  The original OpenCV green-coverage heuristic was removed after causing
+  false rejections on yellow/bleached MSV leaves under variable tropical
+  lighting. The neural classifier is sufficient and fast enough at 224×224.
+
+neural_bouncer(img_rgb, model, threshold) → bool
+  Runs trained MobileNetV3-Large neural Bouncer on a single EXIF-corrected
+  RGB image. Applies BOUNCER_INFER_TF (letterbox 224×224, ImageNet normalize).
+  Returns True (maize) if sigmoid(logit) >= threshold.
+
+BOUNCER_INFER_TF: LongestMaxSize(224) + PadIfNeeded + Normalize + ToTensorV2
+
+Dependencies: torch, albumentations, config.BOUNCER_IMG_SIZE only.
+  No SAM2, Teacher, or other heavy imports — lightweight for import anywhere.
+```
+
+### 6.10 Metrics Reported
 ```
 Per-epoch log: loss, accuracy, maize_prec, maize_rec, maize_f1, specificity, lr
 Comparison CSV: variant, best_f1, threshold, specificity, maize_recall, roc_auc,
@@ -544,63 +577,104 @@ tier1_manifest.csv  → columns: dest_filename, source_path, category, split, ti
 
 ---
 
-## PART 8 — SAM2 MASKING (generate_tier1_masks.py)
+## PART 8 — SAM2 MASKING (generate_tier1_masks.py) [v3]
 
-### 8.1 Auto-Prompting Strategy (v3 — contour bbox)
+### 8.1 Auto-Prompting Strategy (v3 — Contour Bbox)
 ```
 For each Tier 1 image:
 1. load_image_rgb(path) → EXIF-corrected uint8 RGB
 2. Convert to HSV: to_hsv(img_rgb)
-3. Build combined tissue mask from THREE color ranges:
-   Green  (H=30–90)  — healthy leaf tissue
-   Yellow (H=15–38)  — MSV streak yellowing
-   Brown  (H=5–20)   — MLN necrotic / dead tissue
-   This ensures severely diseased MLN leaves with minimal green/yellow
-   are still detected via their necrotic brown tissue.
-4. Run cv2.connectedComponentsWithStats on the combined tissue mask.
-5. Take cv2.boundingRect() of the largest connected component.
-   This gives a tight [x, y, x2, y2] bounding box directly from the
-   tissue mask — no YOLO training required.
-6. Pass the bounding box as a SAM2 box prompt.
-   Box prompts are SAM2's strongest prompt type — they constrain the
-   search space far more precisely than point prompts, preventing the
-   model from expanding into background soil/sky.
-7. Fallback: if no tissue is detected (all three ranges below threshold),
-   use four image corners as background points + image center as a single
-   foreground point. QA filters catch bad results.
-8. Run SAM2.predict() with box= or point_coords=/point_labels=
-9. Select mask with highest SAM2 confidence score
+3. Build THREE tissue masks (v3 — disease-aware):
+     Green  (H=30–90, S>40, V>40)   — healthy leaf tissue
+     Yellow (H=15–38, S>0, V>0)     — MSV streak yellowing
+     Brown  (H=5–20,  S>0, V>0)     — MLN necrotic / dead tissue  [NEW in v3]
+4. Combine tissue masks via OR into a single combined tissue mask
+5. Run cv2.connectedComponentsWithStats on combined mask
+6. Select largest qualifying component (area ≥ 500px)
+7. Derive tight bounding box with 8px padding → (x1, y1, x2, y2)
+8. Pass bbox as SAM2 box prompt (box=np.array([[x1,y1,x2,y2]]))
+9. Select mask with highest SAM2 confidence score (multimask_output=True)
 10. Convert logits → probability via sigmoid: 1/(1+exp(-logits))
 11. Store raw float32 probability map as .npy (NO binarization)
 12. Also store binarized (≥0.5) as uint8 .png for visualization
+
+Fallback (center_fallback): if no tissue detected above _MIN_TISSUE_FRACTION (0.05)
+  → single center foreground point + four background corner points (v2 behaviour)
+
+WHY BBOX > MULTI-POINT (v3 rationale):
+  - Box prompts encode both position AND spatial extent of the leaf
+  - Prevents mask leaking past sharp colour edges (common on MSV leaves)
+  - Captures full leaf length including tips, which point prompts miss
+  - Still zero training required — bbox derived from HSV tissue mask
 ```
 
-### 8.2 Three QA Filters
+### 8.2 Prompt Strategy Labels
+```
+strategy returned by get_leaf_bbox():
+  "green_bbox"    — only green tissue detected
+  "yellow_bbox"   — only yellow tissue detected
+  "brown_bbox"    — only brown/necrotic tissue detected
+  "combined_bbox" — multiple tissue types detected (most common)
+  "center_fallback" — no qualifying tissue detected
+```
+
+### 8.3 Three QA Filters (v3 — relaxed thresholds from v2)
 ```
 Filter 1 — Coverage range:
   binary = (prob_map >= 0.5)
   fg_coverage = binary.sum() / (H * W)
-  Reject if fg_coverage < 0.03 (too small — wrong object segmented)
-  Reject if fg_coverage > 0.90 (too large — background leaked in)
+  Reject if fg_coverage < 0.03  [v2/v3: was 0.10 — relaxed for small/diseased leaves]
+  Reject if fg_coverage > 0.90  [unchanged]
 
 Filter 2 — Mean foreground confidence:
   mean_conf = prob_map[binary==1].mean()
-  Reject if mean_conf < 0.65 (SAM2 was uncertain)
+  Reject if mean_conf < 0.65    [unchanged]
 
 Filter 3 — Shape sanity:
   Fit bounding box to binary mask
   aspect = max(h,w) / min(h,w)
-  Reject if aspect < 1.01 (too round — wrong object)
+  Reject if aspect < 1.01       [v2/v3: was 1.20 — relaxed for overhead/square frames]
 
 Target: < 8% rejection rate
-If > 8% → warn, review QA report, consider adjusting prompting HSV ranges
-Output: tier1_qa_report.csv → filename, category, status, reason, coverage, mean_conf
+If > 8% → warn, review QA report, check HSV ranges in config.py
+  (SAM2_GREEN/YELLOW/BROWN_H_MIN/MAX) and whether center_fallback rate is high
+Output: tier1_qa_report.csv → filename, category, status, reason, prompt_strategy,
+        coverage, mean_conf
 ```
 
-### 8.3 Output Files per Image
+### 8.4 Config Keys Required (v3 additions)
+```
+# Green tissue (unchanged)
+SAM2_GREEN_H_MIN, SAM2_GREEN_H_MAX, SAM2_GREEN_S_MIN, SAM2_GREEN_V_MIN
+
+# Yellow tissue (unchanged)
+SAM2_YELLOW_H_MIN, SAM2_YELLOW_H_MAX, SAM2_YELLOW_S_MIN, SAM2_YELLOW_V_MIN
+
+# Brown/necrotic tissue [NEW in v3]
+SAM2_BROWN_H_MIN, SAM2_BROWN_H_MAX, SAM2_BROWN_S_MIN, SAM2_BROWN_V_MIN
+
+SAM2_QA_MIN_COVERAGE   = 0.03   # overridden locally in script
+SAM2_QA_MAX_COVERAGE   = 0.90
+SAM2_QA_MIN_CONFIDENCE = 0.65
+SAM2_QA_MIN_ASPECT_RATIO = 1.01 # overridden locally in script
+SAM2_QA_MAX_REJECT_RATE  = 0.08
+```
+
+### 8.5 Output Files per Image
 ```
 data/tier1_leaf_masks/{stem}_softmask.npy  ← float32 [0,1] probability map (MAIN TARGET)
 data/tier1_leaf_masks/{stem}_mask.png      ← uint8 255/0 binary visualization
+```
+
+### 8.6 Changelog (v2 → v3)
+```
+[NEW]  Brown HSV range (H=5–20) for MLN necrotic tissue detection
+[NEW]  get_leaf_bbox(): replaces get_leaf_centroid() — returns bbox not centroid
+[NEW]  build_box_prompt(): replaces build_prompts() — uses SAM2 box= API
+[NEW]  SAM2 predictor.predict() now uses box= instead of point_coords=
+[NEW]  Strategy labels updated: *_bbox suffix (green_bbox, yellow_bbox, etc.)
+[NEW]  center_fallback retains point-based prompting as last resort
+[KEEP] All QA thresholds unchanged from v2 (already relaxed in v2)
 ```
 
 ---
@@ -692,8 +766,13 @@ Process all ~215k train+val Tier 2 images. Generate pseudo-labels across 4 modes
 ### 10.2 Per-Image Processing Stages
 ```
 Stage 1 — Bouncer gate:
-  a. Heuristic pre-filter (green coverage + aspect ratio)
-  b. Neural Bouncer (MobileNetV3-Large, empirical threshold)
+  Helpers imported from scripts/bouncer_inference.py (single source of truth
+  shared with train_bouncer.py — no copy-paste drift between scripts):
+  a. heuristic_prefilter(img_rgb) — currently a passthrough (always True);
+     original green-coverage heuristic removed after false rejections on
+     yellow/bleached MSV leaves under variable tropical lighting
+  b. neural_bouncer(img_rgb, model, threshold) — MobileNetV3-Large,
+     empirical threshold from ROC curve
   → Rejected: log "filtered_heuristic" or "filtered_bouncer", skip
 
 Stage 2 — Leaf silhouette:
@@ -717,7 +796,6 @@ Stage 5 — HSV symptom masking (mode-dependent):
   Convert to HSV: to_hsv(img_rgb)  [guaranteed RGB→HSV]
   Apply green exclusion zone first (remove healthy chlorophyll)
   Apply disease-specific HSV ranges (MSV: 4 bands, MLN: 5 bands)
-  **Apply Gabor filter for MSV texture enhancement (AND with HSV result)**
   Mode A: Otsu silhouette + hard binary
   Mode B: SAM2 hard binary silhouette + hard binary HSV
   Mode C: SAM2 soft float silhouette + hard binary HSV
@@ -725,6 +803,12 @@ Stage 5 — HSV symptom masking (mode-dependent):
 
 Stage 6 — Severity:
   severity = (symptom_pixels / leaf_pixels) × 100%
+
+NOTE on output resolution: all .npy and .png outputs are downscaled to
+STUDENT_IMG_SIZE (224×224) at write time to reduce storage.
+  Silhouette: cv2.INTER_LINEAR (float)
+  Symptom PNG: cv2.INTER_NEAREST (preserves binary 0/255 edges)
+  Symptom .npy (mode_d): cv2.INTER_LINEAR (float)
 ```
 
 ### 10.3 HSV Ranges
@@ -786,7 +870,11 @@ Per mode × per class:
   n_excluded, pct_excluded (weight == -1)
   mean_sil_confidence (modes c,d only — sampled from 500 images)
 Output: reports/factory_summary.csv
-Filter breakdown: reports/factory_filter_breakdown.csv
+
+Filter breakdown (counts per status across all images):
+  processed, filtered_heuristic, filtered_bouncer, load_error, etc.
+Output: reports/factory_filter_breakdown.csv
+         columns: status, count, pct
 ```
 
 ---
@@ -1330,7 +1418,26 @@ Without this: one corrupt image crashes DataLoader worker silently.
 With this: training continues, skip counter logged per epoch.
 ```
 
-### 17.2 Gradient Clipping
+### 17.2 Shared Bouncer Inference (scripts/bouncer_inference.py)
+```
+Single source of truth for inference helpers used by BOTH factory_master.py
+and train_bouncer.py. Avoids copy-paste drift — any future change to the
+transform pipeline or threshold logic is made once here.
+
+Exports:
+  BOUNCER_INFER_TF  — letterbox 224×224, ImageNet normalize, ToTensorV2
+  heuristic_prefilter(img_rgb) → bool
+    Currently a passthrough (always True). Original OpenCV green-coverage
+    heuristic removed after causing false rejections on yellow/bleached
+    MSV leaves. Neural classifier is sufficient at 224×224.
+  neural_bouncer(img_rgb, model, threshold) → bool
+    Applies BOUNCER_INFER_TF, runs model, returns sigmoid(logit) >= threshold.
+
+Dependencies: torch, albumentations, config.BOUNCER_IMG_SIZE only.
+No SAM2, Teacher, or other heavy imports.
+```
+
+### 17.3 Gradient Clipping
 ```
 Applied in all training scripts (Bouncer, Teacher, Student):
   torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
@@ -1340,7 +1447,7 @@ Why: Homoscedastic uncertainty log_vars can spike early.
      Multi-task loss interactions can destabilise training.
 ```
 
-### 17.3 Reproducibility
+### 17.4 Reproducibility
 ```
 set_seeds(seed=42) in every training script:
   random.seed(42)
@@ -1357,7 +1464,7 @@ Stage 1 Mode B checkpoint is reused for Stage 2 Mode B because:
   No re-training needed.
 ```
 
-### 17.4 Timing
+### 17.5 Timing
 ```
 Every script records wall-clock duration:
   _t_start = time.time() at main() entry
