@@ -63,7 +63,7 @@ import pandas as pd
 import segmentation_models_pytorch as smp
 from sklearn.metrics import (
     classification_report, confusion_matrix, f1_score,
-    matthews_corrcoef,
+    matthews_corrcoef, roc_auc_score,
 )
 
 from image_utils import load_image_rgb   # EXIF correction, no CLAHE for training
@@ -79,7 +79,7 @@ from config import (
     STUDENT_PHASE2_EPOCHS, STUDENT_PHASE2_LR, STUDENT_PHASE2_LR_MIN,
     STUDENT_PHASE2_PATIENCE,
     STUDENT_WEIGHT_DECAY, STUDENT_DROPOUT,
-    STUDENT_CKPT_W_MIOU, STUDENT_CKPT_W_MSV_F1, STUDENT_CKPT_W_MAE,
+    STUDENT_CKPT_W_MIOU, STUDENT_CKPT_W_MSV_F1, STUDENT_CKPT_W_MLN_F1, STUDENT_CKPT_W_MAE,
     STUDENT_MAX_SEVERITY,
     STUDENT_LABEL_SMOOTHING, ASYMMETRIC_PRIOR,
     STUDENT_VARIANTS, STUDENT_BEST_VARIANT, STUDENT_FACTORY_MODE,
@@ -500,25 +500,22 @@ def build_sample_list(split: str, mode: str) -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_composite_score(miou: float, msv_f1: float,
-                             norm_mae: float) -> float:
+                             mln_f1: float, norm_mae: float) -> float:
     """
     TRAINING composite checkpoint criterion (used during training for checkpoint saving).
-    Formula: 0.50×mIoU + 0.35×MSV_F1 + 0.15×(1−NormMAE)
+    Formula: 0.40×mIoU + 0.35×MSV_F1 + 0.15×MLN_F1 + 0.10×(1−NormMAE)
 
     NOTE: This is the QUALITY composite — optimised for segmentation + classification
-    accuracy during training. The MOBILE composite (which adds speed and model size)
-    is computed post-training in select_best_pipeline.py once CPU latency is known.
+    accuracy during training. The MOBILE composite (which adds speed, ROC-AUC, and
+    model size) is computed post-training in select_best_pipeline.py:
 
-    Separation rationale:
-      - During training: TFLite size and mobile latency are unknown
-      - Post-training: select_best_pipeline.py re-ranks all variants using
-        mobile_composite = MSV_F1×0.38 + mIoU×0.22 + speed×0.22 + sev×0.10 + size×0.08
-        where speed_score = clamp(150ms/cpu_lat, 0,1)
-        and   size_score  = clamp(15MB/tflite_mb, 0,1)
+        mobile_composite = MSV_F1×0.32 + MSV_ROC_AUC×0.18 + mIoU×0.18
+                         + speed×0.16 + MLN_F1×0.08 + sev×0.05 + size×0.03
     """
-    return (STUDENT_CKPT_W_MIOU * miou +
-            STUDENT_CKPT_W_MSV_F1 * msv_f1 +
-            STUDENT_CKPT_W_MAE * (1.0 - norm_mae))
+    return (STUDENT_CKPT_W_MIOU   * miou
+          + STUDENT_CKPT_W_MSV_F1 * msv_f1
+          + STUDENT_CKPT_W_MLN_F1 * mln_f1
+          + STUDENT_CKPT_W_MAE    * (1.0 - norm_mae))
 
 
 def seg_stats_from_logits(logits: torch.Tensor,
@@ -702,7 +699,8 @@ def validate(model, loader, seg_criterion, cls_criterion,
     sev_r2   = 1.0 - (sev_sq_err / max(ss_tot, 1e-7))
     norm_mae = sev_mae / STUDENT_MAX_SEVERITY
 
-    composite = compute_composite_score(seg0["iou"], msv_f1, norm_mae)
+    mln_f1    = report.get("MLN", {}).get("f1-score", 0.0)
+    composite = compute_composite_score(seg0["iou"], msv_f1, mln_f1, norm_mae)
 
     return {
         "loss":         total_loss / max(n_samples, 1),
@@ -715,7 +713,7 @@ def validate(model, loader, seg_criterion, cls_criterion,
         "sym_recall":   seg1["recall"],"sym_prec":seg1["precision"],
         "sym_spec":     seg1["specificity"],
         # Classification
-        "cls_acc":      cls_acc,  "msv_f1":     msv_f1,
+        "cls_acc":      cls_acc,  "msv_f1":     msv_f1,  "mln_f1": mln_f1,
         "macro_f1":     macro_f1, "weighted_f1":weighted_f1, "mcc": mcc,
         # Severity regression
         "sev_mae":      sev_mae,  "sev_rmse":   sev_rmse, "sev_r2": sev_r2,
@@ -762,6 +760,7 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
     n_sev_valid = n_samples  = 0
     all_preds   = []
     all_targets = []
+    all_probs   = []   # softmax probabilities for ROC-AUC
 
     for batch in test_loader:
         if batch is None:
@@ -788,6 +787,8 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
             sev_tgt_sq  += ((sev_tgt[valid_sv]*100)**2).sum().item()
             n_sev_valid += valid_sv.sum().item()
 
+        probs = torch.softmax(cls_out, dim=1).cpu().numpy()
+        all_probs.extend(probs.tolist())
         all_preds.extend(cls_out.argmax(1).cpu().numpy().tolist())
         all_targets.extend(cls_tgt.cpu().numpy().tolist())
 
@@ -813,11 +814,25 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
     ss_tot   = sev_tgt_sq - (sev_tgt_sum**2) / max(n_sev_valid, 1)
     sev_r2   = 1.0 - (sev_sq_err / max(ss_tot, 1e-7))
 
+    msv_f1_test = report.get("MSV", {}).get("f1-score", 0.0)
+    mln_f1_test = report.get("MLN", {}).get("f1-score", 0.0)
+    norm_mae_test = sev_mae / STUDENT_MAX_SEVERITY
     composite = compute_composite_score(
-        seg0["iou"],
-        report.get("MSV",{}).get("f1-score",0.0),
-        sev_mae / STUDENT_MAX_SEVERITY,
+        seg0["iou"], msv_f1_test, mln_f1_test, norm_mae_test,
     )
+
+    # MSV-vs-rest ROC-AUC (threshold-independent MSV detection quality)
+    import numpy as _np2
+    msv_idx = CLASSES.index("MSV")
+    try:
+        import numpy as np_roc
+        probs_arr = np_roc.array(all_probs)
+        msv_roc_auc = round(float(roc_auc_score(
+            [1 if t == msv_idx else 0 for t in all_targets],
+            probs_arr[:, msv_idx],
+        )), 4)
+    except Exception:
+        msv_roc_auc = -1.0
 
     # ── CPU inference latency (200 images, simulates mobile device) ───────────
     import copy
@@ -870,6 +885,8 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
         "sev_r2":           round(sev_r2,   4),
         # Composite criterion
         "composite":        round(composite, 4),
+        # MSV-vs-rest ROC-AUC (threshold-independent; used in mobile composite)
+        "msv_roc_auc":      msv_roc_auc,
         # Inference latency
         "cpu_lat_mean_ms":  lat_mean,
         "cpu_lat_std_ms":   lat_std,
@@ -1024,6 +1041,7 @@ def train_one(encoder_variant: str, factory_mode: str) -> dict:
             "sym_dice":    round(val_m["sym_dice"],        4),
             "cls_acc":     round(val_m["cls_acc"],         4),
             "msv_f1":      round(val_m["msv_f1"],          4),
+            "mln_f1":      round(val_m.get("mln_f1", 0.0),   4),
             "macro_f1":    round(val_m["macro_f1"],        4),
             "mcc":         round(val_m["mcc"],             4),
             "sev_mae":     round(val_m["sev_mae"],         2),
@@ -1098,6 +1116,7 @@ def train_one(encoder_variant: str, factory_mode: str) -> dict:
             "sym_dice":    round(val_m["sym_dice"],        4),
             "cls_acc":     round(val_m["cls_acc"],         4),
             "msv_f1":      round(val_m["msv_f1"],          4),
+            "mln_f1":      round(val_m.get("mln_f1", 0.0),   4),
             "macro_f1":    round(val_m["macro_f1"],        4),
             "mcc":         round(val_m["mcc"],             4),
             "sev_mae":     round(val_m["sev_mae"],         2),

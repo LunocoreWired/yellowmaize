@@ -275,9 +275,10 @@ STUDENT_WEIGHT_DECAY = 1e-4
 STUDENT_DROPOUT = 0.3
 
 # Composite checkpoint criterion weights
-STUDENT_CKPT_W_MIOU = 0.50
-STUDENT_CKPT_W_MSV_F1 = 0.35
-STUDENT_CKPT_W_MAE = 0.15  # weight on (1 - normalized_MAE)
+STUDENT_CKPT_W_MIOU   = 0.40   # was 0.50 — reduced to make room for MLN
+STUDENT_CKPT_W_MSV_F1 = 0.35   # unchanged — primary thesis claim
+STUDENT_CKPT_W_MLN_F1 = 0.15   # NEW — prevents degenerate MSV-only model
+STUDENT_CKPT_W_MAE    = 0.10   # was 0.15 — reduced; severity is secondary
 STUDENT_MAX_SEVERITY = 100.0  # for normalizing MAE
 
 # Label smoothing

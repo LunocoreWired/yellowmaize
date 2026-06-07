@@ -80,11 +80,14 @@ CONFIG_PATH  = Path(__file__).parent / "config.py"
 #          total pipeline (Bouncer ~30ms + Student ~120ms) fits under 250ms
 #   15MB:  comfortable for app size; MobileNet variants will score 1.0 here
 
-W_MSV_F1   = 0.38   # Primary clinical metric — MSV detection is the thesis claim
-W_MIOU     = 0.22   # Segmentation quality — directly visible as overlay in app
-W_SPEED    = 0.22   # Inference speed — critical for mobile usability
-W_SEV      = 0.10   # Severity calibration — secondary feature
-W_SIZE     = 0.08   # Model size — minor differentiator among MobileNet variants
+W_MSV_F1   = 0.32   # Primary clinical metric — MSV detection is the thesis claim
+W_ROC_AUC  = 0.18   # MSV-vs-rest ROC-AUC — threshold-independent detection quality
+W_MIOU     = 0.18   # Segmentation quality — directly visible as overlay in app
+W_SPEED    = 0.16   # Inference speed — critical for mobile usability
+W_MLN_F1   = 0.08   # MLN detection — prevents degenerate MSV-only model
+W_SEV      = 0.05   # Severity calibration — secondary feature
+W_SIZE     = 0.03   # Model size — MobileNet variants all score near 1.0 here
+# Sum = 1.00
 
 TARGET_LATENCY_MS = 150.0   # ms — target CPU latency per image
 TARGET_SIZE_MB    = 15.0    # MB — target TFLite model file size
@@ -160,7 +163,18 @@ def select_best_bouncer() -> dict | None:
               "selecting by specificity only")
         eligible = neural
 
-    best_row = eligible.loc[eligible["specificity"].idxmax()]
+    # Primary: highest specificity
+    # Tiebreaker: ROC-AUC when specificity within 0.005 of best
+    best_spec = eligible["specificity"].max()
+    near_best = eligible[eligible["specificity"] >= best_spec - 0.005]
+    if len(near_best) > 1 and "roc_auc" in near_best.columns:
+        near_best = near_best.dropna(subset=["roc_auc"])
+        if not near_best.empty:
+            best_row = near_best.loc[near_best["roc_auc"].idxmax()]
+        else:
+            best_row = eligible.loc[eligible["specificity"].idxmax()]
+    else:
+        best_row = eligible.loc[eligible["specificity"].idxmax()]
     return best_row.to_dict()
 
 
@@ -189,7 +203,7 @@ def mobile_composite_score(test_metrics: dict,
 
     Speed score  = clamp(TARGET_LATENCY_MS / cpu_lat_mean_ms, 0, 1)
     Size score   = clamp(TARGET_SIZE_MB    / tflite_size_mb,  0, 1)
-      → If TFLite size unknown: size_score defaults to 0.80
+      → If TFLite size unknown: size_score defaults to 1.0 (optimistic)
         (conservative assumption — MobileNet variants are typically small enough)
 
     Citation basis:
@@ -204,10 +218,12 @@ def mobile_composite_score(test_metrics: dict,
         except (ValueError, TypeError):
             return default
 
-    msv_f1   = _f("msv_f1")
-    sil_miou = _f("sil_mIoU")
-    sev_mae  = _f("sev_mae_pct", 100.0)   # percentage — normalise to [0,1]
-    lat_ms   = _f("cpu_lat_mean_ms", 999.0)
+    msv_f1    = _f("msv_f1")
+    mln_f1    = _f("mln_f1")
+    sil_miou  = _f("sil_mIoU")
+    msv_roc   = _f("msv_roc_auc", msv_f1)  # fallback to msv_f1 if AUC not yet computed
+    sev_mae   = _f("sev_mae_pct", 100.0)   # percentage — normalise to [0,1]
+    lat_ms    = _f("cpu_lat_mean_ms", 999.0)
 
     # Severity: lower MAE is better → convert to 0–1 score
     norm_mae    = min(sev_mae / 100.0, 1.0)
@@ -215,15 +231,19 @@ def mobile_composite_score(test_metrics: dict,
     # Speed score: 150ms target, capped at 1.0
     speed_score = min(TARGET_LATENCY_MS / max(lat_ms, 1.0), 1.0)
 
-    # Size score: 15MB target, capped at 1.0; default 0.80 if unknown
+    # Size score: 15MB target, capped at 1.0; default 1.0 if unknown
+    # (MobileNet variants are all small — optimistic default is more defensible
+    #  than 0.80 which would arbitrarily penalise unexported variants)
     if tflite_size_mb and tflite_size_mb > 0:
         size_score = min(TARGET_SIZE_MB / max(tflite_size_mb, 0.1), 1.0)
     else:
-        size_score = 0.80   # conservative default for unknown size
+        size_score = 1.0   # optimistic default — noted in report
 
     score = (W_MSV_F1  * msv_f1
+           + W_ROC_AUC * msv_roc
            + W_MIOU    * sil_miou
            + W_SPEED   * speed_score
+           + W_MLN_F1  * mln_f1
            + W_SEV     * (1.0 - norm_mae)
            + W_SIZE    * size_score)
 
@@ -507,7 +527,7 @@ def write_summary(best_bouncer, best_teacher, best_student,
             "winner_mode":      best_student.get("mode",""),
             "quality_composite":best_student.get("best_composite",""),
             "mobile_composite": best_student.get("mobile_composite",""),
-            "selection_basis":  "mobile_composite (MSV_F1×0.38 + mIoU×0.22 + speed×0.22 + sev×0.10 + size×0.08)",
+            "selection_basis":  "mobile_composite (MSV_F1×0.32 + ROC_AUC×0.18 + mIoU×0.18 + speed×0.16 + MLN_F1×0.08 + sev×0.05 + size×0.03)",
             "canonical_ckpt":   str(canonical_paths.get("student","")),
             **{f"test_{k}": v for k, v in test_metrics.items()
                if k not in ("variant","mode")},
@@ -590,7 +610,7 @@ def write_summary(best_bouncer, best_teacher, best_student,
             f"    Formula    : 0.50×mIoU + 0.35×MSV_F1 + 0.15×(1−NormMAE)",
             "  ── Mobile Composite (deployment selection) ────────────",
             f"    Score      : {best_student.get('mobile_composite','N/A')}",
-            f"    Formula    : MSV_F1×0.38 + mIoU×0.22 + speed×0.22 + sev×0.10 + size×0.08",
+            f"    Formula    : MSV_F1×0.32 + ROC_AUC×0.18 + mIoU×0.18 + speed×0.16 + MLN_F1×0.08 + sev×0.05 + size×0.03",
             f"    Target lat : {TARGET_LATENCY_MS}ms  |  Target size: {TARGET_SIZE_MB}MB",
             "  ── Inference Latency (CPU, simulates mobile) ──────────",
             f"    Mean       : {test_metrics.get('cpu_lat_mean_ms','N/A')} ms",
