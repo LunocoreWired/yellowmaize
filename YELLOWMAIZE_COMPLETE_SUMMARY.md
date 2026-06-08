@@ -172,9 +172,7 @@ Outputs: `preprocessing_report.csv`, `preprocessing_flagged.csv`, `preprocessing
 - Scheduler: CosineAnnealingLR (T_max=15, eta_min=1e-6)
 - Epochs: 15, Batch: 64, Val split: 80/20 (internal)
 - Early stopping: patience=5 (by best val F1)
-- Threshold: empirically selected from ROC curve — maximize **geometric mean of (recall × specificity)^0.5** subject to maize recall ≥ 95%; **hard cap at 0.70** to prevent over-filtering on high-AUC models
-
-> **Threshold fix (v2):** Previous logic maximised specificity alone, which produced near-1.0 thresholds on high-performing models (AUC ~1.0) and caused 88%+ filter rates at inference. Geometric mean balances both metrics; hard cap at 0.70 acts as a final safeguard.
+- Threshold: empirically selected from ROC curve (max specificity s.t. maize recall ≥ 95%)
 
 **Primary metric:** Specificity (TN rate — non-maize rejection rate)
 
@@ -183,7 +181,7 @@ Outputs: `preprocessing_report.csv`, `preprocessing_flagged.csv`, `preprocessing
 - `logs/bouncer_comparison.csv` (ROC-AUC, specificity, maize recall, TP/FP/TN/FN)
 - `logs/bouncer_admission_rate_{variant}.csv` (end-to-end maize admission rate on test split)
 
-### 4.4 Tier 1 Sampling & SAM2 Masking (Phases 1–2) [v3]
+### 4.4 Tier 1 Sampling, YOLO Detector & SAM2 Masking (Phases 1–2)
 
 **Tier 1 composition:** 15,000 images total
 - HEALTHY: 3,000 (pure random)
@@ -191,35 +189,27 @@ Outputs: `preprocessing_report.csv`, `preprocessing_flagged.csv`, `preprocessing
 - MLN: 4,500 (evenly-spaced)
 - Source: train+val split images only (test excluded)
 
-**SAM2 auto-prompting strategy (v3 — contour bbox, disease-aware):**
-1. Convert image to HSV
-2. Build THREE tissue masks and combine via OR:
-   - Green (H=30–90, S>40, V>40) — healthy leaf tissue
-   - Yellow (H=15–38, S>0, V>0) — MSV streak yellowing
-   - Brown (H=5–20, S>0, V>0) — MLN necrotic/dead tissue **[NEW in v3]**
-3. Find largest qualifying connected component (area ≥ 500px)
-4. Derive tight bounding box with 8px padding → (x1, y1, x2, y2)
-5. Pass bbox as SAM2 **box prompt** (`box=np.array([[x1,y1,x2,y2]])`) **[was: point_coords in v2]**
-6. Select mask with highest SAM2 confidence score
-7. Store raw sigmoid output as float32 .npy (NO binarization)
+**Phase 1b: YOLOv8n Leaf Detector** (`train_yolo_detector.py`)
 
-**Fallback (center_fallback):** if no tissue detected above 5% of image pixels → single center foreground point + four background corner points (v2 behaviour preserved)
+Single-class YOLOv8n (nano) trained on 400–500 Label Studio polygon annotations.
+Provides tight bounding-box prompts for SAM2. Polygon → bbox conversion is
+automatic. After training, the script runs the full YOLO+SAM2 pipeline on the
+300 gold-standard images and calibrates the QA confidence threshold to achieve
+mean IoU ≥ `GOLD_IOU_TARGET_MEAN` (0.85). Written to `logs/yolo_qa_calibration.csv`.
 
-**Why bbox over point prompts:**
-- Box prompts encode both position AND spatial extent — prevent mask leaking past colour edges
-- Captures full leaf length including tips that centroid-based prompts miss
-- Zero additional training — bbox derived entirely from HSV tissue mask
+**SAM2 auto-prompting strategy (v3 — YOLO-guided):**
+1. Run YOLOv8n → tight leaf bounding box (if `checkpoints/yolo/best.pt` exists)
+2. Restrict HSV green+yellow tissue detection to pixels inside the YOLO box
+3. Three foreground points along the leaf’s vertical axis (clamped to box)
+4. Pass YOLO box as SAM2 `box=` prompt — hard spatial constraint
+5. Fallback to v2 full-image HSV centroid if YOLO absent or detection fails
 
-**Prompt strategy labels (logged in QA report):**
-`green_bbox`, `yellow_bbox`, `brown_bbox`, `combined_bbox`, `center_fallback`
-
-**QA filters (3 automated — thresholds relaxed from v1 → v2/v3):**
-1. Coverage range: foreground **3%–90%** of image [was 10% min — relaxed for sparse diseased leaves]
-2. Mean foreground confidence ≥ 0.65 [unchanged]
-3. Mask aspect ratio ≥ **1.01** [was 1.20 — relaxed for overhead/square-frame leaves]
+**QA filters (v3 relaxed thresholds):**
+1. Coverage range: foreground 3%–90% (v1 was 10%)
+2. Mean foreground confidence ≥ calibrated threshold (default 0.65)
+3. Mask aspect ratio ≥ 1.01 (v1 was 1.20)
 - Target rejection rate: < 8%
-- Outputs: `_softmask.npy` (float32 probability map) + `_mask.png` (binarized visualization)
-- QA log columns: filename, category, status, reason, prompt_strategy, coverage, mean_conf
+- QA report now includes `prompt_mode` and `yolo_box` columns
 
 ### 4.5 Teacher Model (Phase 3)
 
@@ -235,6 +225,8 @@ Outputs: `preprocessing_report.csv`, `preprocessing_flagged.csv`, `preprocessing
 | **EfficientNet-B2 + UNet** | Efficient CNN (recommended) | ~7.7M |
 | SegFormer-B2 (mit_b2) via smp | Hierarchical ViT | ~25M |
 | EfficientNet-B2 + DeepLabV3+ | Decoder comparison (ASPP) | ~7.7M |
+
+**Hyperparameters:**
 - Input: 512×512 (larger than Student for boundary detail)
 - Batch: 8, Epochs: 30
 - Optimizer: AdamW (lr=5e-5, weight_decay=1e-4)
@@ -569,7 +561,7 @@ yellowmaize/
 ├── create_bouncer_dataset.py        50k bouncer dataset + nonmaize validation
 ├── train_bouncer.py                 4-variant bouncer + PatchCore + admission rate
 ├── sample_15000.py                  Stratified 15k Tier 1 sampler
-├── generate_tier1_masks.py          SAM2 auto-prompting (v3 contour bbox) + QA filters
+├── generate_tier1_masks.py          SAM2 auto-prompting + QA filters
 ├── validate_masks.py                QA report + qualitative overlays
 ├── sample_gold_standard.py          Extract 300-image gold standard set for Label Studio
 ├── validate_gold_standard.py        IoU validation: SAM2→Teacher→Student vs human masks

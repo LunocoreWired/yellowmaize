@@ -49,6 +49,9 @@ matplotlib>=3.7.0
 # ── Progress bars ─────────────────────────────────────────────────────────────
 tqdm>=4.65.0
 
+# ── Object detection (YOLOv8n leaf detector — Phase 1b) ─────────────────────
+ultralytics>=8.0.0        # YOLOv8n training + inference (train_yolo_detector.py)
+
 # ── SAM2 — install separately ─────────────────────────────────────────────────
 # pip install git+https://github.com/facebookresearch/segment-anything-2
 # Download weights: https://dl.fbaipublicfiles.com/segment_anything_v2/

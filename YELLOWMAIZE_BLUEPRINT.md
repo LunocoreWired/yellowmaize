@@ -238,7 +238,8 @@ yellowmaize/                               ← Project root (WSL2 working direct
 ├── create_bouncer_dataset.py              ← Step 2
 ├── train_bouncer.py                       ← Step 3
 ├── sample_15000.py                        ← Step 4
-├── generate_tier1_masks.py               ← Step 5
+├── train_yolo_detector.py                ← Step 4b (run after annotating 400+ images)
+├── generate_tier1_masks.py               ← Step 5  [v3: YOLO-guided]
 ├── validate_masks.py                      ← Step 6
 ├── sample_gold_standard.py               ← Step 6b: extract 300-image gold standard set
 ├── validate_gold_standard.py             ← Step 6c/6d/10b: SAM2→Teacher→Student IoU vs human
@@ -576,104 +577,92 @@ tier1_manifest.csv  → columns: dest_filename, source_path, category, split, ti
 
 ---
 
-## PART 8 — SAM2 MASKING (generate_tier1_masks.py) [v3]
+## PART 7b — YOLO LEAF DETECTOR (train_yolo_detector.py)
 
-### 8.1 Auto-Prompting Strategy (v3 — Contour Bbox)
+### Purpose
+
+Trains a YOLOv8n (nano) single-class detector on Label Studio polygon annotations
+and calibrates the SAM2 QA confidence threshold against gold-standard IoU.
+Must run **after** annotating at least 400 images and **before** `generate_tier1_masks.py`.
+
+### Why YOLO before SAM2
+
+Pure HSV prompting places the centroid correctly for healthy green leaves but drifts
+onto background for heavily diseased images — MSV streak yellow and MLN necrotic brown
+share hue ranges with tropical soil and sand. A tight bounding box from YOLO constrains
+both the centroid search and the SAM2 segmentation region, reducing the dominant v2
+failure mode without needing larger or more complex prompts.
+
+### Annotation requirement
+
+400–500 Label Studio polygon labels. You have 300 from `sample_gold_standard.py`.
+Annotate ~100–200 more before running this script. Export: Label Studio → Export → JSON
+→ `data/gold_standard/annotations/annotations.json`. Polygon → bbox conversion is
+handled automatically by `train_yolo_detector.py`.
+
+### Outputs
+
+| File | Description |
+|---|---|
+| `checkpoints/yolo/best.pt` | Weights loaded at startup by `generate_tier1_masks.py` v3 |
+| `logs/yolo_qa_calibration.csv` | Calibrated SAM2 QA confidence threshold + IoU curve |
+| `logs/yolo_val_metrics.csv` | mAP@0.5, precision, recall on val split |
+| `data/yolo_dataset/` | YOLO-format image + label dataset with train/val split |
+
+### mAP@0.5 target
+
+≥ 0.70 before using YOLO box prompts. Script warns and requests confirmation if
+annotation count is below `YOLO_MIN_ANNOTATIONS = 400` (config.py).
+
+## PART 8 — SAM2 MASKING (generate_tier1_masks.py)  [v3: YOLO-guided]
+
+### 8.1 Auto-Prompting Strategy
+
+> **v3 upgrade:** YOLO bounding-box prompt + constrained HSV centroid. See `train_yolo_detector.py`.
+
 ```
 For each Tier 1 image:
 1. load_image_rgb(path) → EXIF-corrected uint8 RGB
 2. Convert to HSV: to_hsv(img_rgb)
-3. Build THREE tissue masks (v3 — disease-aware):
-     Green  (H=30–90, S>40, V>40)   — healthy leaf tissue
-     Yellow (H=15–38, S>0, V>0)     — MSV streak yellowing
-     Brown  (H=5–20,  S>0, V>0)     — MLN necrotic / dead tissue  [NEW in v3]
-4. Combine tissue masks via OR into a single combined tissue mask
-5. Run cv2.connectedComponentsWithStats on combined mask
-6. Select largest qualifying component (area ≥ 500px)
-7. Derive tight bounding box with 8px padding → (x1, y1, x2, y2)
-8. Pass bbox as SAM2 box prompt (box=np.array([[x1,y1,x2,y2]]))
-9. Select mask with highest SAM2 confidence score (multimask_output=True)
-10. Convert logits → probability via sigmoid: 1/(1+exp(-logits))
-11. Store raw float32 probability map as .npy (NO binarization)
-12. Also store binarized (≥0.5) as uint8 .png for visualization
+3. Green mask: H∈[30,90], S>40, V>40
+4. Find largest green connected component (cv2.connectedComponentsWithStats)
+5. Compute centroid (cx, cy) → foreground point prompt (label=1)
+6. Four corners (10px inset) → background point prompts (label=0)
+7. Run SAM2.predict(point_coords=..., point_labels=...)
+8. Select mask with highest SAM2 confidence score
+9. Convert logits → probability via sigmoid: 1/(1+exp(-logits))
+10. Store raw float32 probability map as .npy (NO binarization)
+11. Also store binarized (≥0.5) as uint8 .png for visualization
 
-Fallback (center_fallback): if no tissue detected above _MIN_TISSUE_FRACTION (0.05)
-  → single center foreground point + four background corner points (v2 behaviour)
-
-WHY BBOX > MULTI-POINT (v3 rationale):
-  - Box prompts encode both position AND spatial extent of the leaf
-  - Prevents mask leaking past sharp colour edges (common on MSV leaves)
-  - Captures full leaf length including tips, which point prompts miss
-  - Still zero training required — bbox derived from HSV tissue mask
+Fallback: if no green component found (coverage < 10%) → log "no_green_region", skip
 ```
 
-### 8.2 Prompt Strategy Labels
-```
-strategy returned by get_leaf_bbox():
-  "green_bbox"    — only green tissue detected
-  "yellow_bbox"   — only yellow tissue detected
-  "brown_bbox"    — only brown/necrotic tissue detected
-  "combined_bbox" — multiple tissue types detected (most common)
-  "center_fallback" — no qualifying tissue detected
-```
-
-### 8.3 Three QA Filters (v3 — relaxed thresholds from v2)
+### 8.2 Three QA Filters
 ```
 Filter 1 — Coverage range:
   binary = (prob_map >= 0.5)
   fg_coverage = binary.sum() / (H * W)
-  Reject if fg_coverage < 0.03  [v2/v3: was 0.10 — relaxed for small/diseased leaves]
-  Reject if fg_coverage > 0.90  [unchanged]
+  Reject if fg_coverage < 0.10 (too small — wrong object segmented)
+  Reject if fg_coverage > 0.90 (too large — background leaked in)
 
 Filter 2 — Mean foreground confidence:
   mean_conf = prob_map[binary==1].mean()
-  Reject if mean_conf < 0.65    [unchanged]
+  Reject if mean_conf < 0.65 (SAM2 was uncertain)
 
 Filter 3 — Shape sanity:
   Fit bounding box to binary mask
   aspect = max(h,w) / min(h,w)
-  Reject if aspect < 1.01       [v2/v3: was 1.20 — relaxed for overhead/square frames]
+  Reject if aspect < 1.2 (too round — wrong object)
 
 Target: < 8% rejection rate
-If > 8% → warn, review QA report, check HSV ranges in config.py
-  (SAM2_GREEN/YELLOW/BROWN_H_MIN/MAX) and whether center_fallback rate is high
-Output: tier1_qa_report.csv → filename, category, status, reason, prompt_strategy,
-        coverage, mean_conf
+If > 8% → warn, review QA report, consider adjusting prompting HSV ranges
+Output: tier1_qa_report.csv → filename, category, status, reason, coverage, mean_conf
 ```
 
-### 8.4 Config Keys Required (v3 additions)
-```
-# Green tissue (unchanged)
-SAM2_GREEN_H_MIN, SAM2_GREEN_H_MAX, SAM2_GREEN_S_MIN, SAM2_GREEN_V_MIN
-
-# Yellow tissue (unchanged)
-SAM2_YELLOW_H_MIN, SAM2_YELLOW_H_MAX, SAM2_YELLOW_S_MIN, SAM2_YELLOW_V_MIN
-
-# Brown/necrotic tissue [NEW in v3]
-SAM2_BROWN_H_MIN, SAM2_BROWN_H_MAX, SAM2_BROWN_S_MIN, SAM2_BROWN_V_MIN
-
-SAM2_QA_MIN_COVERAGE   = 0.03   # overridden locally in script
-SAM2_QA_MAX_COVERAGE   = 0.90
-SAM2_QA_MIN_CONFIDENCE = 0.65
-SAM2_QA_MIN_ASPECT_RATIO = 1.01 # overridden locally in script
-SAM2_QA_MAX_REJECT_RATE  = 0.08
-```
-
-### 8.5 Output Files per Image
+### 8.3 Output Files per Image
 ```
 data/tier1_leaf_masks/{stem}_softmask.npy  ← float32 [0,1] probability map (MAIN TARGET)
 data/tier1_leaf_masks/{stem}_mask.png      ← uint8 255/0 binary visualization
-```
-
-### 8.6 Changelog (v2 → v3)
-```
-[NEW]  Brown HSV range (H=5–20) for MLN necrotic tissue detection
-[NEW]  get_leaf_bbox(): replaces get_leaf_centroid() — returns bbox not centroid
-[NEW]  build_box_prompt(): replaces build_prompts() — uses SAM2 box= API
-[NEW]  SAM2 predictor.predict() now uses box= instead of point_coords=
-[NEW]  Strategy labels updated: *_bbox suffix (green_bbox, yellow_bbox, etc.)
-[NEW]  center_fallback retains point-based prompting as last resort
-[KEEP] All QA thresholds unchanged from v2 (already relaxed in v2)
 ```
 
 ---
@@ -765,13 +754,8 @@ Process all ~215k train+val Tier 2 images. Generate pseudo-labels across 4 modes
 ### 10.2 Per-Image Processing Stages
 ```
 Stage 1 — Bouncer gate:
-  Helpers imported from scripts/bouncer_inference.py (single source of truth
-  shared with train_bouncer.py — no copy-paste drift between scripts):
-  a. heuristic_prefilter(img_rgb) — currently a passthrough (always True);
-     original green-coverage heuristic removed after false rejections on
-     yellow/bleached MSV leaves under variable tropical lighting
-  b. neural_bouncer(img_rgb, model, threshold) — MobileNetV3-Large,
-     empirical threshold from ROC curve
+  a. Heuristic pre-filter (green coverage + aspect ratio)
+  b. Neural Bouncer (MobileNetV3-Large, empirical threshold)
   → Rejected: log "filtered_heuristic" or "filtered_bouncer", skip
 
 Stage 2 — Leaf silhouette:
@@ -802,12 +786,6 @@ Stage 5 — HSV symptom masking (mode-dependent):
 
 Stage 6 — Severity:
   severity = (symptom_pixels / leaf_pixels) × 100%
-
-NOTE on output resolution: all .npy and .png outputs are downscaled to
-STUDENT_IMG_SIZE (224×224) at write time to reduce storage.
-  Silhouette: cv2.INTER_LINEAR (float)
-  Symptom PNG: cv2.INTER_NEAREST (preserves binary 0/255 edges)
-  Symptom .npy (mode_d): cv2.INTER_LINEAR (float)
 ```
 
 ### 10.3 HSV Ranges
@@ -869,11 +847,7 @@ Per mode × per class:
   n_excluded, pct_excluded (weight == -1)
   mean_sil_confidence (modes c,d only — sampled from 500 images)
 Output: reports/factory_summary.csv
-
-Filter breakdown (counts per status across all images):
-  processed, filtered_heuristic, filtered_bouncer, load_error, etc.
-Output: reports/factory_filter_breakdown.csv
-         columns: status, count, pct
+Filter breakdown: reports/factory_filter_breakdown.csv
 ```
 
 ---
@@ -1446,7 +1420,7 @@ Why: Homoscedastic uncertainty log_vars can spike early.
      Multi-task loss interactions can destabilise training.
 ```
 
-### 17.4 Reproducibility
+### 17.3 Reproducibility
 ```
 set_seeds(seed=42) in every training script:
   random.seed(42)
@@ -1463,7 +1437,7 @@ Stage 1 Mode B checkpoint is reused for Stage 2 Mode B because:
   No re-training needed.
 ```
 
-### 17.5 Timing
+### 17.4 Timing
 ```
 Every script records wall-clock duration:
   _t_start = time.time() at main() entry
@@ -1531,7 +1505,16 @@ python train_bouncer.py
 # STEP 4: Sample 15k Tier 1 images
 python sample_15000.py
 
-# STEP 5: SAM2 masking
+# STEP 4b: Export 300 images → annotate 400-500 total in Label Studio
+python sample_gold_standard.py
+# → upload data/label_studio_import/ to Label Studio
+# → annotate leaves with polygon tool (you have 300; add ~100-200 more)
+# → Export → JSON → data/gold_standard/annotations/annotations.json
+
+# STEP 4c: Train YOLOv8n leaf detector + calibrate SAM2 QA threshold
+python train_yolo_detector.py
+
+# STEP 5: SAM2 masking  [v3: YOLO-guided box prompts]
 python generate_tier1_masks.py
 
 # STEP 6: Review QA report and overlays before Teacher training
