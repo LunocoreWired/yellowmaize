@@ -56,36 +56,44 @@ import random
 import time
 from pathlib import Path
 
+import albumentations as A
 import cv2
 import numpy as np
+import pandas as pd
+import segmentation_models_pytorch as smp
 import torch
 import torch.nn as nn
-import segmentation_models_pytorch as smp
-import pandas as pd
-import albumentations as A
 from albumentations.pytorch import ToTensorV2
-
-from image_utils import load_image_rgb
 from config import (
-    SEED, CLASSES, REPORTS_DIR,
-    TIER1_MASKS_DIR,
-    TEACHER_CKPT_DIR, TEACHER_IMG_SIZE,
+    CBAM_SPATIAL_KERNEL,
+    CLASSES,
+    GOLD_ANNOTATION_FILE,
+    GOLD_IMAGES_DIR,
+    GOLD_IOU_TARGET_MEAN,
+    GOLD_IOU_WARN_THRESHOLD,
+    REPORTS_DIR,
+    SEED,
+    STUDENT_BEST_VARIANT,
+    STUDENT_CKPT_DIR,
+    STUDENT_DROPOUT,
+    STUDENT_FACTORY_MODE,
+    STUDENT_IMG_SIZE,
+    TEACHER_CKPT_DIR,
     TEACHER_DEPLOYED_VARIANT,
-    STUDENT_CKPT_DIR, STUDENT_IMG_SIZE,
-    STUDENT_BEST_VARIANT, STUDENT_FACTORY_MODE,
-    STUDENT_DROPOUT, CBAM_SPATIAL_KERNEL,
-    GOLD_IMAGES_DIR, GOLD_ANNOTATION_FILE,
-    GOLD_IOU_WARN_THRESHOLD, GOLD_IOU_TARGET_MEAN,
+    TEACHER_IMG_SIZE,
+    TIER1_MASKS_DIR,
 )
+from image_utils import load_image_rgb
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-OVERLAY_ALPHA    = 0.40
-OVERLAYS_PER_CLS = 5   # qualitative overlay figures per class
+OVERLAY_ALPHA = 0.40
+OVERLAYS_PER_CLS = 5  # qualitative overlay figures per class
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # LABEL STUDIO ANNOTATION PARSER
 # ══════════════════════════════════════════════════════════════════════════════
+
 
 def load_annotations(annotation_file: Path) -> dict[str, np.ndarray]:
     """
@@ -121,19 +129,17 @@ def load_annotations(annotation_file: Path) -> dict[str, np.ndarray]:
     for task in data:
         # Label Studio stores the filename in task["data"]["image"] or
         # task["file_upload"] — handle both formats.
-        fname = (
-            task.get("data", {}).get("image", "")
-            or task.get("file_upload", "")
-        )
+        fname = task.get("data", {}).get("image", "") or task.get("file_upload", "")
         # Strip URL prefix if present (Label Studio sometimes includes it)
-        fname = Path(fname.split("/")[-1]).stem   # → bare stem
+        fname = Path(fname.split("/")[-1]).stem
+        fname = fname.split("-", 1)[-1]  # strip Label Studio hash prefix
 
         polygons = []
         for ann in task.get("annotations", []):
             for result in ann.get("result", []):
                 if result.get("type") != "polygonlabels":
                     continue
-                pts = result["value"].get("points", [])   # [[x%, y%], ...]
+                pts = result["value"].get("points", [])  # [[x%, y%], ...]
                 if len(pts) >= 3:
                     polygons.append(pts)
 
@@ -171,8 +177,8 @@ def rasterize_polygons(polygons: list[list], h: int, w: int) -> np.ndarray:
 # IoU COMPUTATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_iou(pred_binary: np.ndarray,
-                human_binary: np.ndarray) -> float:
+
+def compute_iou(pred_binary: np.ndarray, human_binary: np.ndarray) -> float:
     """
     Binary IoU between predicted mask and human-annotated mask.
 
@@ -180,11 +186,11 @@ def compute_iou(pred_binary: np.ndarray,
     Returns float in [0, 1]. Returns 0.0 if both masks are empty
     (avoids division by zero — treated as a degenerate case).
     """
-    pred_b  = pred_binary.astype(bool)
+    pred_b = pred_binary.astype(bool)
     human_b = human_binary.astype(bool)
 
     intersection = np.logical_and(pred_b, human_b).sum()
-    union        = np.logical_or(pred_b,  human_b).sum()
+    union = np.logical_or(pred_b, human_b).sum()
 
     if union == 0:
         # Both masks are entirely empty — degenerate, flag as 0
@@ -196,32 +202,36 @@ def compute_iou(pred_binary: np.ndarray,
 # MODEL LOADERS
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def load_teacher(variant: str) -> nn.Module:
     """Load best Teacher checkpoint for inference."""
     ckpt_path = TEACHER_CKPT_DIR / "teacher_model_best.pth"
     if not ckpt_path.exists():
         raise FileNotFoundError(
-            f"Teacher checkpoint not found: {ckpt_path}\n"
-            "Run train_teacher.py first."
+            f"Teacher checkpoint not found: {ckpt_path}\nRun train_teacher.py first."
         )
 
     unet_encoders = {
-        "resnet50":        "resnet50",
+        "resnet50": "resnet50",
         "efficientnet-b2": "efficientnet-b2",
-        "mit_b2":          "mit_b2",
+        "mit_b2": "mit_b2",
     }
 
     if variant in unet_encoders:
         model = smp.Unet(
             encoder_name=unet_encoders[variant],
-            encoder_weights=None,   # weights loaded from checkpoint
-            in_channels=3, classes=1, activation=None,
+            encoder_weights=None,  # weights loaded from checkpoint
+            in_channels=3,
+            classes=1,
+            activation=None,
         )
     elif variant == "deeplabv3plus-eb2":
         model = smp.DeepLabV3Plus(
             encoder_name="efficientnet-b2",
             encoder_weights=None,
-            in_channels=3, classes=1, activation=None,
+            in_channels=3,
+            classes=1,
+            activation=None,
         )
     else:
         raise ValueError(f"Unknown teacher variant: {variant}")
@@ -248,12 +258,12 @@ def load_student(encoder_variant: str) -> nn.Module:
         )
 
     use_cbam = "cbam" in encoder_variant
-    model    = StudentModel(encoder_name=encoder_variant, use_cbam=use_cbam)
+    model = StudentModel(encoder_name=encoder_variant, use_cbam=use_cbam)
 
     # Find best student checkpoint
     # Prefer: student_{variant}_{mode}_best.pth (from Stage 2)
     # Fallback: student_{variant}_mode_b_best.pth (from Stage 1)
-    mode     = STUDENT_FACTORY_MODE
+    mode = STUDENT_FACTORY_MODE
     ckpt_path = STUDENT_CKPT_DIR / f"student_{encoder_variant}_{mode}_best.pth"
     if not ckpt_path.exists():
         # Try Stage 1 checkpoint
@@ -275,56 +285,54 @@ def load_student(encoder_variant: str) -> nn.Module:
 # INFERENCE HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def teacher_predict(model: nn.Module,
-                    img_rgb: np.ndarray,
-                    img_size: int) -> np.ndarray:
+
+def teacher_predict(model: nn.Module, img_rgb: np.ndarray, img_size: int) -> np.ndarray:
     """
     Run Teacher inference. Returns binary mask at original image resolution.
     """
-    tf = A.Compose([
-        A.LongestMaxSize(max_size=img_size),
-        A.PadIfNeeded(img_size, img_size, border_mode=0, value=0),
-        A.Normalize(mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
+    tf = A.Compose(
+        [
+            A.LongestMaxSize(max_size=img_size),
+            A.PadIfNeeded(img_size, img_size, border_mode=0, value=0),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2(),
+        ]
+    )
     h_orig, w_orig = img_rgb.shape[:2]
     img_t = tf(image=img_rgb)["image"].unsqueeze(0).to(DEVICE)
 
     with torch.no_grad():
-        logits = model(img_t)                          # 1×1×H×W
-        prob   = torch.sigmoid(logits).squeeze().cpu().numpy()
+        logits = model(img_t)  # 1×1×H×W
+        prob = torch.sigmoid(logits).squeeze().cpu().numpy()
 
     # Resize back to original resolution
-    prob_full = cv2.resize(prob, (w_orig, h_orig),
-                           interpolation=cv2.INTER_LINEAR)
+    prob_full = cv2.resize(prob, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
     return (prob_full >= 0.5).astype(np.uint8)
 
 
-def student_predict(model: nn.Module,
-                    img_rgb: np.ndarray,
-                    img_size: int) -> np.ndarray:
+def student_predict(model: nn.Module, img_rgb: np.ndarray, img_size: int) -> np.ndarray:
     """
     Run Student inference. Returns binary silhouette mask (channel 0)
     at original image resolution.
     """
-    tf = A.Compose([
-        A.LongestMaxSize(max_size=img_size),
-        A.PadIfNeeded(img_size, img_size, border_mode=0, value=0),
-        A.Normalize(mean=[0.485, 0.456, 0.406],
-                    std=[0.229, 0.224, 0.225]),
-        ToTensorV2(),
-    ])
+    tf = A.Compose(
+        [
+            A.LongestMaxSize(max_size=img_size),
+            A.PadIfNeeded(img_size, img_size, border_mode=0, value=0),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2(),
+        ]
+    )
     h_orig, w_orig = img_rgb.shape[:2]
     img_t = tf(image=img_rgb)["image"].unsqueeze(0).to(DEVICE)
 
     with torch.no_grad():
-        seg_logits, _, _ = model(img_t)                # 1×2×H×W
-        sil_prob = torch.sigmoid(
-            seg_logits[:, 0]).squeeze().cpu().numpy()  # channel 0 = silhouette
+        seg_logits, _, _ = model(img_t)  # 1×2×H×W
+        sil_prob = (
+            torch.sigmoid(seg_logits[:, 0]).squeeze().cpu().numpy()
+        )  # channel 0 = silhouette
 
-    sil_full = cv2.resize(sil_prob, (w_orig, h_orig),
-                          interpolation=cv2.INTER_LINEAR)
+    sil_full = cv2.resize(sil_prob, (w_orig, h_orig), interpolation=cv2.INTER_LINEAR)
     return (sil_full >= 0.5).astype(np.uint8)
 
 
@@ -332,11 +340,14 @@ def student_predict(model: nn.Module,
 # OVERLAY GENERATOR
 # ══════════════════════════════════════════════════════════════════════════════
 
-def draw_comparison_overlay(img_rgb: np.ndarray,
-                            human_mask: np.ndarray,
-                            pred_mask: np.ndarray,
-                            iou: float,
-                            label: str) -> np.ndarray:
+
+def draw_comparison_overlay(
+    img_rgb: np.ndarray,
+    human_mask: np.ndarray,
+    pred_mask: np.ndarray,
+    iou: float,
+    label: str,
+) -> np.ndarray:
     """
     Draw a side-by-side comparison overlay:
       Left half  — human mask (green)
@@ -353,35 +364,50 @@ def draw_comparison_overlay(img_rgb: np.ndarray,
     # False positive → red   (pred has it, human doesn't)
     fp = np.logical_and(pred_mask, ~human_mask.astype(bool))
 
-    green  = np.array([0,   220, 0  ], dtype=np.float32)
-    red    = np.array([220, 0,   0  ], dtype=np.float32)
-    cyan   = np.array([0,   220, 220], dtype=np.float32)
+    green = np.array([0, 220, 0], dtype=np.float32)
+    red = np.array([220, 0, 0], dtype=np.float32)
+    cyan = np.array([0, 220, 220], dtype=np.float32)
 
-    overlay[tp] = overlay[tp] * (1 - OVERLAY_ALPHA) + cyan  * OVERLAY_ALPHA
+    overlay[tp] = overlay[tp] * (1 - OVERLAY_ALPHA) + cyan * OVERLAY_ALPHA
     overlay[fn] = overlay[fn] * (1 - OVERLAY_ALPHA) + green * OVERLAY_ALPHA
-    overlay[fp] = overlay[fp] * (1 - OVERLAY_ALPHA) + red   * OVERLAY_ALPHA
+    overlay[fp] = overlay[fp] * (1 - OVERLAY_ALPHA) + red * OVERLAY_ALPHA
 
     overlay = overlay.clip(0, 255).astype(np.uint8)
 
     # Draw human mask contour (green) and pred contour (blue)
     for mask, color in [(human_mask, (0, 200, 0)), (pred_mask, (0, 0, 220))]:
         contours, _ = cv2.findContours(
-            mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         cv2.drawContours(overlay, contours, -1, color, 2)
 
     # Label bar at top
     text = f"{label}  |  IoU={iou:.3f}"
-    cv2.putText(overlay, text, (8, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    cv2.putText(overlay, text, (8, 24),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0),       1)
+    cv2.putText(
+        overlay, text, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2
+    )
+    cv2.putText(overlay, text, (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
 
     # Legend bottom-left
     legend = "Green=missed | Cyan=correct | Red=extra"
-    cv2.putText(overlay, legend, (8, overlay.shape[0] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
-    cv2.putText(overlay, legend, (8, overlay.shape[0] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0),       1)
+    cv2.putText(
+        overlay,
+        legend,
+        (8, overlay.shape[0] - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        2,
+    )
+    cv2.putText(
+        overlay,
+        legend,
+        (8, overlay.shape[0] - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (0, 0, 0),
+        1,
+    )
 
     return overlay
 
@@ -390,8 +416,8 @@ def draw_comparison_overlay(img_rgb: np.ndarray,
 # SUMMARY STATISTICS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_summary(rows: list[dict],
-                    artifact: str) -> dict:
+
+def compute_summary(rows: list[dict], artifact: str) -> dict:
     """
     Compute mean IoU ± std per class and overall for one artifact.
     """
@@ -401,22 +427,22 @@ def compute_summary(rows: list[dict],
     all_ious = []
     for cls in CLASSES:
         cls_ious = [
-            r[iou_key] for r in rows
-            if r["category"] == cls and r[iou_key] >= 0
+            r[iou_key] for r in rows if r["category"] == cls and r[iou_key] >= 0
         ]
-        summary[f"{cls}_mean_iou"]  = round(float(np.mean(cls_ious)),  4) if cls_ious else -1
-        summary[f"{cls}_std_iou"]   = round(float(np.std(cls_ious)),   4) if cls_ious else -1
-        summary[f"{cls}_n"]         = len(cls_ious)
+        summary[f"{cls}_mean_iou"] = (
+            round(float(np.mean(cls_ious)), 4) if cls_ious else -1
+        )
+        summary[f"{cls}_std_iou"] = (
+            round(float(np.std(cls_ious)), 4) if cls_ious else -1
+        )
+        summary[f"{cls}_n"] = len(cls_ious)
         all_ious.extend(cls_ious)
 
-    summary["overall_mean_iou"] = round(float(np.mean(all_ious)),  4) if all_ious else -1
-    summary["overall_std_iou"]  = round(float(np.std(all_ious)),   4) if all_ious else -1
-    summary["n_total"]          = len(all_ious)
-    summary["n_below_warn"]     = sum(
-        1 for v in all_ious if v < GOLD_IOU_WARN_THRESHOLD)
-    summary["target_met"]       = (
-        summary["overall_mean_iou"] >= GOLD_IOU_TARGET_MEAN
-    )
+    summary["overall_mean_iou"] = round(float(np.mean(all_ious)), 4) if all_ious else -1
+    summary["overall_std_iou"] = round(float(np.std(all_ious)), 4) if all_ious else -1
+    summary["n_total"] = len(all_ious)
+    summary["n_below_warn"] = sum(1 for v in all_ious if v < GOLD_IOU_WARN_THRESHOLD)
+    summary["target_met"] = summary["overall_mean_iou"] >= GOLD_IOU_TARGET_MEAN
     return summary
 
 
@@ -424,14 +450,18 @@ def compute_summary(rows: list[dict],
 # MAIN VALIDATION LOOP
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def main() -> None:
     t_start = time.time()
     random.seed(SEED)
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--sam2-only", action="store_true",
-                        help="Validate SAM2 masks only (no model inference). "
-                             "Run this first — Teacher/Student checkpoints not needed.")
+    parser.add_argument(
+        "--sam2-only",
+        action="store_true",
+        help="Validate SAM2 masks only (no model inference). "
+        "Run this first — Teacher/Student checkpoints not needed.",
+    )
     args = parser.parse_args()
 
     print("=" * 72)
@@ -453,11 +483,10 @@ def main() -> None:
         return
 
     # ── 3. Collect gold standard image list ───────────────────────────────────
-    valid_exts  = {".jpg", ".jpeg", ".png"}
-    gold_images = sorted([
-        p for p in GOLD_IMAGES_DIR.iterdir()
-        if p.suffix.lower() in valid_exts
-    ])
+    valid_exts = {".jpg", ".jpeg", ".png"}
+    gold_images = sorted(
+        [p for p in GOLD_IMAGES_DIR.iterdir() if p.suffix.lower() in valid_exts]
+    )
     print(f"  Gold standard images found : {len(gold_images):,}")
 
     # ── 4. Load models (skip if --sam2-only) ─────────────────────────────────
@@ -485,20 +514,17 @@ def main() -> None:
     overlay_dir.mkdir(parents=True, exist_ok=True)
 
     # Track overlay counts per class per artifact
-    overlay_counts = {
-        cls: {"sam2": 0, "teacher": 0, "student": 0}
-        for cls in CLASSES
-    }
+    overlay_counts = {cls: {"sam2": 0, "teacher": 0, "student": 0} for cls in CLASSES}
 
     # ── 6. Main per-image loop ────────────────────────────────────────────────
     rows = []
     n_total = n_no_annotation = n_no_sam2 = 0
 
     print(f"\n  Validating {len(gold_images):,} images ...")
-    print(f"  {'─'*68}")
+    print(f"  {'─' * 68}")
 
     for i, img_path in enumerate(gold_images):
-        stem     = img_path.stem          # e.g. "MSV_image045"
+        stem = img_path.stem  # e.g. "MSV_image045"
         # Category is encoded as prefix by sample_gold_standard.py
         category = stem.split("_")[0]
         if category not in CLASSES:
@@ -520,81 +546,95 @@ def main() -> None:
         human_mask = rasterize_polygons(polygons, h, w)
 
         row = {
-            "stem":        stem,
-            "category":    category,
-            "img_path":    str(img_path),
-            "sam2_iou":    -1.0,
+            "stem": stem,
+            "category": category,
+            "img_path": str(img_path),
+            "sam2_iou": -1.0,
             "teacher_iou": -1.0,
             "student_iou": -1.0,
-            "sam2_warn":   False,
-            "teacher_warn":False,
-            "student_warn":False,
+            "sam2_warn": False,
+            "teacher_warn": False,
+            "student_warn": False,
         }
 
         # ── SAM2 IoU ──────────────────────────────────────────────────────────
         npy_path = TIER1_MASKS_DIR / f"{stem}_softmask.npy"
         if npy_path.exists():
-            prob_map   = np.load(str(npy_path)).astype(np.float32)
-            prob_full  = cv2.resize(prob_map, (w, h),
-                                    interpolation=cv2.INTER_LINEAR)
-            sam2_mask  = (prob_full >= 0.5).astype(np.uint8)
-            sam2_iou   = compute_iou(sam2_mask, human_mask)
-            row["sam2_iou"]  = round(sam2_iou,  4)
+            prob_map = np.load(str(npy_path)).astype(np.float32)
+            prob_full = cv2.resize(prob_map, (w, h), interpolation=cv2.INTER_LINEAR)
+            sam2_mask = (prob_full >= 0.5).astype(np.uint8)
+            sam2_iou = compute_iou(sam2_mask, human_mask)
+            row["sam2_iou"] = round(sam2_iou, 4)
             row["sam2_warn"] = sam2_iou < GOLD_IOU_WARN_THRESHOLD
 
             # Save overlay (up to OVERLAYS_PER_CLS per class)
             if overlay_counts[category]["sam2"] < OVERLAYS_PER_CLS:
                 ov = draw_comparison_overlay(
-                    img_rgb, human_mask, sam2_mask, sam2_iou,
-                    f"SAM2 | {category} | {stem}")
+                    img_rgb,
+                    human_mask,
+                    sam2_mask,
+                    sam2_iou,
+                    f"SAM2 | {category} | {stem}",
+                )
                 cv2.imwrite(
                     str(overlay_dir / f"{stem}_sam2_overlay.jpg"),
-                    cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
+                    cv2.cvtColor(ov, cv2.COLOR_RGB2BGR),
+                )
                 overlay_counts[category]["sam2"] += 1
         else:
             n_no_sam2 += 1
 
         # ── Teacher IoU ───────────────────────────────────────────────────────
         if teacher_model is not None:
-            teacher_mask = teacher_predict(teacher_model, img_rgb,
-                                           TEACHER_IMG_SIZE)
-            teacher_iou  = compute_iou(teacher_mask, human_mask)
-            row["teacher_iou"]  = round(teacher_iou, 4)
+            teacher_mask = teacher_predict(teacher_model, img_rgb, TEACHER_IMG_SIZE)
+            teacher_iou = compute_iou(teacher_mask, human_mask)
+            row["teacher_iou"] = round(teacher_iou, 4)
             row["teacher_warn"] = teacher_iou < GOLD_IOU_WARN_THRESHOLD
 
             if overlay_counts[category]["teacher"] < OVERLAYS_PER_CLS:
                 ov = draw_comparison_overlay(
-                    img_rgb, human_mask, teacher_mask, teacher_iou,
-                    f"Teacher | {category} | {stem}")
+                    img_rgb,
+                    human_mask,
+                    teacher_mask,
+                    teacher_iou,
+                    f"Teacher | {category} | {stem}",
+                )
                 cv2.imwrite(
                     str(overlay_dir / f"{stem}_teacher_overlay.jpg"),
-                    cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
+                    cv2.cvtColor(ov, cv2.COLOR_RGB2BGR),
+                )
                 overlay_counts[category]["teacher"] += 1
 
         # ── Student IoU ───────────────────────────────────────────────────────
         if student_model is not None:
-            student_mask = student_predict(student_model, img_rgb,
-                                           STUDENT_IMG_SIZE)
-            student_iou  = compute_iou(student_mask, human_mask)
-            row["student_iou"]  = round(student_iou, 4)
+            student_mask = student_predict(student_model, img_rgb, STUDENT_IMG_SIZE)
+            student_iou = compute_iou(student_mask, human_mask)
+            row["student_iou"] = round(student_iou, 4)
             row["student_warn"] = student_iou < GOLD_IOU_WARN_THRESHOLD
 
             if overlay_counts[category]["student"] < OVERLAYS_PER_CLS:
                 ov = draw_comparison_overlay(
-                    img_rgb, human_mask, student_mask, student_iou,
-                    f"Student | {category} | {stem}")
+                    img_rgb,
+                    human_mask,
+                    student_mask,
+                    student_iou,
+                    f"Student | {category} | {stem}",
+                )
                 cv2.imwrite(
                     str(overlay_dir / f"{stem}_student_overlay.jpg"),
-                    cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
+                    cv2.cvtColor(ov, cv2.COLOR_RGB2BGR),
+                )
                 overlay_counts[category]["student"] += 1
 
         rows.append(row)
 
         if (i + 1) % 50 == 0 or (i + 1) == len(gold_images):
-            print(f"  [{i+1:>4}/{len(gold_images)}]  "
-                  f"annotated {len(rows):,}  |  "
-                  f"no_annotation {n_no_annotation:,}  |  "
-                  f"no_sam2_mask {n_no_sam2:,}")
+            print(
+                f"  [{i + 1:>4}/{len(gold_images)}]  "
+                f"annotated {len(rows):,}  |  "
+                f"no_annotation {n_no_annotation:,}  |  "
+                f"no_sam2_mask {n_no_sam2:,}"
+            )
 
     # ── 7. Write per-image report ─────────────────────────────────────────────
     report_path = REPORTS_DIR / "gold_standard_iou_report.csv"
@@ -607,16 +647,18 @@ def main() -> None:
 
     # ── 8. Compute and write summary ──────────────────────────────────────────
     summary_rows = []
-    artifacts    = ["sam2"]
+    artifacts = ["sam2"]
     if teacher_model is not None:
         artifacts.append("teacher")
     if student_model is not None:
         artifacts.append("student")
 
     print(f"\n{'─' * 72}")
-    print(f"  {'Artifact':<12}  {'Class':<10}  {'Mean IoU':>8}  "
-          f"{'Std':>6}  {'N':>5}  {'<Warn':>6}")
-    print(f"  {'─'*12}  {'─'*10}  {'─'*8}  {'─'*6}  {'─'*5}  {'─'*6}")
+    print(
+        f"  {'Artifact':<12}  {'Class':<10}  {'Mean IoU':>8}  "
+        f"{'Std':>6}  {'N':>5}  {'<Warn':>6}"
+    )
+    print(f"  {'─' * 12}  {'─' * 10}  {'─' * 8}  {'─' * 6}  {'─' * 5}  {'─' * 6}")
 
     for artifact in artifacts:
         s = compute_summary(rows, artifact)
@@ -624,24 +666,32 @@ def main() -> None:
 
         for cls in CLASSES:
             mean = s[f"{cls}_mean_iou"]
-            std  = s[f"{cls}_std_iou"]
-            n    = s[f"{cls}_n"]
+            std = s[f"{cls}_std_iou"]
+            n = s[f"{cls}_n"]
             warn = sum(
-                1 for r in rows
-                if r["category"] == cls and r[f"{artifact}_iou"] >= 0
+                1
+                for r in rows
+                if r["category"] == cls
+                and r[f"{artifact}_iou"] >= 0
                 and r[f"{artifact}_iou"] < GOLD_IOU_WARN_THRESHOLD
             )
-            print(f"  {artifact:<12}  {cls:<10}  {mean:>8.4f}  "
-                  f"{std:>6.4f}  {n:>5}  {warn:>6}")
+            print(
+                f"  {artifact:<12}  {cls:<10}  {mean:>8.4f}  "
+                f"{std:>6.4f}  {n:>5}  {warn:>6}"
+            )
 
-        print(f"  {artifact:<12}  {'OVERALL':<10}  "
-              f"{s['overall_mean_iou']:>8.4f}  "
-              f"{s['overall_std_iou']:>6.4f}  "
-              f"{s['n_total']:>5}  "
-              f"{s['n_below_warn']:>6}")
+        print(
+            f"  {artifact:<12}  {'OVERALL':<10}  "
+            f"{s['overall_mean_iou']:>8.4f}  "
+            f"{s['overall_std_iou']:>6.4f}  "
+            f"{s['n_total']:>5}  "
+            f"{s['n_below_warn']:>6}"
+        )
         target_str = "✓ TARGET MET" if s["target_met"] else "✗ BELOW TARGET"
-        print(f"  {'':12}  {'':10}  {target_str}  "
-              f"(target: mean IoU ≥ {GOLD_IOU_TARGET_MEAN})")
+        print(
+            f"  {'':12}  {'':10}  {target_str}  "
+            f"(target: mean IoU ≥ {GOLD_IOU_TARGET_MEAN})"
+        )
         print()
 
     summary_path = REPORTS_DIR / "gold_standard_iou_summary.csv"
@@ -656,7 +706,7 @@ def main() -> None:
     if len(artifacts) > 1 and summary_rows:
         print(f"\n  IoU chain (same 300 images across all artifacts):")
         print(f"  {'Artifact':<16}  {'Overall mean IoU':>16}  {'Target met':>10}")
-        print(f"  {'─'*16}  {'─'*16}  {'─'*10}")
+        print(f"  {'─' * 16}  {'─' * 16}  {'─' * 10}")
         for s in summary_rows:
             met = "Yes" if s["target_met"] else "No"
             print(f"  {s['artifact']:<16}  {s['overall_mean_iou']:>16.4f}  {met:>10}")
