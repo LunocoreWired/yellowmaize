@@ -575,7 +575,8 @@ def build_student_encoder() -> str:
 
     df = pd.read_csv(csv_path)
     display = [c for c in ["encoder","mode","best_composite",
-                             "test_sil_mIoU","test_msv_f1","test_cls_accuracy",
+                             "test_sil_mIoU","test_msv_f1","test_mln_f1",
+                             "test_msv_roc_auc","test_cls_accuracy",
                              "test_cpu_lat_mean_ms","test_cpu_fps"]
                if c in df.columns]
     df_num = df.copy()
@@ -602,20 +603,21 @@ def build_student_encoder() -> str:
         mdf = _pd.read_csv(MOBILE_RANKED_CSV)
         if not mdf.empty:
             disp_cols = [c for c in [
-                "variant","mode","mobile_composite","msv_f1","sil_mIoU",
+                "variant","mode","mobile_composite","msv_f1","mln_f1",
+                "msv_roc_auc","sil_mIoU",
                 "cpu_lat_mean_ms","cpu_fps","tflite_size_mb_est","tflite_compatible"
             ] if c in mdf.columns]
             if disp_cols:
                 mdf_disp = mdf[disp_cols].copy()
-                for c in ["mobile_composite","msv_f1","sil_mIoU"]:
+                for c in ["mobile_composite","msv_f1","mln_f1","msv_roc_auc","sil_mIoU"]:
                     if c in mdf_disp.columns:
                         mdf_disp[c] = _pd.to_numeric(mdf_disp[c], errors="coerce")
                 mob_html = (
-                    "<h3>Mobile-aware ranking (MSV_F1×0.38 + mIoU×0.22 + Speed×0.22 + Sev×0.10 + Size×0.08)</h3>"
+                    "<h3>Mobile-aware ranking (MSV_F1×0.32 + ROC_AUC×0.18 + mIoU×0.18 + Speed×0.16 + MLN_F1×0.08 + Sev×0.05 + Size×0.03)</h3>"
                     + df_to_table(mdf_disp, highlight_col="mobile_composite")
                 )
 
-    note = '<div class="note">Stage 1: all 5 encoder variants trained on Factory Mode B. Best encoder selected by composite score (0.5×mIoU + 0.35×MSV_F1 + 0.15×(1−NormMAE)). Final deployment model selected by mobile composite.</div>'
+    note = '<div class="note">Stage 1: all 5 encoder variants trained on Factory Mode B. Best encoder selected by composite score (0.40×mIoU + 0.35×MSV_F1 + 0.15×MLN_F1 + 0.10×(1−NormMAE)). Final deployment model selected by mobile composite.</div>'
     return note + table + chart + mob_html
 
 
@@ -627,6 +629,7 @@ def build_student_mode() -> str:
     df = pd.read_csv(csv_path)
     display = [c for c in ["mode","encoder","best_composite",
                              "test_sil_mIoU","test_sym_mIoU","test_msv_f1",
+                             "test_mln_f1","test_msv_roc_auc",
                              "test_sev_mae_pct","test_sev_r2"]
                if c in df.columns]
     df_num = df.copy()
@@ -636,7 +639,8 @@ def build_student_mode() -> str:
 
     table = df_to_table(df[display], highlight_col="best_composite")
     chart = ""
-    metric_cols = [c for c in ["best_composite","test_sil_mIoU","test_msv_f1"]
+    metric_cols = [c for c in ["best_composite","test_sil_mIoU","test_msv_f1",
+                                "test_mln_f1","test_msv_roc_auc"]
                    if c in df_num.columns]
     if "mode" in df_num.columns and metric_cols:
         chart = safe_chart(
@@ -683,14 +687,19 @@ def build_student_best() -> str:
 
     # Overview cards
     html += f"""<div class="grid3">
-{metric_card(r('sil_mIoU'),  "Silhouette mIoU")}
-{metric_card(r('msv_f1'),    "MSV F1 (primary)", "good" if float(str(r('msv_f1')).replace('N/A','0') or 0) >= 0.80 else "warn")}
+{metric_card(r('sil_mIoU'),     "Silhouette mIoU")}
+{metric_card(r('msv_f1'),       "MSV F1 (primary)", "good" if float(str(r('msv_f1')).replace('N/A','0') or 0) >= 0.80 else "warn")}
+{metric_card(r('msv_roc_auc'),  "MSV ROC-AUC")}
+</div>
+<div class="grid3">
+{metric_card(r('mln_f1'),       "MLN F1")}
 {metric_card(r('cls_accuracy'), "Classification Accuracy")}
+{metric_card(r('mcc'),          "Matthews Correlation (MCC)")}
 </div>
 <div class="grid3">
 {metric_card(r('sym_mIoU'),     "Symptom mask mIoU")}
-{metric_card(r('mcc'),          "Matthews Correlation (MCC)")}
 {metric_card(r('sev_mae_pct'),  "Severity MAE (%)")}
+{metric_card(r('composite'),    "Quality Composite")}
 </div>"""
 
     # Per-class table
@@ -716,6 +725,8 @@ def build_student_best() -> str:
         {"Metric":"Symptom mIoU",          "Value":r("sym_mIoU")},
         {"Metric":"Symptom Dice",          "Value":r("sym_dice")},
         {"Metric":"Symptom Recall",        "Value":r("sym_recall")},
+        {"Metric":"MSV ROC-AUC",           "Value":r("msv_roc_auc")},
+        {"Metric":"MLN F1",                "Value":r("mln_f1")},
         {"Metric":"Severity MAE %",        "Value":r("sev_mae_pct")},
         {"Metric":"Severity RMSE %",       "Value":r("sev_rmse_pct")},
         {"Metric":"Severity R²",           "Value":r("sev_r2")},
@@ -742,7 +753,7 @@ def build_student_best() -> str:
         html += "<h3>Training curves</h3>"
         html += safe_chart(
             chart_training_curve,
-            cdf, ["sil_mIoU","sym_mIoU","msv_f1","composite","train_loss"],
+            cdf, ["sil_mIoU","sym_mIoU","msv_f1","mln_f1","composite","train_loss"],
             f"Student Training — {enc} / {mode}")
 
     return html

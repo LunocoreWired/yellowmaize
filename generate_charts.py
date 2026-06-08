@@ -501,11 +501,13 @@ def _student_comparison_bar(csv_path: Path, stage: int):
 
     # Metrics to plot — use test-level columns when available, fall back to val
     metric_map = [
-        ("sil_mIoU",   "sil_mIoU",  "Silhouette\nmIoU",   "#3B82F6"),
-        ("sym_mIoU",   "sym_mIoU",  "Symptom\nmIoU",      "#10B981"),
-        ("msv_f1",     "msv_f1",    "MSV F1",              "#F59E0B"),
-        ("macro_f1",   "macro_f1",  "Macro F1",            "#EF4444"),
-        ("composite",  "composite", "Composite",           "#8B5CF6"),
+        ("sil_mIoU",    "sil_mIoU",    "Silhouette\nmIoU",   "#3B82F6"),
+        ("sym_mIoU",    "sym_mIoU",    "Symptom\nmIoU",      "#10B981"),
+        ("msv_f1",      "msv_f1",      "MSV F1",             "#F59E0B"),
+        ("mln_f1",      "mln_f1",      "MLN F1",             "#EC4899"),
+        ("msv_roc_auc", "msv_roc_auc", "MSV ROC-AUC",        "#14B8A6"),
+        ("macro_f1",    "macro_f1",    "Macro F1",           "#EF4444"),
+        ("composite",   "composite",   "Composite",          "#8B5CF6"),
     ]
 
     # Find which columns actually exist
@@ -720,6 +722,8 @@ def chart_student_radar():
         ("sil_mIoU",     "Sil mIoU"),
         ("sym_mIoU",     "Sym mIoU"),
         ("msv_f1",       "MSV F1"),
+        ("mln_f1",       "MLN F1"),
+        ("msv_roc_auc",  "MSV AUC"),
         ("cls_accuracy", "Cls Acc"),
         ("composite",    "Composite"),
         ("sev_r2",       "Sev R²"),
@@ -821,15 +825,16 @@ def chart_student_metrics_heatmap():
         return
 
     metrics_cols = [
-        ("sil_mIoU",     "Sil\nmIoU"),
-        ("sym_mIoU",     "Sym\nmIoU"),
-        ("msv_f1",       "MSV\nF1"),
-        ("healthy_f1",   "HLT\nF1"),
-        ("mln_f1",       "MLN\nF1"),
-        ("cls_accuracy", "Cls\nAcc"),
-        ("mcc",          "MCC"),
-        ("composite",    "Composite"),
-        ("sev_mae_pct",  "Sev\nMAE%"),
+        ("sil_mIoU",        "Sil\nmIoU"),
+        ("sym_mIoU",        "Sym\nmIoU"),
+        ("msv_f1",          "MSV\nF1"),
+        ("msv_roc_auc",     "MSV\nAUC"),
+        ("mln_f1",          "MLN\nF1"),
+        ("healthy_f1",      "HLT\nF1"),
+        ("cls_accuracy",    "Cls\nAcc"),
+        ("mcc",             "MCC"),
+        ("composite",       "Composite"),
+        ("sev_mae_pct",     "Sev\nMAE%"),
         ("cpu_lat_mean_ms", "CPU\nms"),
     ]
 
