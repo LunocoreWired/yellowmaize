@@ -17,9 +17,20 @@
    annotations already done would be invalidated.
 
    GUARD: On first run, a SHA-256 hash of tier1_manifest.csv is written to
-   data/label_studio_import/_manifest_hash.txt. On subsequent runs the hash
+   data/gold_standard/images/_manifest_hash.txt. On subsequent runs the hash
    is re-checked. If it has changed, the script aborts with a clear error
    rather than silently producing a mismatched sample.
+
+ OUTPUT DIRECTORY:
+   Images are written to GOLD_IMAGES_DIR (data/gold_standard/images/) so that
+   validate_gold_standard.py can find them directly — no manual file moving
+   required after Label Studio annotation.
+
+ WORKFLOW:
+   1. Run this script right after sample_15000.py (no masks needed).
+   2. Import data/gold_standard/images/ into Label Studio and annotate.
+   3. Export annotations as JSON → data/gold_standard/annotations/annotations.json
+   4. Run validate_gold_standard.py (after Teacher + Student are trained).
 ================================================================================
 """
 
@@ -28,7 +39,7 @@ import shutil
 from pathlib import Path
 import pandas as pd
 
-from config import TIER1_MANIFEST, DATA_DIR, CLASSES, SEED
+from config import TIER1_MANIFEST, GOLD_IMAGES_DIR, GOLD_MANIFEST, CLASSES, SEED
 
 
 def _manifest_hash(path: Path) -> str:
@@ -44,17 +55,17 @@ def main():
     print("  Yellow MAIze | Generating 300-Image Gold Standard Validation Set")
     print("=" * 72)
 
-    # 1. Create the destination directory
-    gold_dir = DATA_DIR / "label_studio_import"
-    gold_dir.mkdir(parents=True, exist_ok=True)
+    # 1. Create the destination directory (data/gold_standard/images/)
+    GOLD_IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
     # ── Manifest hash guard ────────────────────────────────────────────────────
     # Protects against silent re-sampling if sample_15000.py is re-run after
     # Label Studio annotation has already begun.
-    hash_file = gold_dir / "_manifest_hash.txt"
+    hash_file = GOLD_IMAGES_DIR / "_manifest_hash.txt"
 
     if not Path(TIER1_MANIFEST).exists():
         print(f"  [FATAL] Could not find {TIER1_MANIFEST}")
+        print("          Run sample_15000.py first.")
         return
 
     current_hash = _manifest_hash(Path(TIER1_MANIFEST))
@@ -77,7 +88,7 @@ def main():
 
     # Clear out old images only (preserve hash file if it exists)
     print("  Clearing old export folder...")
-    for item in gold_dir.iterdir():
+    for item in GOLD_IMAGES_DIR.iterdir():
         if item.is_file() and item.name != "_manifest_hash.txt":
             item.unlink()
 
@@ -104,8 +115,8 @@ def main():
 
     gold_df = pd.concat(sampled_rows).copy()
 
-    # 4. Copy and Rename the physical files
-    print(f"\n  Copying and renaming {len(gold_df)} images to {gold_dir} ...")
+    # 4. Copy and rename the physical files
+    print(f"\n  Copying and renaming {len(gold_df)} images to {GOLD_IMAGES_DIR} ...")
 
     success_count = 0
     new_filenames = []
@@ -117,7 +128,7 @@ def main():
         # Prepend the category to the filename so annotators see the class.
         # Example: MSV_original_filename.jpg
         dest_filename = f"{category}_{src_path.name}"
-        dest_path = gold_dir / dest_filename
+        dest_path = GOLD_IMAGES_DIR / dest_filename
 
         if src_path.exists():
             shutil.copy2(src_path, dest_path)
@@ -127,12 +138,11 @@ def main():
             print(f"  [WARN] Missing source file: {src_path}")
             new_filenames.append("ERROR_MISSING")
 
-    # Add the new names to the manifest so we don't lose track of them
-    gold_df["label_studio_filename"] = new_filenames
+    gold_df["gold_filename"] = new_filenames
 
-    # 5. Save mini-manifest
-    gold_manifest_path = gold_dir / "_gold_standard_manifest_300.csv"
-    gold_df.to_csv(gold_manifest_path, index=False)
+    # 5. Save gold manifest (picked up by validate_gold_standard.py)
+    GOLD_MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    gold_df.to_csv(GOLD_MANIFEST, index=False)
 
     # 6. Write (or confirm) manifest hash — locks this sample to the current
     #    tier1_manifest.csv so future runs detect if it ever changes.
@@ -141,12 +151,14 @@ def main():
 
     print(f"\n{'─' * 72}")
     print(f"  Successfully copied {success_count} / {len(gold_df)} images.")
-    print(f"  Folder ready for Label Studio: {gold_dir}")
-    print(f"  Manifest saved to: {gold_manifest_path}")
+    print(f"  Folder ready for Label Studio : {GOLD_IMAGES_DIR}")
+    print(f"  Gold manifest saved to        : {GOLD_MANIFEST}")
     print()
-    print("  NEXT STEP: Upload images to Label Studio and annotate leaf")
-    print("  silhouettes (polygonlabels). Export JSON to:")
-    print("  data/gold_standard/annotations/annotations.json")
+    print("  NEXT STEPS:")
+    print("    1. Import images into Label Studio and annotate leaf silhouettes")
+    print("       (polygonlabels). Export JSON to:")
+    print(f"      {GOLD_IMAGES_DIR.parent / 'annotations' / 'annotations.json'}")
+    print("    2. Run validate_gold_standard.py after training is complete.")
     print("=" * 72)
 
 

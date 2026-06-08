@@ -46,6 +46,7 @@ from config import (
     STUDENT_IMG_SIZE, STUDENT_BATCH_SIZE, STUDENT_NUM_WORKERS,
     CLASSES, CLASS_TO_IDX,
     XAI_METHODS, XAI_DEPLOYED_METHOD, XAI_TARGET_LAYERS,
+    XAI_N_SAMPLES_CLASS, XAI_INSERTION_STEPS,
     STUDENT_BEST_VARIANT, STUDENT_FACTORY_MODE,
     FACTORY_MODES,
 )
@@ -66,7 +67,7 @@ def set_seeds(seed: int) -> None:
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 XAI_OUTPUT_DIR   = REPORTS_DIR / "xai"
-N_SAMPLES_CLASS  = 5     # qualitative overlays per class per XAI method
+N_SAMPLES_CLASS  = XAI_N_SAMPLES_CLASS   # from config — default 30 per class
 OVERLAY_ALPHA    = 0.50  # heatmap overlay transparency
 
 
@@ -436,18 +437,18 @@ def main() -> None:
             pg_acc = pointing_game_accuracy(heatmap, seg_mask_np)
 
             ins_auc, del_auc = insertion_deletion_auc(
-                model, inp_t, heatmap, true_cls, n_steps=8)
+                model, inp_t, heatmap, true_cls, n_steps=XAI_INSERTION_STEPS)
 
             quant_rows.append({
-                "stem":        stem,
-                "category":    category,
-                "true_cls":    category,
-                "pred_cls":    pred_name,
-                "pred_sev":    pred_sev,
-                "method":      method,
+                "stem":              stem,
+                "category":          category,
+                "pred_cls":          pred_name,
+                "correct":           category == pred_name,
+                "pred_sev":          pred_sev,
+                "method":            method,
                 "pointing_game_acc": round(pg_acc, 4) if not np.isnan(pg_acc) else "nan",
-                "insertion_auc":    round(ins_auc, 4) if not np.isnan(ins_auc) else "nan",
-                "deletion_auc":     round(del_auc, 4) if not np.isnan(del_auc) else "nan",
+                "insertion_auc":     round(ins_auc, 4) if not np.isnan(ins_auc) else "nan",
+                "deletion_auc":      round(del_auc, 4) if not np.isnan(del_auc) else "nan",
             })
 
         print(f"  [{category}] {stem[:40]:<40} "
@@ -461,30 +462,116 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(quant_rows)
 
-        # Per-method summary
+        # ── Per-method overall summary ────────────────────────────────────
         print(f"\n{'─' * 72}")
         print("  XAI quantitative summary (mean across all samples):")
         print(f"  {'Method':<20} {'Pointing Game':>14} {'Ins AUC':>8} {'Del AUC':>8}")
         print(f"  {'─'*20} {'─'*14} {'─'*8} {'─'*8}")
 
         df = pd.DataFrame(quant_rows)
+        method_scores = {}
         for method in XAI_METHODS:
             mdf = df[df["method"] == method]
-            pg  = mdf["pointing_game_acc"]
-            pg  = pd.to_numeric(pg, errors="coerce")
-            ins = pd.to_numeric(mdf["insertion_auc"], errors="coerce")
-            dl  = pd.to_numeric(mdf["deletion_auc"], errors="coerce")
+            pg  = pd.to_numeric(mdf["pointing_game_acc"], errors="coerce")
+            ins = pd.to_numeric(mdf["insertion_auc"],     errors="coerce")
+            dl  = pd.to_numeric(mdf["deletion_auc"],      errors="coerce")
             print(f"  {method:<20} {pg.mean():>14.4f} "
                   f"{ins.mean():>8.4f} {dl.mean():>8.4f}")
+            method_scores[method] = {
+                "pg_mean":  pg.mean(),
+                "ins_mean": ins.mean(),
+                "del_mean": dl.mean(),
+                # MSV-specific pointing game (thesis primary focus)
+                "msv_pg": pd.to_numeric(
+                    mdf[mdf["category"] == "MSV"]["pointing_game_acc"],
+                    errors="coerce").mean(),
+            }
 
-        print(f"\n  Comparison saved: {comp_path}")
-        print(f"  Overlays saved  : {XAI_OUTPUT_DIR}")
+        # ── Per-class breakdown for each method ──────────────────────────────
+        print(f"\n  Per-class breakdown:")
+        for method in XAI_METHODS:
+            mdf = df[df["method"] == method]
+            print(f"  [{method}]")
+            print(f"    {'Class':<12} {'Pointing Game':>14} {'Ins AUC':>8} {'Del AUC':>8} {'Correct%':>9}")
+            print(f"    {'─'*12} {'─'*14} {'─'*8} {'─'*8} {'─'*9}")
+            for cls in CLASSES:
+                cdf = mdf[mdf["category"] == cls]
+                if cdf.empty:
+                    continue
+                pg  = pd.to_numeric(cdf["pointing_game_acc"], errors="coerce").mean()
+                ins = pd.to_numeric(cdf["insertion_auc"],     errors="coerce").mean()
+                dl  = pd.to_numeric(cdf["deletion_auc"],      errors="coerce").mean()
+                acc = cdf["correct"].mean() * 100 if "correct" in cdf.columns else float("nan")
+                print(f"    {cls:<12} {pg:>14.4f} {ins:>8.4f} {dl:>8.4f} {acc:>8.1f}%")
+
+        # ── Auto-select best XAI method ───────────────────────────────────────
+        # Selection criterion: highest MSV pointing game accuracy (primary thesis focus).
+        # Tiebreaker: insertion AUC (measures faithfulness of top activations).
+        valid_methods = {m: s for m, s in method_scores.items()
+                         if not np.isnan(s["msv_pg"])}
+        if valid_methods:
+            best_method = max(
+                valid_methods,
+                key=lambda m: (valid_methods[m]["msv_pg"],
+                               valid_methods[m]["ins_mean"])
+            )
+            best_pg  = valid_methods[best_method]["msv_pg"]
+            best_ins = valid_methods[best_method]["ins_mean"]
+
+            print(f"\n{'─' * 72}")
+            print(f"  XAI AUTO-SELECTION:")
+            print(f"    Best method : {best_method}")
+            print(f"    MSV pointing game : {best_pg:.4f}")
+            print(f"    Insertion AUC     : {best_ins:.4f}")
+            print(f"    Criterion: highest MSV pointing game accuracy")
+            print(f"    Tiebreaker: insertion AUC")
+
+            # Write best method to selection log
+            selection_path = LOGS_DIR / "xai_method_selection.csv"
+            import csv as _csv
+            with open(selection_path, "w", newline="", encoding="utf-8") as f_sel:
+                _w = _csv.DictWriter(f_sel, fieldnames=[
+                    "selected_method","msv_pg","ins_auc","del_auc",
+                    "gradcam_pg","gradcamplusplus_pg","scorecam_pg"])
+                _w.writeheader()
+                _w.writerow({
+                    "selected_method":   best_method,
+                    "msv_pg":            round(best_pg, 4),
+                    "ins_auc":           round(best_ins, 4),
+                    "del_auc":           round(valid_methods[best_method]["del_mean"], 4),
+                    "gradcam_pg":        round(valid_methods.get("gradcam",        {}).get("msv_pg", float("nan")), 4),
+                    "gradcamplusplus_pg":round(valid_methods.get("gradcamplusplus",{}).get("msv_pg", float("nan")), 4),
+                    "scorecam_pg":       round(valid_methods.get("scorecam",       {}).get("msv_pg", float("nan")), 4),
+                })
+            print(f"    Selection log: {selection_path}")
+
+            # Update config.py XAI_DEPLOYED_METHOD in-place
+            config_path = Path(__file__).parent / "config.py"
+            if config_path.exists():
+                cfg_text = config_path.read_text(encoding="utf-8")
+                import re as _re
+                new_cfg = _re.sub(
+                    r'XAI_DEPLOYED_METHOD\s*=\s*"[^"]*"',
+                    f'XAI_DEPLOYED_METHOD = "{best_method}"',
+                    cfg_text)
+                if new_cfg != cfg_text:
+                    config_path.write_text(new_cfg, encoding="utf-8")
+                    print(f"    config.py updated: XAI_DEPLOYED_METHOD = "{best_method}"")
+                else:
+                    print(f"    config.py unchanged (already {best_method})")
+        else:
+            best_method = XAI_DEPLOYED_METHOD
+            print(f"  [WARN] Could not auto-select XAI method — using config default: {best_method}")
+
+        print(f"\n  Comparison saved : {comp_path}")
+        print(f"  Overlays saved   : {XAI_OUTPUT_DIR}")
 
     print(f"\n  Note: In the Android app, two distinct outputs are shown:")
     print(f"    (1) Green contour overlay  — UNet segmentation head")
     print(f"        'Symptom boundary' — pixel-level localization")
-    print(f"    (2) Amber heatmap overlay  — Grad-CAM++ on encoder")
+    print(f"    (2) Amber heatmap overlay  — {XAI_DEPLOYED_METHOD} on encoder")
     print(f"        'Diagnostic attention' — explainability / justification")
+    print(f"    Deployed XAI method: {XAI_DEPLOYED_METHOD} (auto-selected or config default)")
 
     print(f"\n  NEXT STEP: python evaluate_severity.py")
     print("=" * 72)

@@ -135,10 +135,10 @@ CLAHE_TILE_GRID = (8, 8)  # local region size for histogram equalization
 # ══════════════════════════════════════════════════════════════════════════════
 # Auto-prompting HSV range for foreground detection.
 # GREEN: healthy leaf tissue
-SAM2_GREEN_H_MIN = 30
-SAM2_GREEN_H_MAX = 90
-SAM2_GREEN_S_MIN = 40
-SAM2_GREEN_V_MIN = 40
+SAM2_GREEN_H_MIN = 35   # was 30 — raised to avoid warm yellows
+SAM2_GREEN_H_MAX = 75   # was 90 — excludes cogon grass band (H=75–90)
+SAM2_GREEN_S_MIN = 50   # was 40 — excludes dull/background greens
+SAM2_GREEN_V_MIN = 40   # unchanged
 
 # YELLOW: MSV chlorotic streaks / early-stage yellowing
 SAM2_YELLOW_H_MIN = 15
@@ -153,11 +153,11 @@ SAM2_BROWN_S_MIN = 30
 SAM2_BROWN_V_MIN = 50
 
 # QA filter thresholds
-SAM2_QA_MIN_COVERAGE = 0.10  # reject if foreground < 10% of image
-SAM2_QA_MAX_COVERAGE = 0.90  # reject if foreground > 90% of image
-SAM2_QA_MIN_CONFIDENCE = 0.60  # v7: lowered from 0.65 — absorbs dark MLN leaves
-SAM2_QA_MIN_ASPECT_RATIO = 1.20  # reject if mask aspect ratio < 1.2
-SAM2_QA_MAX_REJECT_RATE = 0.08  # warn if > 8% of images rejected
+SAM2_QA_MIN_COVERAGE = 0.03   # reject if foreground < 3% of image (close-up leaves fill frame)
+SAM2_QA_MAX_COVERAGE = 0.99   # was 0.90 — raised after data showed 2,537 valid close-up masks wrongly rejected
+SAM2_QA_MIN_CONFIDENCE = 0.50 # was 0.60/0.65 — lowered after data showed diseased leaves cluster at 0.51–0.64
+SAM2_QA_MIN_ASPECT_RATIO = 1.01  # was 1.20 — overhead/square-frame leaves are valid
+SAM2_QA_MAX_REJECT_RATE = 0.08   # warn if > 8% of images rejected
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TEACHER
@@ -275,9 +275,10 @@ STUDENT_WEIGHT_DECAY = 1e-4
 STUDENT_DROPOUT = 0.3
 
 # Composite checkpoint criterion weights
-STUDENT_CKPT_W_MIOU = 0.50
-STUDENT_CKPT_W_MSV_F1 = 0.35
-STUDENT_CKPT_W_MAE = 0.15  # weight on (1 - normalized_MAE)
+STUDENT_CKPT_W_MIOU   = 0.40   # was 0.50 — reduced to make room for MLN
+STUDENT_CKPT_W_MSV_F1 = 0.35   # unchanged — primary thesis claim
+STUDENT_CKPT_W_MLN_F1 = 0.15   # NEW — prevents degenerate MSV-only model
+STUDENT_CKPT_W_MAE    = 0.10   # was 0.15 — reduced; severity is secondary
 STUDENT_MAX_SEVERITY = 100.0  # for normalizing MAE
 
 # Label smoothing
@@ -339,13 +340,23 @@ CBAM_SPATIAL_KERNEL = 7
 XAI_METHODS = ["gradcam", "gradcamplusplus", "scorecam"]
 XAI_DEPLOYED_METHOD = "gradcamplusplus"
 
+# Number of images per class for quantitative XAI metrics
+# 5 is too few for stable means — 30 gives defensible thesis statistics
+XAI_N_SAMPLES_CLASS = 30
+
+# Steps for insertion/deletion AUC — higher = smoother curve, slower
+# 8 is too coarse; 25 gives a reasonable trade-off between speed and resolution
+XAI_INSERTION_STEPS = 25
+
 # Target layer per encoder (last conv block before decoder branch)
+# Path is relative to StudentModel instance — starts with unet.encoder
+# because StudentModel wraps smp.Unet as self.unet (not self.encoder directly)
 XAI_TARGET_LAYERS = {
-    "mobilenet_v2": "encoder.features[-1][0]",
-    "mobilenet_v2_cbam": "encoder.features[-1][0]",
-    "mobilenet_v3_small": "encoder.features[-1][0]",
-    "efficientnet_b0": "encoder.blocks[-1][-1]",
-    "efficientnet_b0_cbam": "encoder.blocks[-1][-1]",
+    "mobilenet_v2":        "unet.encoder.features[-1][0]",
+    "mobilenet_v2_cbam":   "unet.encoder.features[-1][0]",
+    "mobilenet_v3_small":  "unet.encoder.features[-1][0]",
+    "efficientnet_b0":     "unet.encoder.blocks[-1][-1]",
+    "efficientnet_b0_cbam":"unet.encoder.blocks[-1][-1]",
 }
 
 # ══════════════════════════════════════════════════════════════════════════════

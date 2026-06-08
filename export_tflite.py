@@ -263,15 +263,25 @@ def validate_tflite(tflite_path: Path,
         interpreter.invoke()
         latencies.append((time.perf_counter() - t0) * 1000)   # ms
 
-        # Get outputs (order may vary — find by shape)
+        # Get outputs by name (preserved from ONNX export)
+        # Names: seg_logits, cls_logits, sev_out
         cls_tflite = None
         seg_tflite = None
         for det in out_det:
-            out = interpreter.get_tensor(det["index"])
-            if out.shape[-1] == len(CLASSES):
+            out  = interpreter.get_tensor(det["index"])
+            name = det.get("name", "")
+            if "cls" in name:
                 cls_tflite = out
-            elif len(out.shape) == 4:
+            elif "seg" in name:
                 seg_tflite = out
+            # fallback to shape heuristic if names stripped by converter
+        if cls_tflite is None and seg_tflite is None:
+            for det in out_det:
+                out = interpreter.get_tensor(det["index"])
+                if out.shape[-1] == len(CLASSES):
+                    cls_tflite = out
+                elif len(out.shape) == 4:
+                    seg_tflite = out
 
         if cls_tflite is not None:
             cls_pred_tfl = np.argmax(cls_tflite, axis=-1)[0]
@@ -281,7 +291,10 @@ def validate_tflite(tflite_path: Path,
 
         if seg_tflite is not None and seg_pt is not None:
             seg_pt_np = torch.sigmoid(seg_pt[:, 0]).squeeze().numpy()
-            seg_tfl   = seg_tflite.squeeze()
+            # TFLite output is NHWC: [1, H, W, 2] — channel 0 = silhouette
+            seg_tfl = seg_tflite.squeeze()   # [H, W, 2]
+            if seg_tfl.ndim == 3:
+                seg_tfl = seg_tfl[:, :, 0]  # NHWC: take channel 0
             if seg_pt_np.shape == seg_tfl.shape:
                 seg_diffs.append(np.abs(seg_pt_np - seg_tfl).mean())
 
@@ -400,8 +413,8 @@ def main() -> None:
     if tflite_ok:
         print(f"\n  TFLite model: {TFLITE_PATH}")
         print(f"  → Copy this file into the MAIze Android app's assets/ folder.")
-        print(f"  → Input: float32 [{STUDENT_IMG_SIZE}×{STUDENT_IMG_SIZE}×3]  (ImageNet normalized)")
-        print(f"  → Outputs: seg_logits [2×H×W], cls_logits [3], sev_out [1]")
+        print(f"  → Input: float32 [{STUDENT_IMG_SIZE}×{STUDENT_IMG_SIZE}×3]  NHWC (channels last, ImageNet normalized)")
+        print(f"  → Outputs: seg_logits [H×W×2], cls_logits [3], sev_out [1]")
         print(f"  → Apply sigmoid to seg_logits and sev_out at inference.")
         print(f"  → Classification: argmax(softmax(cls_logits)) → 0=HEALTHY, 1=MSV, 2=MLN")
     else:

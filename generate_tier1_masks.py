@@ -38,9 +38,9 @@
      when the leaf extends beyond the centroid axis.
    - Still zero training required — bbox derived from existing HSV mask.
 
- QA FILTERS (v6 — thresholds unchanged from v2/v3/v4/v5):
-   Filter 1 — Coverage range  : foreground must be 3%–90% of image
-   Filter 2 — Mean confidence : mean prob of foreground region ≥ 0.65
+ QA FILTERS (v6 — thresholds from config.py):
+   Filter 1 — Coverage range  : foreground must be 3%–99% of image
+   Filter 2 — Mean confidence : mean prob of foreground region ≥ 0.50
    Filter 3 — Aspect ratio    : mask bounding box ratio ≥ 1.01
    Target rejection rate: < 8% of total images.
 
@@ -117,7 +117,6 @@ from config import (
     SAM2_BROWN_H_MIN,
     SAM2_BROWN_S_MIN,
     SAM2_BROWN_V_MIN,
-    # REPORTS_DIR removed — unused in this script   # FIX 5
     SAM2_CHECKPOINT,
     SAM2_CONFIG,
     SAM2_GREEN_H_MAX,
@@ -141,23 +140,25 @@ from config import (
 )
 from image_utils import load_image_rgb, to_hsv  # EXIF correction
 
-# ── v4 QA / prompting constants ───────────────────────────────────────────────
-# QA thresholds — same values as v3 (the *target* is to pass more images, not
-# to lower the bar; we improve the prompting so more images naturally pass).
-_QA_MIN_COVERAGE = 0.03  # was SAM2_QA_MIN_COVERAGE (0.10) in config — v2 relaxation
-_QA_MAX_COVERAGE = 0.90  # unchanged across versions
-_QA_MIN_CONFIDENCE = 0.65  # unchanged across versions
-_QA_MIN_ASPECT = 1.01  # was SAM2_QA_MIN_ASPECT_RATIO (1.20) — v2 relaxation
+# ── QA thresholds — pulled directly from config.py ────────────────────────────
+# Edit SAM2_QA_* keys in config.py to adjust. Values set from empirical
+# analysis of tier1_qa_report.csv (15,000 images):
+#   MAX_COVERAGE  raised 0.90 → 0.99: close-up leaves legitimately fill the frame
+#   MIN_CONFIDENCE lowered 0.65 → 0.50: diseased leaves cluster at 0.51–0.64
+#   MIN_COVERAGE  0.03: valid for tightly-cropped single-leaf shots
+#   MIN_ASPECT    1.01: overhead/square-frame images are valid
+_QA_MIN_COVERAGE   = SAM2_QA_MIN_COVERAGE
+_QA_MAX_COVERAGE   = SAM2_QA_MAX_COVERAGE
+_QA_MIN_CONFIDENCE = SAM2_QA_MIN_CONFIDENCE
+_QA_MIN_ASPECT     = SAM2_QA_MIN_ASPECT_RATIO
 
-# Green HSV range — tightened in v4 to exclude cogon grass / background vegetation.
-# Cogon grass (Imperata cylindrica) sits in H=75–90; lowering H_MAX to 75 and
-# raising S_MIN to 50 removes it without losing healthy maize leaf response.
-# These shadow the config values; update config.py to SAM2_GREEN_H_MAX=75,
-# SAM2_GREEN_S_MIN=50 once validated in the overlay review.
-_GREEN_H_MIN = 35  # was SAM2_GREEN_H_MIN (30) — slight raise avoids warm yellows
-_GREEN_H_MAX = 75  # was SAM2_GREEN_H_MAX (90) — KEY: excludes cogon band 75–90
-_GREEN_S_MIN = 50  # was SAM2_GREEN_S_MIN (40) — excludes dull/background greens
-_GREEN_V_MIN = 40  # unchanged
+# Green HSV range — pulled from config.py (tightened in v4, now canonical).
+# H_MAX=75 excludes cogon grass (Imperata cylindrica, H=75–90).
+# S_MIN=50 excludes dull background greens.
+_GREEN_H_MIN = SAM2_GREEN_H_MIN
+_GREEN_H_MAX = SAM2_GREEN_H_MAX
+_GREEN_S_MIN = SAM2_GREEN_S_MIN
+_GREEN_V_MIN = SAM2_GREEN_V_MIN
 
 # Morphological closing kernel for tissue mask (NEW v4).
 # Fills holes from specular highlights and veins, connecting nearby fragments.
@@ -497,7 +498,7 @@ def main() -> None:
     print("=" * 72)
     print("  Yellow MAIze | Phase 2: SAM2 Tier 1 Masking  [v6]")
     print("=" * 72)
-    print("  QA thresholds (v3 — unchanged from v2):")
+    print("  QA thresholds (from config.py):")
     print(f"    Coverage     : {_QA_MIN_COVERAGE:.0%} – {_QA_MAX_COVERAGE:.0%}")
     print(f"    Confidence   : ≥ {_QA_MIN_CONFIDENCE:.2f}")
     print(f"    Aspect ratio : ≥ {_QA_MIN_ASPECT:.2f}")
@@ -860,7 +861,7 @@ def main() -> None:
             "           center_fallback→ lower _MIN_COMPONENT_AREA_PX (500) or increase _MORPH_CLOSE_KSIZE (15)"
         )
         print(
-            "           confidence_low → lower _QA_MIN_CONFIDENCE below 0.65 (last resort)"
+            f"           confidence_low → lower SAM2_QA_MIN_CONFIDENCE in config.py (currently {_QA_MIN_CONFIDENCE:.2f})"
         )
         print("           sam2_error     → check GPU memory / SAM2 install")
         print(

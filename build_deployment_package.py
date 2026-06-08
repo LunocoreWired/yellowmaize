@@ -47,10 +47,10 @@ import torch.nn as nn
 
 from config import (
     SEED,
-    EXPORTS_DIR, LOGS_DIR, CHECKPOINTS_DIR,
+    EXPORTS_DIR, LOGS_DIR, REPORTS_DIR, CHECKPOINTS_DIR,
     BOUNCER_CKPT_DIR, STUDENT_CKPT_DIR,
     BOUNCER_IMG_SIZE, STUDENT_IMG_SIZE,
-    BOUNCER_DEPLOYED_VARIANT, STUDENT_BEST_VARIANT,
+    BOUNCER_DEPLOYED_VARIANT, STUDENT_BEST_VARIANT, STUDENT_FACTORY_MODE,
     CLASSES, CLASS_TO_IDX,
 )
 
@@ -237,7 +237,7 @@ def write_metadata(bouncer_thresh: float,
     metadata = {
         "project": "Yellow MAIze",
         "version": "1.0",
-        "description": "MAIze: MobileNetV2-UNet + Grad-CAM for Maize Disease Detection",
+        "description": f"MAIze: {STUDENT_BEST_VARIANT}-UNet + Grad-CAM for Maize Disease Detection",
         "generated": time.strftime("%Y-%m-%d %H:%M:%S"),
         "target_platform": "Android (TFLite)",
 
@@ -255,7 +255,7 @@ def write_metadata(bouncer_thresh: float,
                 "std":  IMAGENET_STD,
                 "input_range": "float32 [0, 1] after /255, then normalized",
             },
-            "step3_layout": "NCHW — shape [1, 3, H, W] (channels first)",
+            "step3_layout": "NHWC — shape [1, H, W, 3] (channels last). TFLite always uses NHWC. The ONNX→TF→TFLite conversion automatically transposes from PyTorch NCHW to TFLite NHWC.",
             "clahe_note": "CLAHE is applied in the training pipeline but NOT required at inference — the model has learned to handle lighting variation through augmentation.",
             "exif_note": "Apply EXIF orientation correction before resizing.",
         },
@@ -265,8 +265,9 @@ def write_metadata(bouncer_thresh: float,
             "architecture":"MobileNetV3-Large binary classifier",
             "input": {
                 "name":  "input",
-                "shape": [1, 3, BOUNCER_IMG_SIZE, BOUNCER_IMG_SIZE],
+                "shape": [1, BOUNCER_IMG_SIZE, BOUNCER_IMG_SIZE, 3],
                 "dtype": "float32",
+                "layout": "NHWC — channels last (TFLite default)",
             },
             "output": {
                 "name":        "logit",
@@ -283,7 +284,7 @@ def write_metadata(bouncer_thresh: float,
             "threshold_note":         "Empirically selected on validation split to maximise specificity subject to maize recall ≥ 95%.",
             "heuristic_prefilter": {
                 "description": "Run this BEFORE neural bouncer (microseconds, saves battery)",
-                "green_hsv_range": "H:[35,85] S:>40 V:>40",
+                "green_hsv_range": "H:[35,75] S:>50 V:>40",
                 "min_green_coverage_pct": 15,
                 "min_aspect_ratio": 1.5,
                 "max_aspect_ratio": 18.0,
@@ -294,16 +295,18 @@ def write_metadata(bouncer_thresh: float,
 
         "student": {
             "file":        "student_model.tflite",
-            "architecture":"MobileNetV2-UNet multi-task (3 heads)",
+            "architecture":f"{STUDENT_BEST_VARIANT}-UNet multi-task (3 heads)",
             "input": {
                 "name":  "input",
-                "shape": [1, 3, STUDENT_IMG_SIZE, STUDENT_IMG_SIZE],
+                "shape": [1, STUDENT_IMG_SIZE, STUDENT_IMG_SIZE, 3],
                 "dtype": "float32",
+                "layout": "NHWC — channels last (TFLite default)",
             },
             "outputs": {
                 "segmentation": {
                     "index":       0,
-                    "shape":       [1, 2, STUDENT_IMG_SIZE, STUDENT_IMG_SIZE],
+                    "shape":       [1, STUDENT_IMG_SIZE, STUDENT_IMG_SIZE, 2],
+                    "layout":      "NHWC — [:, :, :, 0]=leaf silhouette, [:, :, :, 1]=symptom mask",
                     "dtype":       "float32 (raw logits)",
                     "channel_0":   "Leaf silhouette — sigmoid → binary boundary mask",
                     "channel_1":   "Symptom mask    — sigmoid → binary symptom region",
@@ -328,7 +331,8 @@ def write_metadata(bouncer_thresh: float,
             },
             "grad_cam_note": {
                 "description": "Grad-CAM++ heatmap is computed at runtime in the Android app, not stored in TFLite.",
-                "target_layer": "Last convolutional block of the MobileNetV2 encoder",
+                "target_layer": f"Last convolutional block of the {STUDENT_BEST_VARIANT} encoder",
+                "target_layer_note": "For mobilenet_v2: features[-1]; for efficientnet_b2: blocks[-1]; for resnet: layer4. Check train_student.py GradCAMWrapper for exact hook point.",
                 "library":      "Use tflite-support or compute gradient manually",
                 "app_display":  "Show as semi-transparent amber overlay labelled 'Diagnostic attention'",
                 "seg_display":  "Show segmentation channel_0 as green contour labelled 'Symptom boundary'",
@@ -409,12 +413,12 @@ app/src/main/assets/
 
 ### 3. Preprocessing (Java/Kotlin)
 ```kotlin
-// Letterbox resize to 224×224
+// Letterbox resize to 224×224 (longest side → 224, pad shorter side with zeros)
 val imageProcessor = ImageProcessor.Builder()
-    .add(ResizeWithCropOrPadOp(224, 224))
+    .add(ResizeOp(224, 224, ResizeOp.ResizeMethod.BILINEAR))
     .add(NormalizeOp(
-        floatArrayOf(0.485f, 0.456f, 0.406f),  // mean
-        floatArrayOf(0.229f, 0.224f, 0.225f)    // std
+        floatArrayOf(0.485f, 0.456f, 0.406f),  // mean (ImageNet)
+        floatArrayOf(0.229f, 0.224f, 0.225f)    // std  (ImageNet)
     ))
     .build()
 
@@ -438,7 +442,7 @@ fun isLikelyMaize(bitmap: Bitmap): Boolean {{
         for (y in 0 until bitmap.height step 4) {{
             Color.colorToHSV(bitmap.getPixel(x, y), hsv)
             val h = hsv[0]; val s = hsv[1] * 255; val v = hsv[2] * 255
-            if (h in 35f..85f && s > 40 && v > 40) greenPixels++
+            if (h in 35f..75f && s > 50 && v > 40) greenPixels++
         }}
     }}
     return (greenPixels.toFloat() / (total / 16)) > 0.15f
@@ -465,10 +469,10 @@ if (sigmoid < {bouncer_thresh}f) {{
 val studentInterpreter = Interpreter(
     FileUtil.loadMappedFile(context, "student_model.tflite"))
 
-// Output buffers
-val segOutput = Array(1) {{ Array(2) {{ Array(224) {{ FloatArray(224) }} }} }}
-val clsOutput = Array(1) {{ FloatArray(3) }}
-val sevOutput = Array(1) {{ FloatArray(1) }}
+// Output buffers — TFLite outputs in NHWC layout
+val segOutput = Array(1) {{ Array(224) {{ Array(224) {{ FloatArray(2) }} }} }}  // [1,H,W,2]
+val clsOutput = Array(1) {{ FloatArray(3) }}                                     // [1,3]
+val sevOutput = Array(1) {{ FloatArray(1) }}                                     // [1,1]
 
 val outputs = mapOf(0 to segOutput, 1 to clsOutput, 2 to sevOutput)
 studentInterpreter.runForMultipleInputsOutputs(
@@ -486,9 +490,10 @@ val confidence = classProbs[classIndex] * 100f
 // Severity
 val severityPct = sevOutput[0][0] * 100f
 
-// Segmentation — extract leaf boundary contour
-val silhouette = segOutput[0][0]  // channel 0: leaf silhouette
-val symptoms   = segOutput[0][1]  // channel 1: symptom mask
+// Segmentation — NHWC layout: segOutput[0][y][x][channel]
+// channel 0 = leaf silhouette, channel 1 = symptom mask
+val silhouette = Array(224) { y -> FloatArray(224) { x -> segOutput[0][y][x][0] } }
+val symptoms   = Array(224) { y -> FloatArray(224) { x -> segOutput[0][y][x][1] } }
 // Apply sigmoid and threshold at 0.5 to get binary masks
 // Draw green contour overlay from silhouette mask
 // Draw symptom region overlay from symptoms mask
@@ -512,7 +517,7 @@ displayResult(
 ## Important notes
 
 1. **Input normalization** — must use ImageNet mean/std exactly as above. Wrong normalization produces random outputs with no error.
-2. **Channel order** — TFLite expects NCHW (channels first): shape `[1, 3, 224, 224]`. Most Android camera APIs produce NHWC; transpose before inference.
+2. **Channel order** — TFLite uses NHWC (channels last): shape `[1, 224, 224, 3]`. The ONNX→TF→TFLite conversion handles the PyTorch NCHW→NHWC transpose automatically. Pass your Android `TensorImage` directly — do NOT manually transpose to NCHW.
 3. **Sigmoid vs softmax** — segmentation and severity outputs need sigmoid; classification needs softmax. Applying the wrong function produces incorrect results silently.
 4. **Severity disclaimer** — severity % is learned from HSV-derived pseudo-labels, not expert agronomic ratings. Display as an estimate, not a diagnosis.
 5. **Bouncer threshold** — the value `{bouncer_thresh}` was empirically selected on the validation split. Do not hardcode a different value.
