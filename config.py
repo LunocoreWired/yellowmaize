@@ -340,13 +340,23 @@ CBAM_SPATIAL_KERNEL = 7
 XAI_METHODS = ["gradcam", "gradcamplusplus", "scorecam"]
 XAI_DEPLOYED_METHOD = "gradcamplusplus"
 
+# Number of images per class for quantitative XAI metrics
+# 5 is too few for stable means — 30 gives defensible thesis statistics
+XAI_N_SAMPLES_CLASS = 30
+
+# Steps for insertion/deletion AUC — higher = smoother curve, slower
+# 8 is too coarse; 25 gives a reasonable trade-off between speed and resolution
+XAI_INSERTION_STEPS = 25
+
 # Target layer per encoder (last conv block before decoder branch)
+# Path is relative to StudentModel instance — starts with unet.encoder
+# because StudentModel wraps smp.Unet as self.unet (not self.encoder directly)
 XAI_TARGET_LAYERS = {
-    "mobilenet_v2": "encoder.features[-1][0]",
-    "mobilenet_v2_cbam": "encoder.features[-1][0]",
-    "mobilenet_v3_small": "encoder.features[-1][0]",
-    "efficientnet_b0": "encoder.blocks[-1][-1]",
-    "efficientnet_b0_cbam": "encoder.blocks[-1][-1]",
+    "mobilenet_v2":        "unet.encoder.features[-1][0]",
+    "mobilenet_v2_cbam":   "unet.encoder.features[-1][0]",
+    "mobilenet_v3_small":  "unet.encoder.features[-1][0]",
+    "efficientnet_b0":     "unet.encoder.blocks[-1][-1]",
+    "efficientnet_b0_cbam":"unet.encoder.blocks[-1][-1]",
 }
 
 # ══════════════════════════════════════════════════════════════════════════════

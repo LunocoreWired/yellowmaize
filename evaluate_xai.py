@@ -46,6 +46,7 @@ from config import (
     STUDENT_IMG_SIZE, STUDENT_BATCH_SIZE, STUDENT_NUM_WORKERS,
     CLASSES, CLASS_TO_IDX,
     XAI_METHODS, XAI_DEPLOYED_METHOD, XAI_TARGET_LAYERS,
+    XAI_N_SAMPLES_CLASS, XAI_INSERTION_STEPS,
     STUDENT_BEST_VARIANT, STUDENT_FACTORY_MODE,
     FACTORY_MODES,
 )
@@ -66,7 +67,7 @@ def set_seeds(seed: int) -> None:
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 XAI_OUTPUT_DIR   = REPORTS_DIR / "xai"
-N_SAMPLES_CLASS  = 5     # qualitative overlays per class per XAI method
+N_SAMPLES_CLASS  = XAI_N_SAMPLES_CLASS   # from config — default 30 per class
 OVERLAY_ALPHA    = 0.50  # heatmap overlay transparency
 
 
@@ -436,18 +437,18 @@ def main() -> None:
             pg_acc = pointing_game_accuracy(heatmap, seg_mask_np)
 
             ins_auc, del_auc = insertion_deletion_auc(
-                model, inp_t, heatmap, true_cls, n_steps=8)
+                model, inp_t, heatmap, true_cls, n_steps=XAI_INSERTION_STEPS)
 
             quant_rows.append({
-                "stem":        stem,
-                "category":    category,
-                "true_cls":    category,
-                "pred_cls":    pred_name,
-                "pred_sev":    pred_sev,
-                "method":      method,
+                "stem":              stem,
+                "category":          category,
+                "pred_cls":          pred_name,
+                "correct":           category == pred_name,
+                "pred_sev":          pred_sev,
+                "method":            method,
                 "pointing_game_acc": round(pg_acc, 4) if not np.isnan(pg_acc) else "nan",
-                "insertion_auc":    round(ins_auc, 4) if not np.isnan(ins_auc) else "nan",
-                "deletion_auc":     round(del_auc, 4) if not np.isnan(del_auc) else "nan",
+                "insertion_auc":     round(ins_auc, 4) if not np.isnan(ins_auc) else "nan",
+                "deletion_auc":      round(del_auc, 4) if not np.isnan(del_auc) else "nan",
             })
 
         print(f"  [{category}] {stem[:40]:<40} "
@@ -461,7 +462,7 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(quant_rows)
 
-        # Per-method summary
+        # Per-method overall summary
         print(f"\n{'─' * 72}")
         print("  XAI quantitative summary (mean across all samples):")
         print(f"  {'Method':<20} {'Pointing Game':>14} {'Ins AUC':>8} {'Del AUC':>8}")
@@ -470,12 +471,26 @@ def main() -> None:
         df = pd.DataFrame(quant_rows)
         for method in XAI_METHODS:
             mdf = df[df["method"] == method]
-            pg  = mdf["pointing_game_acc"]
-            pg  = pd.to_numeric(pg, errors="coerce")
-            ins = pd.to_numeric(mdf["insertion_auc"], errors="coerce")
-            dl  = pd.to_numeric(mdf["deletion_auc"], errors="coerce")
+            pg  = pd.to_numeric(mdf["pointing_game_acc"], errors="coerce")
+            ins = pd.to_numeric(mdf["insertion_auc"],     errors="coerce")
+            dl  = pd.to_numeric(mdf["deletion_auc"],      errors="coerce")
             print(f"  {method:<20} {pg.mean():>14.4f} "
                   f"{ins.mean():>8.4f} {dl.mean():>8.4f}")
+
+        # Per-class breakdown for deployed method (MSV focus)
+        print(f"\n  Per-class breakdown [{XAI_DEPLOYED_METHOD}]:")
+        print(f"  {'Class':<12} {'Pointing Game':>14} {'Ins AUC':>8} {'Del AUC':>8} {'Correct%':>9}")
+        print(f"  {'─'*12} {'─'*14} {'─'*8} {'─'*8} {'─'*9}")
+        deployed_df = df[df["method"] == XAI_DEPLOYED_METHOD]
+        for cls in CLASSES:
+            cdf = deployed_df[deployed_df["category"] == cls]
+            if cdf.empty:
+                continue
+            pg  = pd.to_numeric(cdf["pointing_game_acc"], errors="coerce").mean()
+            ins = pd.to_numeric(cdf["insertion_auc"],     errors="coerce").mean()
+            dl  = pd.to_numeric(cdf["deletion_auc"],      errors="coerce").mean()
+            acc = cdf["correct"].mean() * 100 if "correct" in cdf.columns else float("nan")
+            print(f"  {cls:<12} {pg:>14.4f} {ins:>8.4f} {dl:>8.4f} {acc:>8.1f}%")
 
         print(f"\n  Comparison saved: {comp_path}")
         print(f"  Overlays saved  : {XAI_OUTPUT_DIR}")
