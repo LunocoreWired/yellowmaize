@@ -598,12 +598,12 @@ def chart_student_training_curves():
         phase_labels = {1: "Phase 1 (frozen enc)", 2: "Phase 2 (fine-tune)", None: ""}
 
         metrics_plot = [
-            ("val_loss",   "train_loss",   "Loss",          None,   None),
-            ("sil_mIoU",   "sym_mIoU",     "Seg mIoU",      0, 1.05),
-            ("sil_dice",   "sym_dice",     "Seg Dice",      0, 1.05),
-            ("msv_f1",     "macro_f1",     "Classification F1", 0, 1.05),
-            ("sev_mae",    None,           "Severity MAE (%)", None, None),
-            ("composite",  None,           "Composite Score", 0, 1.05),
+            ("val_loss",   "train_loss",   "Loss",               None,   None),
+            ("sil_mIoU",   "sym_mIoU",     "Seg mIoU",           0, 1.05),
+            ("sil_dice",   "sym_dice",     "Seg Dice",           0, 1.05),
+            ("msv_f1",     "mln_f1",       "MSV / MLN F1",       0, 1.05),
+            ("sev_mae",    None,           "Severity MAE (%)",   None, None),
+            ("composite",  None,           "Composite Score",    0, 1.05),
         ]
 
         for ax, (col1, col2, title, ymin, ymax) in zip(axes, metrics_plot):
@@ -724,6 +724,7 @@ def chart_student_radar():
         ("msv_f1",       "MSV F1"),
         ("mln_f1",       "MLN F1"),
         ("msv_roc_auc",  "MSV AUC"),
+        ("macro_roc_auc","Macro AUC"),
         ("cls_accuracy", "Cls Acc"),
         ("composite",    "Composite"),
         ("sev_r2",       "Sev R²"),
@@ -829,12 +830,15 @@ def chart_student_metrics_heatmap():
         ("sym_mIoU",        "Sym\nmIoU"),
         ("msv_f1",          "MSV\nF1"),
         ("msv_roc_auc",     "MSV\nAUC"),
+        ("macro_roc_auc",   "Macro\nAUC"),
         ("mln_f1",          "MLN\nF1"),
         ("healthy_f1",      "HLT\nF1"),
         ("cls_accuracy",    "Cls\nAcc"),
         ("mcc",             "MCC"),
+        ("cohen_kappa",     "Kappa"),
         ("composite",       "Composite"),
         ("sev_mae_pct",     "Sev\nMAE%"),
+        ("sev_r2",          "Sev\nR²"),
         ("cpu_lat_mean_ms", "CPU\nms"),
     ]
 

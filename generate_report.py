@@ -726,10 +726,17 @@ def build_student_best() -> str:
         {"Metric":"Symptom Dice",          "Value":r("sym_dice")},
         {"Metric":"Symptom Recall",        "Value":r("sym_recall")},
         {"Metric":"MSV ROC-AUC",           "Value":r("msv_roc_auc")},
+        {"Metric":"MLN ROC-AUC",           "Value":r("mln_roc_auc")},
+        {"Metric":"HEALTHY ROC-AUC",       "Value":r("healthy_roc_auc")},
+        {"Metric":"Macro OvR AUC",         "Value":r("macro_roc_auc")},
         {"Metric":"MLN F1",                "Value":r("mln_f1")},
+        {"Metric":"Cohen's Kappa",         "Value":r("cohen_kappa")},
         {"Metric":"Severity MAE %",        "Value":r("sev_mae_pct")},
+        {"Metric":"Severity MSE %",        "Value":r("sev_mse_pct")},
         {"Metric":"Severity RMSE %",       "Value":r("sev_rmse_pct")},
+        {"Metric":"Severity MAPE %",       "Value":r("sev_mape_pct")},
         {"Metric":"Severity R²",           "Value":r("sev_r2")},
+        {"Metric":"Severity Pearson r",    "Value":r("sev_pearson")},
         {"Metric":"CPU Latency (ms)",      "Value":r("cpu_lat_mean_ms")},
         {"Metric":"CPU FPS",               "Value":r("cpu_fps")},
         {"Metric":"Eval Duration (s)",     "Value":r("eval_duration_s")},
@@ -760,6 +767,23 @@ def build_student_best() -> str:
 
 
 def build_xai() -> str:
+    xai_sel_csv = LOGS_DIR / "xai_method_selection.csv"
+    if xai_sel_csv.exists():
+        sel_df = pd.read_csv(xai_sel_csv)
+        if not sel_df.empty:
+            sel = sel_df.iloc[0]
+            html += (
+                '<div class="metric-card good">'
+                '<div class="metric-label">Selected XAI Method (auto)</div>'
+                f'<div class="metric-value">{sel.get("selected_method","N/A")}</div>'
+                f'<div class="metric-sub">MSV PG: {sel.get("msv_pg","N/A")} | '
+                f'Ins AUC: {sel.get("ins_auc","N/A")}</div>'
+                f'<div class="metric-sub">GradCAM: {sel.get("gradcam_pg","N/A")} | '
+                f'GradCAM++: {sel.get("gradcamplusplus_pg","N/A")} | '
+                f'ScoreCAM: {sel.get("scorecam_pg","N/A")}</div>'
+                '</div>'
+            )
+
     xai_csv = LOGS_DIR / "xai_comparison.csv"
     if not xai_csv.exists():
         return "<p>XAI comparison not found. Run evaluate_xai.py first.</p>"

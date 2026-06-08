@@ -63,8 +63,9 @@ import pandas as pd
 import segmentation_models_pytorch as smp
 from sklearn.metrics import (
     classification_report, confusion_matrix, f1_score,
-    matthews_corrcoef, roc_auc_score,
+    matthews_corrcoef, roc_auc_score, cohen_kappa_score,
 )
+from scipy.stats import pearsonr as _pearsonr
 
 from image_utils import load_image_rgb   # EXIF correction, no CLAHE for training
 from scripts.safe_collate import safe_collate, reset_skip_counter
@@ -624,6 +625,9 @@ def validate(model, loader, seg_criterion, cls_criterion,
     sev_sq_err   = 0.0
     sev_tgt_sum  = 0.0
     sev_tgt_sq   = 0.0
+    sev_mape_num = 0.0   # sum of |pred-true|/max(|true|,eps) for MAPE
+    sev_pred_list = []   # for Pearson r
+    sev_true_list = []
     n_sev_valid  = 0
     n_samples    = 0
     all_cls_preds   = []
@@ -657,6 +661,10 @@ def validate(model, loader, seg_criterion, cls_criterion,
             sev_sq_err  += (diff_pct ** 2).sum().item()
             sev_tgt_sum += (sev_tgt_v * 100.0).sum().item()
             sev_tgt_sq  += ((sev_tgt_v * 100.0) ** 2).sum().item()
+            tgt_pct_v    = sev_tgt_v * 100.0
+            sev_mape_num += (diff_pct.abs() / (tgt_pct_v.abs() + 1e-6)).sum().item()
+            sev_pred_list.extend((sev_out[valid_sv] * 100.0).cpu().tolist())
+            sev_true_list.extend(tgt_pct_v.cpu().tolist())
             n_sev_valid += valid_sv.sum().item()
         else:
             l_sev = torch.tensor(0.0, device=device)
@@ -692,12 +700,19 @@ def validate(model, loader, seg_criterion, cls_criterion,
     seg1 = seg_metrics_from_stats(**s1)
 
     # Severity metrics
-    sev_mae  = sev_abs_err / max(n_sev_valid, 1)
-    sev_rmse = (sev_sq_err / max(n_sev_valid, 1)) ** 0.5
+    sev_mae   = sev_abs_err / max(n_sev_valid, 1)
+    sev_mse   = sev_sq_err  / max(n_sev_valid, 1)
+    sev_rmse  = sev_mse ** 0.5
+    sev_mape  = (sev_mape_num / max(n_sev_valid, 1)) * 100.0  # as %
     # R²: 1 - SS_res/SS_tot
-    ss_tot   = sev_tgt_sq - (sev_tgt_sum ** 2) / max(n_sev_valid, 1)
-    sev_r2   = 1.0 - (sev_sq_err / max(ss_tot, 1e-7))
-    norm_mae = sev_mae / STUDENT_MAX_SEVERITY
+    ss_tot    = sev_tgt_sq - (sev_tgt_sum ** 2) / max(n_sev_valid, 1)
+    sev_r2    = 1.0 - (sev_sq_err / max(ss_tot, 1e-7))
+    # Pearson r
+    try:
+        sev_pearson = float(_pearsonr(sev_true_list, sev_pred_list)[0])                       if len(sev_true_list) > 1 else 0.0
+    except Exception:
+        sev_pearson = 0.0
+    norm_mae  = sev_mae / STUDENT_MAX_SEVERITY
 
     mln_f1    = report.get("MLN", {}).get("f1-score", 0.0)
     composite = compute_composite_score(seg0["iou"], msv_f1, mln_f1, norm_mae)
@@ -716,7 +731,9 @@ def validate(model, loader, seg_criterion, cls_criterion,
         "cls_acc":      cls_acc,  "msv_f1":     msv_f1,  "mln_f1": mln_f1,
         "macro_f1":     macro_f1, "weighted_f1":weighted_f1, "mcc": mcc,
         # Severity regression
-        "sev_mae":      sev_mae,  "sev_rmse":   sev_rmse, "sev_r2": sev_r2,
+        "sev_mae":      sev_mae,  "sev_mse":    sev_mse,
+        "sev_rmse":     sev_rmse, "sev_mape":   sev_mape,
+        "sev_r2":       sev_r2,   "sev_pearson":sev_pearson,
         "composite":    composite,
         "report":    report, "preds": all_cls_preds, "targets": all_cls_targets,
     }
@@ -755,12 +772,15 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
     # Global accumulators
     s0 = {"tp":0.,"fp":0.,"fn":0.,"tn":0.}   # silhouette
     s1 = {"tp":0.,"fp":0.,"fn":0.,"tn":0.}   # symptom
-    sev_abs_err = sev_sq_err = 0.0
-    sev_tgt_sum = sev_tgt_sq = 0.0
-    n_sev_valid = n_samples  = 0
-    all_preds   = []
-    all_targets = []
-    all_probs   = []   # softmax probabilities for ROC-AUC
+    sev_abs_err  = sev_sq_err = 0.0
+    sev_tgt_sum  = sev_tgt_sq = 0.0
+    sev_mape_num = 0.0
+    sev_pred_list = []
+    sev_true_list = []
+    n_sev_valid  = n_samples = 0
+    all_preds    = []
+    all_targets  = []
+    all_probs    = []   # softmax probabilities for ROC-AUC
 
     for batch in test_loader:
         if batch is None:
@@ -781,11 +801,15 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
 
         if valid_sv.any():
             diff_pct     = (sev_out[valid_sv] - sev_tgt[valid_sv]) * 100.0
-            sev_abs_err += diff_pct.abs().sum().item()
-            sev_sq_err  += (diff_pct**2).sum().item()
-            sev_tgt_sum += (sev_tgt[valid_sv]*100).sum().item()
-            sev_tgt_sq  += ((sev_tgt[valid_sv]*100)**2).sum().item()
-            n_sev_valid += valid_sv.sum().item()
+            sev_abs_err  += diff_pct.abs().sum().item()
+            sev_sq_err   += (diff_pct**2).sum().item()
+            sev_tgt_sum  += (sev_tgt[valid_sv]*100).sum().item()
+            sev_tgt_sq   += ((sev_tgt[valid_sv]*100)**2).sum().item()
+            tgt_pct_v     = sev_tgt[valid_sv] * 100.0
+            sev_mape_num += (diff_pct.abs() / (tgt_pct_v.abs() + 1e-6)).sum().item()
+            sev_pred_list.extend((sev_out[valid_sv]*100.0).cpu().tolist())
+            sev_true_list.extend(tgt_pct_v.cpu().tolist())
+            n_sev_valid  += valid_sv.sum().item()
 
         probs = torch.softmax(cls_out, dim=1).cpu().numpy()
         all_probs.extend(probs.tolist())
@@ -809,10 +833,16 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
     weighted_f1 = report.get("weighted avg", {}).get("f1-score", 0.0)
 
     # Severity regression
-    sev_mae  = sev_abs_err / max(n_sev_valid, 1)
-    sev_rmse = (sev_sq_err / max(n_sev_valid, 1)) ** 0.5
-    ss_tot   = sev_tgt_sq - (sev_tgt_sum**2) / max(n_sev_valid, 1)
-    sev_r2   = 1.0 - (sev_sq_err / max(ss_tot, 1e-7))
+    sev_mae     = sev_abs_err / max(n_sev_valid, 1)
+    sev_mse     = sev_sq_err  / max(n_sev_valid, 1)
+    sev_rmse    = sev_mse ** 0.5
+    sev_mape    = (sev_mape_num / max(n_sev_valid, 1)) * 100.0
+    ss_tot      = sev_tgt_sq - (sev_tgt_sum**2) / max(n_sev_valid, 1)
+    sev_r2      = 1.0 - (sev_sq_err / max(ss_tot, 1e-7))
+    try:
+        sev_pearson = float(_pearsonr(sev_true_list, sev_pred_list)[0])                       if len(sev_true_list) > 1 else 0.0
+    except Exception:
+        sev_pearson = 0.0
 
     msv_f1_test = report.get("MSV", {}).get("f1-score", 0.0)
     mln_f1_test = report.get("MLN", {}).get("f1-score", 0.0)
@@ -821,18 +851,32 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
         seg0["iou"], msv_f1_test, mln_f1_test, norm_mae_test,
     )
 
-    # MSV-vs-rest ROC-AUC (threshold-independent MSV detection quality)
-    import numpy as _np2
-    msv_idx = CLASSES.index("MSV")
+    # ROC-AUC: MSV-vs-rest, per-class, and macro OvR
+    probs_arr = np.array(all_probs)
     try:
-        import numpy as np_roc
-        probs_arr = np_roc.array(all_probs)
+        msv_idx     = CLASSES.index("MSV")
+        healthy_idx = CLASSES.index("HEALTHY")
+        mln_idx     = CLASSES.index("MLN")
         msv_roc_auc = round(float(roc_auc_score(
             [1 if t == msv_idx else 0 for t in all_targets],
-            probs_arr[:, msv_idx],
-        )), 4)
+            probs_arr[:, msv_idx])), 4)
+        healthy_roc_auc = round(float(roc_auc_score(
+            [1 if t == healthy_idx else 0 for t in all_targets],
+            probs_arr[:, healthy_idx])), 4)
+        mln_roc_auc = round(float(roc_auc_score(
+            [1 if t == mln_idx else 0 for t in all_targets],
+            probs_arr[:, mln_idx])), 4)
+        macro_roc_auc = round(float(roc_auc_score(
+            all_targets, probs_arr, multi_class="ovr",
+            average="macro", labels=list(range(len(CLASSES))))), 4)
     except Exception:
-        msv_roc_auc = -1.0
+        msv_roc_auc = healthy_roc_auc = mln_roc_auc = macro_roc_auc = -1.0
+
+    # Cohen's Kappa
+    try:
+        cohen_kappa = round(float(cohen_kappa_score(all_targets, all_preds)), 4)
+    except Exception:
+        cohen_kappa = -1.0
 
     # ── CPU inference latency (200 images, simulates mobile device) ───────────
     import copy
@@ -880,13 +924,21 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
         "mln_rec":          round(report.get("MLN",{}).get("recall",0),       4),
         "mln_f1":           round(report.get("MLN",{}).get("f1-score",0),     4),
         # Severity regression
-        "sev_mae_pct":      round(sev_mae,  2),
-        "sev_rmse_pct":     round(sev_rmse, 2),
-        "sev_r2":           round(sev_r2,   4),
+        "sev_mae_pct":      round(sev_mae,     2),
+        "sev_mse_pct":      round(sev_mse,     2),
+        "sev_rmse_pct":     round(sev_rmse,    2),
+        "sev_mape_pct":     round(sev_mape,    2),
+        "sev_r2":           round(sev_r2,      4),
+        "sev_pearson":      round(sev_pearson, 4),
         # Composite criterion
         "composite":        round(composite, 4),
-        # MSV-vs-rest ROC-AUC (threshold-independent; used in mobile composite)
+        # ROC-AUC (MSV-vs-rest, per-class OvR, macro OvR)
         "msv_roc_auc":      msv_roc_auc,
+        "healthy_roc_auc":  healthy_roc_auc,
+        "mln_roc_auc":      mln_roc_auc,
+        "macro_roc_auc":    macro_roc_auc,
+        # Cohen's Kappa
+        "cohen_kappa":      cohen_kappa,
         # Inference latency
         "cpu_lat_mean_ms":  lat_mean,
         "cpu_lat_std_ms":   lat_std,
@@ -1044,9 +1096,12 @@ def train_one(encoder_variant: str, factory_mode: str) -> dict:
             "mln_f1":      round(val_m.get("mln_f1", 0.0),   4),
             "macro_f1":    round(val_m["macro_f1"],        4),
             "mcc":         round(val_m["mcc"],             4),
-            "sev_mae":     round(val_m["sev_mae"],         2),
-            "sev_rmse":    round(val_m["sev_rmse"],        2),
-            "sev_r2":      round(val_m["sev_r2"],          4),
+            "sev_mae":     round(val_m["sev_mae"],              2),
+            "sev_mse":     round(val_m.get("sev_mse", 0.0),      2),
+            "sev_rmse":    round(val_m["sev_rmse"],               2),
+            "sev_mape":    round(val_m.get("sev_mape", 0.0),      2),
+            "sev_r2":      round(val_m["sev_r2"],                 4),
+            "sev_pearson": round(val_m.get("sev_pearson", 0.0),   4),
             "composite":   round(val_m["composite"],       4),
         }
         log_rows.append(row)
@@ -1119,9 +1174,12 @@ def train_one(encoder_variant: str, factory_mode: str) -> dict:
             "mln_f1":      round(val_m.get("mln_f1", 0.0),   4),
             "macro_f1":    round(val_m["macro_f1"],        4),
             "mcc":         round(val_m["mcc"],             4),
-            "sev_mae":     round(val_m["sev_mae"],         2),
-            "sev_rmse":    round(val_m["sev_rmse"],        2),
-            "sev_r2":      round(val_m["sev_r2"],          4),
+            "sev_mae":     round(val_m["sev_mae"],              2),
+            "sev_mse":     round(val_m.get("sev_mse", 0.0),      2),
+            "sev_rmse":    round(val_m["sev_rmse"],               2),
+            "sev_mape":    round(val_m.get("sev_mape", 0.0),      2),
+            "sev_r2":      round(val_m["sev_r2"],                 4),
+            "sev_pearson": round(val_m.get("sev_pearson", 0.0),   4),
             "composite":   round(val_m["composite"],       4),
         }
         log_rows.append(row)
