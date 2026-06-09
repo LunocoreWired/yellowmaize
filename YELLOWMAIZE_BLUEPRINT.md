@@ -131,8 +131,13 @@ yellowmaize/                               ← Project root (WSL2 working direct
 │   └── sam2_hiera_large.pt               ← Download separately
 │
 ├── data/                                  ← AUTO-GENERATED (do not edit)
+│   ├── yolo_dataset/                      ← YOLOv8n training data (images + labels + yaml)
 │   ├── tier1_raw/                         ← 15k images for SAM2
 │   ├── tier1_leaf_masks/                  ← SAM2 .npy + .png masks
+│   ├── gold_standard/                     ← 501-image human annotation set
+│   │   ├── images/                        ← 501 renamed images (AUTO-GENERATED)
+│   │   ├── annotations/annotations.json   ← Label Studio JSON export (place here)
+│   │   └── gold_manifest.csv              ← AUTO-GENERATED
 │   ├── pseudo_masks/
 │   │   ├── mode_a/                        ← Factory mode A outputs
 │   │   ├── mode_b/                        ← Factory mode B outputs
@@ -595,8 +600,8 @@ failure mode without needing larger or more complex prompts.
 
 ### Annotation requirement
 
-400–500 Label Studio polygon labels. You have 300 from `sample_gold_standard.py`.
-Annotate ~100–200 more before running this script. Export: Label Studio → Export → JSON
+400–500 Label Studio polygon labels. You have 501 images from `sample_gold_standard.py`.
+Annotate at least 400 of these 501 images before running this script. Export: Label Studio → Export → JSON
 → `data/gold_standard/annotations/annotations.json`. Polygon → bbox conversion is
 handled automatically by `train_yolo_detector.py`.
 
@@ -618,45 +623,45 @@ annotation count is below `YOLO_MIN_ANNOTATIONS = 400` (config.py).
 
 ### 8.1 Auto-Prompting Strategy
 
-> **v3 upgrade:** YOLO bounding-box prompt + constrained HSV centroid. See `train_yolo_detector.py`.
+> **v3 upgrade:** YOLOv8n bounding-box prompt + HSV centroid constrained inside the box.
+> Falls back to v2 full-image HSV-only mode if YOLO weights absent or detection fails.
 
 ```
 For each Tier 1 image:
 1. load_image_rgb(path) → EXIF-corrected uint8 RGB
-2. Convert to HSV: to_hsv(img_rgb)
-3. Green mask: H∈[30,90], S>40, V>40
-4. Find largest green connected component (cv2.connectedComponentsWithStats)
-5. Compute centroid (cx, cy) → foreground point prompt (label=1)
-6. Four corners (10px inset) → background point prompts (label=0)
-7. Run SAM2.predict(point_coords=..., point_labels=...)
-8. Select mask with highest SAM2 confidence score
-9. Convert logits → probability via sigmoid: 1/(1+exp(-logits))
-10. Store raw float32 probability map as .npy (NO binarization)
-11. Also store binarized (≥0.5) as uint8 .png for visualization
-
-Fallback: if no green component found (coverage < 10%) → log "no_green_region", skip
+2. [YOLO path] Run YOLOv8n → tight leaf bounding box (x1,y1,x2,y2)
+   - Restrict HSV tissue search to pixels inside that box → no centroid drift
+   - Build 3 foreground points along vertical leaf axis, clamped to box
+   - Pass box as SAM2 box= prompt (hard spatial constraint)
+3. [HSV fallback] If YOLO absent/fails: full-image combined green+yellow HSV mask
+   - Green:  H∈[35,85],  S>40, V>40  (healthy tissue)
+   - Yellow: H∈[15,45],  S>40, V>60  (MSV/MLN diseased tissue)
+   - Largest connected component centroid → 3 foreground points along vertical axis
+   - Center-of-image fallback if no tissue detected (no rejection at prompt stage)
+4. Four image corners (10px inset) → background point prompts (label=0)
+5. SAM2.predict(point_coords, point_labels, box=yolo_box)
+6. Select mask with highest SAM2 score → convert logits → sigmoid probability
+7. Store raw float32 .npy (NO binarization) + binarized uint8 .png
+QA report columns: filename, category, status, reason, prompt_strategy,
+                   prompt_mode (yolo|hsv_fallback), yolo_box, coverage, mean_conf
 ```
 
-### 8.2 Three QA Filters
+### 8.2 Three QA Filters  (v3 — relaxed thresholds)
 ```
 Filter 1 — Coverage range:
-  binary = (prob_map >= 0.5)
-  fg_coverage = binary.sum() / (H * W)
-  Reject if fg_coverage < 0.10 (too small — wrong object segmented)
-  Reject if fg_coverage > 0.90 (too large — background leaked in)
+  Reject if fg_coverage < 0.03  (v1: 0.10 — diseased leaves are sparser)
+  Reject if fg_coverage > 0.90
 
 Filter 2 — Mean foreground confidence:
-  mean_conf = prob_map[binary==1].mean()
-  Reject if mean_conf < 0.65 (SAM2 was uncertain)
+  Threshold: calibrated from gold-standard IoU (train_yolo_detector.py)
+  Default fallback: 0.65 if calibration file absent
 
 Filter 3 — Shape sanity:
-  Fit bounding box to binary mask
   aspect = max(h,w) / min(h,w)
-  Reject if aspect < 1.2 (too round — wrong object)
+  Reject if aspect < 1.01  (v1: 1.20 — overhead/square-frame leaves)
 
 Target: < 8% rejection rate
-If > 8% → warn, review QA report, consider adjusting prompting HSV ranges
-Output: tier1_qa_report.csv → filename, category, status, reason, coverage, mean_conf
+Output: tier1_qa_report.csv (+ prompt_mode, yolo_box columns vs v2)
 ```
 
 ### 8.3 Output Files per Image

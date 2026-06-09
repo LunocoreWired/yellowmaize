@@ -45,10 +45,11 @@ Phase 0-pre  partition_dataset.py           → global_split_manifest.csv (70/15
 Phase 0a     create_bouncer_dataset.py       → 50k binary bouncer dataset
 Phase 0b     train_bouncer.py               → bouncer_best.pth
 Phase 1      sample_15000.py                → 15k Tier 1 images
-Phase 2      generate_tier1_masks.py        → SAM2 float .npy masks + QA
+Phase 1b     sample_gold_standard.py        → 501-image gold standard set for human annotation
+             train_yolo_detector.py         → YOLOv8n leaf detector + SAM2 QA calibration
+Phase 2      generate_tier1_masks.py        → SAM2 float .npy masks + QA  [v3: YOLO-guided]
 Phase 2b     validate_masks.py              → QA report + overlays
-Phase 2c     sample_gold_standard.py        → 300-image gold standard set for human annotation
-Phase 2d     validate_gold_standard.py      → SAM2 IoU vs human masks (--sam2-only)
+Phase 2c     validate_gold_standard.py      → SAM2 IoU vs human masks (--sam2-only)
 Phase 3      train_teacher.py               → teacher_model_best.pth
 Phase 2e     validate_gold_standard.py      → SAM2 + Teacher IoU vs human masks (full run)
 Phase 4      factory_master.py              → pseudo_masks/ (4 modes)
@@ -75,13 +76,14 @@ python create_bouncer_dataset.py
 python train_bouncer.py
 python generate_charts.py --bouncer      # bouncer comparison + training curves
 python sample_15000.py
-python generate_tier1_masks.py
-python validate_masks.py             # review overlays before Teacher training
-python sample_gold_standard.py       # extract 300-image gold standard set
+python sample_gold_standard.py       # extract 501-image gold standard set
                                      # → images auto-copied to data/gold_standard/images/
                                      # → upload that folder to Label Studio
-                                     # → annotate leaf silhouettes (polygonlabels)
+                                     # → annotate at least 400 leaf silhouettes (polygonlabels)
                                      # → export JSON → data/gold_standard/annotations/annotations.json
+python train_yolo_detector.py        # train YOLOv8n leaf detector + calibrate SAM2 QA threshold
+python generate_tier1_masks.py       # SAM2 masking v3 (YOLO-guided prompts)
+python validate_masks.py             # review overlays before Teacher training
 python validate_gold_standard.py --sam2-only   # SAM2 IoU vs human (before Teacher)
 python train_teacher.py
 python generate_charts.py --teacher      # teacher comparison + training curves
@@ -189,12 +191,16 @@ Outputs: `preprocessing_report.csv`, `preprocessing_flagged.csv`, `preprocessing
 - MLN: 4,500 (evenly-spaced)
 - Source: train+val split images only (test excluded)
 
-**Phase 1b: YOLOv8n Leaf Detector** (`train_yolo_detector.py`)
+**Phase 1b: Gold Standard Sampling + YOLO Detector** (`sample_gold_standard.py`, `train_yolo_detector.py`)
 
-Single-class YOLOv8n (nano) trained on 400–500 Label Studio polygon annotations.
+`sample_gold_standard.py` — Extracts 501 images (167 per class) from Tier 1 for human annotation in Label Studio.
+Run immediately after `sample_15000.py`. Annotate at least 400 of the 501 images as polygon labels
+before training YOLO.
+
+`train_yolo_detector.py` — Single-class YOLOv8n (nano) trained on Label Studio polygon annotations.
 Provides tight bounding-box prompts for SAM2. Polygon → bbox conversion is
 automatic. After training, the script runs the full YOLO+SAM2 pipeline on the
-300 gold-standard images and calibrates the QA confidence threshold to achieve
+gold-standard images and calibrates the QA confidence threshold to achieve
 mean IoU ≥ `GOLD_IOU_TARGET_MEAN` (0.85). Written to `logs/yolo_qa_calibration.csv`.
 
 **SAM2 auto-prompting strategy (v3 — YOLO-guided):**
@@ -452,12 +458,13 @@ Self-contained single HTML file (all charts base64 embedded). Dark-themed. 9 sec
 
 ### 4.13 Gold Standard Validation (Phases 2c–2e, 5c)
 
-**Purpose:** Validate pseudo-label quality against 300 human-annotated leaf silhouette masks (100 per class). Provides a thesis-defensible chain comparison: SAM2 → Teacher → Student, all measured against the same human ground truth.
+**Purpose:** Validate pseudo-label quality against 501 human-annotated leaf silhouette masks (167 per class). Provides a thesis-defensible chain comparison: SAM2 → Teacher → Student, all measured against the same human ground truth.
 
 **sample_gold_standard.py:**
-- Stratified sample: 100 HEALTHY + 100 MSV + 100 MLN from Tier 1 manifest (seed=42)
+- Stratified sample: 167 HEALTHY + 167 MSV + 167 MLN from Tier 1 manifest (seed=42) — total 501 images
 - Renames files with class prefix (e.g. `MSV_image045.jpg`) for annotator clarity
 - Output: `data/gold_standard/images/` — upload directly to Label Studio for polygon annotation
+- Target: annotate at least 400 of these 501 images before running `train_yolo_detector.py`
 - Also writes `data/gold_standard/gold_manifest.csv` (column: `gold_filename`)
 - Hash guard: SHA-256 hash of `tier1_manifest.csv` written to `_manifest_hash.txt` on first run.
   If `sample_15000.py` is re-run after annotation begins, subsequent runs abort with a clear
