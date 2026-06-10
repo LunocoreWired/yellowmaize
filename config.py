@@ -348,11 +348,18 @@ XAI_TARGET_LAYERS = {
 #   (No need to use Label Studio's built-in bbox export; polygons are more
 #   accurate and the converter here gives axis-aligned boxes for free.)
 YOLO_DATASET_DIR       = DATA_DIR / "yolo_dataset"     # YOLO-format images + labels
+YOLO_IMAGES_DIR        = DATA_DIR / "yolo_annotations" / "images"
+YOLO_ANNOTATIONS_DIR   = DATA_DIR / "yolo_annotations" / "labels"
+YOLO_ANNOTATION_FILE   = YOLO_ANNOTATIONS_DIR / "annotations.json"
 YOLO_WEIGHTS_DIR       = CHECKPOINTS_DIR / "yolo"       # best.pt saved here
 YOLO_WEIGHTS_BEST      = CHECKPOINTS_DIR / "yolo" / "best.pt"
 YOLO_IMG_SIZE          = 640           # standard YOLOv8 input resolution
 YOLO_EPOCHS            = 100           # early-stopped via YOLO_PATIENCE
-YOLO_BATCH_SIZE        = 16
+YOLO_BATCH_SIZE        = 8             # RTX 5060 8 GB — 16 fits VRAM but 8 leaves
+                                       # headroom for SAM2 co-residency and avoids
+                                       # system RAM exhaustion if CUDA falls back to CPU
+YOLO_WORKERS           = 2             # dataloader threads — 4 eats ~6 GB RAM on
+                                       # 640-px images; 2 keeps usage under 16 GB DDR4
 YOLO_LR0               = 0.01          # initial LR (YOLOv8 default)
 YOLO_PATIENCE          = 20            # epochs without improvement → stop
 YOLO_CONF_THRESHOLD    = 0.25          # detection confidence for inference
