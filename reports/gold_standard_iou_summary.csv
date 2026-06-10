@@ -1,2 +1,2 @@
 artifact,HEALTHY_mean_iou,HEALTHY_std_iou,HEALTHY_n,MSV_mean_iou,MSV_std_iou,MSV_n,MLN_mean_iou,MLN_std_iou,MLN_n,overall_mean_iou,overall_std_iou,n_total,n_below_warn,target_met
-sam2,0.8278,0.1827,92,0.8406,0.1993,96,0.7281,0.2043,99,0.7977,0.2024,287,85,False
+sam2,0.9378,0.1443,166,0.9409,0.1564,164,0.9489,0.1095,167,0.9425,0.1381,497,38,True
