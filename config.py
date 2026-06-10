@@ -10,6 +10,7 @@
 
 import os
 from pathlib import Path
+import numpy as np
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GLOBAL SEED — enforced in every training script for reproducibility
