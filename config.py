@@ -162,33 +162,35 @@ SAM2_QA_MAX_REJECT_RATE  = 0.08   # warn if > 8% of images rejected
 # ══════════════════════════════════════════════════════════════════════════════
 # TEACHER
 # ══════════════════════════════════════════════════════════════════════════════
-TEACHER_IMG_SIZE     = 512
-TEACHER_BATCH_SIZE   = 4  # RTX 5060 8 GB: batch=8 @ 512px exceeds VRAM.
-                            # batch=4 keeps peak usage ~5.5 GB, leaving headroom
-                            # for activations + gradients. Effective batch size is
-                            # maintained via TEACHER_GRAD_ACCUM_STEPS=2 in
-                            # train_teacher.py (4×2 = 8 effective, same LR schedule).
+TEACHER_IMG_SIZE     = 768   # increased from 512 — preserves leaf margin detail
+                              # that was blurred at 512px, directly addressing
+                              # the systematic undersegmentation seen in overlays
+TEACHER_BATCH_SIZE   = 2    # RTX 5060 8 GB: 768px UNet needs smaller batch.
+                              # Effective batch maintained via TEACHER_GRAD_ACCUM_STEPS.
 
-# Per-variant batch size overrides — accounts for encoder/decoder memory
-# differences at 512px on RTX 5060 8 GB.  Falls back to TEACHER_BATCH_SIZE
-# for any variant not listed here.
-#   resnet50           — 6 is safe; standard CNN, predictable VRAM footprint
-#   efficientnet-b2    — 6 is safe (OOM at 8, confirmed)
-#   mit_b2             — transformer self-attention scales quadratically with
-#                        sequence length; 512px → 1024 tokens → needs batch=2
-#   deeplabv3plus-eb2  — ASPP is heavier than a UNet decoder; batch=4 is safer
+# Per-variant batch size overrides at 768px on RTX 5060 8 GB.
+# All variants reduced from 512px values to stay within 7.5 GB peak VRAM.
+#   resnet50           — batch=3 safe at 768px
+#   efficientnet-b2    — batch=3 safe at 768px
+#   mit_b2             — transformer self-attention scales quadratically;
+#                        768px → 2304 tokens → batch=1 required
+#   deeplabv3plus-eb2  — ASPP heavier than UNet decoder; batch=2
 TEACHER_BATCH_SIZE_OVERRIDES = {
-    "resnet50":           6,
-    "efficientnet-b2":    6,
-    "mit_b2":             2,
-    "deeplabv3plus-eb2":  4,
+    "resnet50":           3,
+    "efficientnet-b2":    3,
+    "mit_b2":             1,
+    "deeplabv3plus-eb2":  2,
 }
-TEACHER_GRAD_ACCUM_STEPS = 2  # accumulate gradients over 2 steps → effective batch=8
-TEACHER_EPOCHS       = 30
+TEACHER_GRAD_ACCUM_STEPS = 4  # accumulate over 4 steps → effective batch=8 for most
+                                # variants (mit_b2: 1×4=4 effective — acceptable)
+TEACHER_EPOCHS       = 50    # increased from 30 — soft SAM2 targets need more
+                              # epochs to converge; 0.72 IoU suggests early stop
+                              # fired before full convergence at epoch 30
 TEACHER_LR           = 5e-5
 TEACHER_WEIGHT_DECAY = 1e-4
 TEACHER_VAL_SPLIT    = 0.20
-TEACHER_PATIENCE     = 10
+TEACHER_PATIENCE     = 15   # increased from 10 — gives model more room to
+                              # recover from ReduceLROnPlateau steps before stopping
 TEACHER_LR_FACTOR    = 0.5
 TEACHER_LR_PATIENCE  = 5
 

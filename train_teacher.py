@@ -41,6 +41,7 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, Subset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -48,7 +49,7 @@ from PIL import Image
 import pandas as pd
 import segmentation_models_pytorch as smp
 
-from image_utils import load_image_rgb   # EXIF correction + corrupt guard
+from image_utils import load_image_rgb   # EXIF correction + corrupt guard (NOT clahe)
 from scripts.safe_collate import safe_collate, reset_skip_counter
 
 from config import (
@@ -95,6 +96,71 @@ if "PYTORCH_CUDA_ALLOC_CONF" not in _os.environ:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# BOUNDARY-AWARE COMBINED LOSS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BoundaryAwareLoss(nn.Module):
+    """
+    Combined Dice + boundary-weighted BCE loss.
+
+    Motivation: Teacher was systematically undersegmenting leaf margins —
+    the boundary band in SAM2 soft targets (values 0.3–0.7) caused the model
+    to learn conservative, shrunk predictions. Standard DiceLoss treats all
+    pixels equally and cannot penalise missed edges specifically.
+
+    This loss adds a BCE term where boundary pixels are upweighted by
+    BOUNDARY_WEIGHT (default 5.0), forcing the model to focus on the exact
+    region where it was failing.
+
+    Soft target sharpening: SAM2 probability maps are amplified slightly
+    (×SHARPEN_FACTOR, clipped to [0,1]) before computing loss. This pulls
+    boundary-band values (0.3–0.7) toward 1.0 without fully binarizing,
+    reducing the amount the model is rewarded for predicting low-confidence
+    at edges.
+
+    Loss formula:
+        boundary = max_pool(target) − avg_pool(target)   ← edge detector
+        weight   = 1.0 + BOUNDARY_WEIGHT × boundary
+        L        = DiceLoss(pred, target_sharp)
+                 + BCE_weighted(pred, target_sharp, weight)
+    """
+
+    BOUNDARY_WEIGHT = 5.0    # upweight factor for boundary pixels
+    SHARPEN_FACTOR  = 1.3    # amplify soft targets before loss (clip to 1.0)
+    DICE_WEIGHT     = 1.0    # relative weight of Dice term
+    BCE_WEIGHT      = 0.5    # relative weight of boundary BCE term
+
+    def __init__(self):
+        super().__init__()
+        self._dice = smp.losses.DiceLoss(mode="binary", from_logits=True)
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        # Sharpen soft targets slightly — reduces ambiguity at leaf edges
+        targets_sharp = (targets * self.SHARPEN_FACTOR).clamp(0.0, 1.0)
+
+        # Dice loss on sharpened targets
+        l_dice = self._dice(logits, targets_sharp)
+
+        # Boundary detection via max_pool − avg_pool (pure PyTorch, no kornia)
+        # Works on [B, 1, H, W] targets
+        t = targets_sharp
+        boundary = (
+            F.max_pool2d(t, kernel_size=3, stride=1, padding=1)
+            - F.avg_pool2d(t, kernel_size=3, stride=1, padding=1)
+        ).clamp(0.0, 1.0)
+
+        # Pixel weights: 1.0 everywhere + extra at boundary pixels
+        weight = 1.0 + self.BOUNDARY_WEIGHT * boundary
+
+        # Weighted BCE
+        l_bce = F.binary_cross_entropy_with_logits(
+            logits, targets_sharp, weight=weight
+        )
+
+        return self.DICE_WEIGHT * l_dice + self.BCE_WEIGHT * l_bce
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TRANSFORMS
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -110,6 +176,15 @@ def make_train_transforms(img_size: int):
         A.HueSaturationValue(hue_shift_limit=10,
                              sat_shift_limit=20,
                              val_shift_limit=10, p=0.2),
+        # ElasticTransform: deforms leaf boundaries slightly during training,
+        # preventing the model from memorising exact SAM2 boundary shapes and
+        # encouraging it to learn robust edge features instead.
+        A.ElasticTransform(alpha=60, sigma=6, p=0.3),
+        # CoarseDropout: randomly masks small regions, forces the model to
+        # infer leaf extent from context rather than local texture — reduces
+        # the tendency to shrink predictions where texture is ambiguous.
+        A.CoarseDropout(max_holes=6, max_height=32, max_width=32,
+                        min_holes=1, fill_value=0, p=0.2),
         A.Normalize(mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
@@ -149,7 +224,12 @@ class TeacherDataset(Dataset):
         img_path = Path(row["img_path"])
         npy_path = Path(row["npy_path"])
 
-        # EXIF-corrected load with truncation/corrupt guard
+        # EXIF-corrected load with truncation/corrupt guard.
+        # NOTE: deliberately load_image_rgb (NOT load_image_clahe).
+        # CLAHE is correct for Bouncer and Factory inputs, but Teacher training
+        # must use the same image appearance that SAM2 saw when generating the
+        # soft probability maps — applying CLAHE here would create an
+        # image/target mismatch at the leaf boundary region.
         if not img_path.exists():
             return None
         img_rgb = load_image_rgb(img_path)
@@ -226,6 +306,21 @@ def build_sample_list() -> list[dict]:
             })
 
     print(f"  Samples loaded : {len(samples):,}  (skipped {skipped:,} test-split)")
+
+    # ── Verify #7: data distribution check ───────────────────────────────────
+    # If this number is significantly below ~12,000 it indicates a pipeline
+    # issue (missing .npy files, wrong paths, etc.) — investigate before training.
+    by_class = {}
+    for s in samples:
+        by_class.setdefault(s["category"], 0)
+        by_class[s["category"]] += 1
+    print(f"  Distribution  : " + " | ".join(
+        f"{c}: {by_class.get(c, 0):,}" for c in ["HEALTHY", "MSV", "MLN"]))
+    expected_min = 10_000
+    if len(samples) < expected_min:
+        print(f"  [WARN] Only {len(samples):,} samples — expected ≥ {expected_min:,}.")
+        print(f"         Check that tier1_leaf_masks/ has .npy files for all Tier 1 images.")
+
     return samples
 
 
@@ -435,8 +530,10 @@ def train_variant(variant: str, all_samples: list[dict]) -> dict:
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model     = build_teacher_model(variant).to(DEVICE)
-    # Dice Loss — accepts float targets in [0,1] natively
-    criterion = smp.losses.DiceLoss(mode="binary", from_logits=True)
+    # BoundaryAwareLoss: Dice + boundary-weighted BCE on sharpened soft targets.
+    # Replaces plain DiceLoss to specifically penalise missed leaf margin pixels
+    # — the failure mode observed in Teacher overlays (IoU 0.72 vs SAM2 0.94).
+    criterion = BoundaryAwareLoss()
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=TEACHER_LR,
@@ -566,7 +663,7 @@ def evaluate_teacher_test(variant: str, all_samples: list[dict]) -> dict:
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
-    criterion = smp.losses.DiceLoss(mode="binary", from_logits=True)
+    criterion = BoundaryAwareLoss()
     val_tf    = make_val_transforms(TEACHER_IMG_SIZE)
     test_ds   = TeacherDataset(test_samples, val_tf)
     batch_size = TEACHER_BATCH_SIZE_OVERRIDES.get(variant, TEACHER_BATCH_SIZE)
