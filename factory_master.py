@@ -111,16 +111,23 @@ def load_teacher() -> nn.Module:
     ckpt    = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     variant = ckpt.get("variant", TEACHER_DEPLOYED_VARIANT)
 
-    encoder_map = {
-        "resnet50":       "resnet50",
-        "efficientnet-b2":"efficientnet-b2",
-        "mit_b2":         "mit_b2",
-    }
-    model = smp.Unet(
-        encoder_name=encoder_map.get(variant, "efficientnet-b2"),
-        encoder_weights=None,
-        in_channels=3, classes=1, activation=None,
-    )
+    if variant == "deeplabv3plus-eb2":
+        model = smp.DeepLabV3Plus(
+            encoder_name="efficientnet-b2",
+            encoder_weights=None,
+            in_channels=3, classes=1, activation=None,
+        )
+    else:
+        encoder_map = {
+            "resnet50":        "resnet50",
+            "efficientnet-b2": "efficientnet-b2",
+            "mit_b2":          "mit_b2",
+        }
+        model = smp.Unet(
+            encoder_name=encoder_map.get(variant, "efficientnet-b2"),
+            encoder_weights=None,
+            in_channels=3, classes=1, activation=None,
+        )
     model.load_state_dict(ckpt["model_state"])
     model.to(DEVICE).eval()
     return model

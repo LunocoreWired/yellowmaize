@@ -167,7 +167,7 @@ class BoundaryAwareLoss(nn.Module):
 def make_train_transforms(img_size: int):
     return A.Compose([
         A.LongestMaxSize(max_size=img_size),
-        A.PadIfNeeded(img_size, img_size, border_mode=0, value=0),
+        A.PadIfNeeded(img_size, img_size, border_mode=0, fill=0),
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.5),
         A.RandomRotate90(p=0.5),
@@ -183,8 +183,10 @@ def make_train_transforms(img_size: int):
         # CoarseDropout: randomly masks small regions, forces the model to
         # infer leaf extent from context rather than local texture — reduces
         # the tendency to shrink predictions where texture is ambiguous.
-        A.CoarseDropout(max_holes=6, max_height=32, max_width=32,
-                        min_holes=1, fill_value=0, p=0.2),
+        A.CoarseDropout(num_holes_range=(1, 6),
+                        hole_height_range=(8, 32),
+                        hole_width_range=(8, 32),
+                        fill=0, p=0.2),
         A.Normalize(mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
@@ -194,7 +196,7 @@ def make_train_transforms(img_size: int):
 def make_val_transforms(img_size: int):
     return A.Compose([
         A.LongestMaxSize(max_size=img_size),
-        A.PadIfNeeded(img_size, img_size, border_mode=0, value=0),
+        A.PadIfNeeded(img_size, img_size, border_mode=0, fill=0),
         A.Normalize(mean=[0.485, 0.456, 0.406],
                     std=[0.229, 0.224, 0.225]),
         ToTensorV2(),
@@ -339,7 +341,14 @@ def build_teacher_model(variant: str) -> nn.Module:
       deeplabv3plus-eb2 — smp.DeepLabV3Plus, EfficientNet-B2
                           True decoder comparison: ASPP vs UNet skip connections.
                           ASPP handles multi-scale leaf variation better.
+
+    Dropout: applied to the penultimate encoder feature map via a wrapper hook.
+    Targeting only the last encoder block avoids disturbing shallow skip
+    connections while still regularising the high-level representations that
+    tend to overfit first (as seen: val Dice peaked ep 3 and diverged thereafter).
     """
+    ENCODER_DROPOUT = 0.3   # drop 30% of encoder output channels during training
+
     unet_encoders = {
         "resnet50":        "resnet50",
         "efficientnet-b2": "efficientnet-b2",
@@ -368,6 +377,23 @@ def build_teacher_model(variant: str) -> nn.Module:
         )
     else:
         raise ValueError(f"Unknown Teacher variant: {variant}")
+
+    # Register a forward hook that applies Dropout2d to the final encoder
+    # feature map during training. This is the standard way to add encoder
+    # dropout to smp models without modifying the frozen encoder weights or
+    # patching internal smp code.
+    _dropout_layer = nn.Dropout2d(p=ENCODER_DROPOUT)
+
+    def _encoder_dropout_hook(module, input, output):
+        # output is a list of feature maps from each encoder stage.
+        # Apply dropout only to the last (deepest) feature map.
+        if isinstance(output, (list, tuple)) and _dropout_layer.training:
+            out_list = list(output)
+            out_list[-1] = _dropout_layer(out_list[-1])
+            return type(output)(out_list)
+        return output
+
+    model.encoder.register_forward_hook(_encoder_dropout_hook)
 
     return model
 
