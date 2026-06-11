@@ -670,7 +670,7 @@ def main() -> None:
                     print(f"    Validated {i+1:,}/{len(all_files):,} "
                           f"({n_rej:,} rejected so far)")
 
-        raw_valid[cls] = valid_paths
+        raw_valid[cls] = sorted(valid_paths)  # sort for deterministic downstream ordering
         print(f"    Valid: {len(valid_paths):,}  |  Rejected: {n_rej:,}")
 
     # ── Phase B: MD5 exact duplicates (Steps 7 — cross-class) ─────────────────
