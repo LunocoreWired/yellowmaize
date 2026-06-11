@@ -163,7 +163,27 @@ SAM2_QA_MAX_REJECT_RATE  = 0.08   # warn if > 8% of images rejected
 # TEACHER
 # ══════════════════════════════════════════════════════════════════════════════
 TEACHER_IMG_SIZE     = 512
-TEACHER_BATCH_SIZE   = 8
+TEACHER_BATCH_SIZE   = 4  # RTX 5060 8 GB: batch=8 @ 512px exceeds VRAM.
+                            # batch=4 keeps peak usage ~5.5 GB, leaving headroom
+                            # for activations + gradients. Effective batch size is
+                            # maintained via TEACHER_GRAD_ACCUM_STEPS=2 in
+                            # train_teacher.py (4×2 = 8 effective, same LR schedule).
+
+# Per-variant batch size overrides — accounts for encoder/decoder memory
+# differences at 512px on RTX 5060 8 GB.  Falls back to TEACHER_BATCH_SIZE
+# for any variant not listed here.
+#   resnet50           — 6 is safe; standard CNN, predictable VRAM footprint
+#   efficientnet-b2    — 6 is safe (OOM at 8, confirmed)
+#   mit_b2             — transformer self-attention scales quadratically with
+#                        sequence length; 512px → 1024 tokens → needs batch=2
+#   deeplabv3plus-eb2  — ASPP is heavier than a UNet decoder; batch=4 is safer
+TEACHER_BATCH_SIZE_OVERRIDES = {
+    "resnet50":           6,
+    "efficientnet-b2":    6,
+    "mit_b2":             2,
+    "deeplabv3plus-eb2":  4,
+}
+TEACHER_GRAD_ACCUM_STEPS = 2  # accumulate gradients over 2 steps → effective batch=8
 TEACHER_EPOCHS       = 30
 TEACHER_LR           = 5e-5
 TEACHER_WEIGHT_DECAY = 1e-4

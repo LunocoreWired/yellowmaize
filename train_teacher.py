@@ -56,10 +56,12 @@ from config import (
     TIER1_RAW_DIR, TIER1_MASKS_DIR, TIER1_MANIFEST,
     GLOBAL_MANIFEST,
     TEACHER_CKPT_DIR, LOGS_DIR, REPORTS_DIR,
-    TEACHER_IMG_SIZE, TEACHER_BATCH_SIZE, TEACHER_EPOCHS,
+    TEACHER_IMG_SIZE, TEACHER_BATCH_SIZE, TEACHER_BATCH_SIZE_OVERRIDES,
+    TEACHER_EPOCHS,
     TEACHER_LR, TEACHER_WEIGHT_DECAY, TEACHER_VAL_SPLIT,
     TEACHER_PATIENCE, TEACHER_LR_FACTOR, TEACHER_LR_PATIENCE,
     TEACHER_VARIANTS, TEACHER_DEPLOYED_VARIANT,
+    TEACHER_GRAD_ACCUM_STEPS,
 )
 
 
@@ -83,6 +85,13 @@ def set_seeds(seed: int) -> None:
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# RTX 5060 8 GB: reduce fragmentation from UNet skip-connection allocs.
+# Set before launching: export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# or it will be set automatically here if not already in the environment.
+import os as _os
+if "PYTORCH_CUDA_ALLOC_CONF" not in _os.environ:
+    _os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -307,22 +316,43 @@ def compute_seg_metrics(preds_logits: torch.Tensor,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train_one_epoch(model, loader, optimizer, criterion, device) -> float:
+    """
+    Train one epoch with gradient accumulation.
+    TEACHER_GRAD_ACCUM_STEPS micro-batches are accumulated before each
+    optimizer step, giving an effective batch size of
+    TEACHER_BATCH_SIZE × TEACHER_GRAD_ACCUM_STEPS without the extra VRAM
+    cost of a larger physical batch.
+    """
     model.train()
     total_loss = 0.0
     n_samples  = 0
-    for batch in loader:
+    optimizer.zero_grad()
+
+    for step, batch in enumerate(loader):
         if batch is None:
             continue
         imgs, masks = batch
         imgs, masks = imgs.to(device), masks.to(device)
-        optimizer.zero_grad()
+
         logits = model(imgs)
-        loss   = criterion(logits, masks)
+        # Divide loss by accum steps so gradients are averaged, not summed,
+        # keeping the effective LR identical to a single large-batch step.
+        loss = criterion(logits, masks) / TEACHER_GRAD_ACCUM_STEPS
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-        optimizer.step()
-        total_loss += loss.item() * imgs.size(0)
+
+        total_loss += loss.item() * TEACHER_GRAD_ACCUM_STEPS * imgs.size(0)
         n_samples  += imgs.size(0)
+
+        if (step + 1) % TEACHER_GRAD_ACCUM_STEPS == 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
+            optimizer.zero_grad()
+
+    # Flush any remaining accumulated gradients at epoch end
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+    optimizer.step()
+    optimizer.zero_grad()
+
     return total_loss / max(n_samples, 1)
 
 
@@ -390,12 +420,14 @@ def train_variant(variant: str, all_samples: list[dict]) -> dict:
     train_ds = TeacherDataset([all_samples[i] for i in train_idx], train_tf)
     val_ds   = TeacherDataset([all_samples[i] for i in val_idx],   val_tf)
 
+    batch_size = TEACHER_BATCH_SIZE_OVERRIDES.get(variant, TEACHER_BATCH_SIZE)
+
     train_loader = DataLoader(
-        train_ds, batch_size=TEACHER_BATCH_SIZE,
+        train_ds, batch_size=batch_size,
         shuffle=True, num_workers=4, pin_memory=True, drop_last=True,
         collate_fn=safe_collate)
     val_loader = DataLoader(
-        val_ds, batch_size=TEACHER_BATCH_SIZE,
+        val_ds, batch_size=batch_size,
         shuffle=False, num_workers=4, pin_memory=True,
         collate_fn=safe_collate)
 
@@ -537,8 +569,9 @@ def evaluate_teacher_test(variant: str, all_samples: list[dict]) -> dict:
     criterion = smp.losses.DiceLoss(mode="binary", from_logits=True)
     val_tf    = make_val_transforms(TEACHER_IMG_SIZE)
     test_ds   = TeacherDataset(test_samples, val_tf)
+    batch_size = TEACHER_BATCH_SIZE_OVERRIDES.get(variant, TEACHER_BATCH_SIZE)
     test_loader = DataLoader(
-        test_ds, batch_size=TEACHER_BATCH_SIZE,
+        test_ds, batch_size=batch_size,
         shuffle=False, num_workers=4, pin_memory=True,
         collate_fn=safe_collate)
 
