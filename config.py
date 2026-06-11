@@ -183,9 +183,11 @@ TEACHER_BATCH_SIZE_OVERRIDES = {
 }
 TEACHER_GRAD_ACCUM_STEPS = 4  # accumulate over 4 steps → effective batch=8 for most
                                 # variants (mit_b2: 1×4=4 effective — acceptable)
-TEACHER_EPOCHS       = 50    # increased from 30 — soft SAM2 targets need more
-                              # epochs to converge; 0.72 IoU suggests early stop
-                              # fired before full convergence at epoch 30
+TEACHER_EPOCHS       = 30    # reverted from 50 — old run shows model converges
+                              # by ep 18–25 (val Dice plateau visible in logs).
+                              # The 0.72 gold IoU is NOT a convergence failure —
+                              # it reflects SAM2 mask style vs human annotation
+                              # style. More epochs do not close this gap.
 TEACHER_LR           = 5e-5
 TEACHER_WEIGHT_DECAY = 1e-4
 TEACHER_VAL_SPLIT    = 0.20
