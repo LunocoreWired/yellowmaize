@@ -45,6 +45,8 @@ Phase 0-pre  partition_dataset.py           → global_split_manifest.csv (70/15
 Phase 0a     create_bouncer_dataset.py       → 50k binary bouncer dataset
 Phase 0b     train_bouncer.py               → bouncer_best.pth
 Phase 1      sample_15000.py                → 15k Tier 1 images
+Phase 1a     sample_yolo_annotations.py     → 501 images for YOLO bbox annotation
+Phase 1b     train_yolo_detector.py         → checkpoints/yolo/best.pt + QA calibration
 Phase 1b     sample_gold_standard.py        → 501-image gold standard set for human annotation
              train_yolo_detector.py         → YOLOv8n leaf detector + SAM2 QA calibration
 Phase 2      generate_tier1_masks.py        → SAM2 float .npy masks + QA  [v3: YOLO-guided]
@@ -76,6 +78,11 @@ python create_bouncer_dataset.py
 python train_bouncer.py
 python generate_charts.py --bouncer      # bouncer comparison + training curves
 python sample_15000.py
+python sample_yolo_annotations.py       # export 501 images for YOLO bbox annotation
+                                         # → import data/yolo_annotations/images/ into Label Studio
+                                         # → draw one bbox per image (label: "leaf")
+                                         # → export YOLO format → data/yolo_annotations/labels/
+python train_yolo_detector.py           # train YOLOv8n + calibrate SAM2 QA threshold
 python sample_gold_standard.py       # extract 501-image gold standard set
                                      # → images auto-copied to data/gold_standard/images/
                                      # → upload that folder to Label Studio
@@ -190,6 +197,13 @@ Outputs: `preprocessing_report.csv`, `preprocessing_flagged.csv`, `preprocessing
 - MSV: 7,500 (evenly-spaced across sorted filenames — diversity proxy)
 - MLN: 4,500 (evenly-spaced)
 - Source: train+val split images only (test excluded)
+
+**Phase 1a: YOLO Annotation Sampler** (`sample_yolo_annotations.py`)
+
+Extracts a reproducible stratified sample of **501 images** (167 per class) from
+Tier 1 for YOLO bounding-box annotation. Images are renamed with class prefix (e.g.
+`MSV_image045.jpg`) and exported to `data/yolo_annotations/images/`. A SHA-256
+hash lock guards against re-sampling if `tier1_manifest.csv` changes post-annotation.
 
 **Phase 1b: Gold Standard Sampling + YOLO Detector** (`sample_gold_standard.py`, `train_yolo_detector.py`)
 
@@ -481,7 +495,7 @@ GOLD_IMAGES_DIR         = DATA_DIR / "gold_standard" / "images"
 GOLD_MANIFEST           = DATA_DIR / "gold_standard" / "gold_manifest.csv"
 GOLD_ANNOTATION_FILE    = DATA_DIR / "gold_standard" / "annotations" / "annotations.json"
 GOLD_IOU_WARN_THRESHOLD = 0.75   ← per-image flag threshold
-GOLD_IOU_TARGET_MEAN    = 0.80   ← overall validation target
+GOLD_IOU_TARGET_MEAN    = 0.85   ← overall validation target (updated from 0.80)
 TEACHER_DEPLOYED_VARIANT = "efficientnet-b2"
 ```
 
@@ -556,22 +570,24 @@ Cohen's Kappa (inter-rater), Spearman ρ (HSV vs human)
 
 ---
 
-## 8. File Inventory (23 files, ~10,500 lines total)
+## 8. File Inventory (24 files, ~10,700 lines total)
 
 ```
 yellowmaize/
 ├── __init__.py                      Root package marker
-├── config.py                        All hyperparameters (295+ lines; includes GOLD_* keys)
+├── config.py                        All hyperparameters (409 lines; includes YOLO_* and GOLD_* keys)
 ├── image_utils.py                   EXIF correction, CLAHE, channel safety
 ├── requirements.txt                 All dependencies
 ├── partition_dataset.py             10-step preprocessing + 70/15/15 split
 ├── create_bouncer_dataset.py        50k bouncer dataset + nonmaize validation
 ├── train_bouncer.py                 4-variant bouncer + PatchCore + admission rate
 ├── sample_15000.py                  Stratified 15k Tier 1 sampler
+├── sample_yolo_annotations.py       501-image YOLO bbox annotation export (167 per class)
 ├── generate_tier1_masks.py          SAM2 auto-prompting + QA filters
 ├── validate_masks.py                QA report + qualitative overlays
 ├── sample_gold_standard.py          Extract 300-image gold standard set for Label Studio
 ├── validate_gold_standard.py        IoU validation: SAM2→Teacher→Student vs human masks
+├── train_yolo_detector.py           YOLOv8n leaf detector + SAM2 QA threshold calibration
 ├── train_teacher.py                 4-variant teacher + test evaluation
 ├── factory_master.py                4-mode pseudo-label factory + summary statistics
 ├── train_student.py                 5-variant student + all metrics + test eval

@@ -10,6 +10,7 @@
 
 import os
 from pathlib import Path
+import numpy as np
 
 # ══════════════════════════════════════════════════════════════════════════════
 # GLOBAL SEED — enforced in every training script for reproducibility
@@ -162,7 +163,27 @@ SAM2_QA_MAX_REJECT_RATE  = 0.08   # warn if > 8% of images rejected
 # TEACHER
 # ══════════════════════════════════════════════════════════════════════════════
 TEACHER_IMG_SIZE     = 512
-TEACHER_BATCH_SIZE   = 8
+TEACHER_BATCH_SIZE   = 4  # RTX 5060 8 GB: batch=8 @ 512px exceeds VRAM.
+                            # batch=4 keeps peak usage ~5.5 GB, leaving headroom
+                            # for activations + gradients. Effective batch size is
+                            # maintained via TEACHER_GRAD_ACCUM_STEPS=2 in
+                            # train_teacher.py (4×2 = 8 effective, same LR schedule).
+
+# Per-variant batch size overrides — accounts for encoder/decoder memory
+# differences at 512px on RTX 5060 8 GB.  Falls back to TEACHER_BATCH_SIZE
+# for any variant not listed here.
+#   resnet50           — 6 is safe; standard CNN, predictable VRAM footprint
+#   efficientnet-b2    — 6 is safe (OOM at 8, confirmed)
+#   mit_b2             — transformer self-attention scales quadratically with
+#                        sequence length; 512px → 1024 tokens → needs batch=2
+#   deeplabv3plus-eb2  — ASPP is heavier than a UNet decoder; batch=4 is safer
+TEACHER_BATCH_SIZE_OVERRIDES = {
+    "resnet50":           6,
+    "efficientnet-b2":    6,
+    "mit_b2":             2,
+    "deeplabv3plus-eb2":  4,
+}
+TEACHER_GRAD_ACCUM_STEPS = 2  # accumulate gradients over 2 steps → effective batch=8
 TEACHER_EPOCHS       = 30
 TEACHER_LR           = 5e-5
 TEACHER_WEIGHT_DECAY = 1e-4
@@ -347,11 +368,18 @@ XAI_TARGET_LAYERS = {
 #   (No need to use Label Studio's built-in bbox export; polygons are more
 #   accurate and the converter here gives axis-aligned boxes for free.)
 YOLO_DATASET_DIR       = DATA_DIR / "yolo_dataset"     # YOLO-format images + labels
+YOLO_IMAGES_DIR        = DATA_DIR / "yolo_annotations" / "images"
+YOLO_ANNOTATIONS_DIR   = DATA_DIR / "yolo_annotations" / "labels"
+YOLO_ANNOTATION_FILE   = YOLO_ANNOTATIONS_DIR / "annotations.json"
 YOLO_WEIGHTS_DIR       = CHECKPOINTS_DIR / "yolo"       # best.pt saved here
 YOLO_WEIGHTS_BEST      = CHECKPOINTS_DIR / "yolo" / "best.pt"
 YOLO_IMG_SIZE          = 640           # standard YOLOv8 input resolution
 YOLO_EPOCHS            = 100           # early-stopped via YOLO_PATIENCE
-YOLO_BATCH_SIZE        = 16
+YOLO_BATCH_SIZE        = 8             # RTX 5060 8 GB — 16 fits VRAM but 8 leaves
+                                       # headroom for SAM2 co-residency and avoids
+                                       # system RAM exhaustion if CUDA falls back to CPU
+YOLO_WORKERS           = 2             # dataloader threads — 4 eats ~6 GB RAM on
+                                       # 640-px images; 2 keeps usage under 16 GB DDR4
 YOLO_LR0               = 0.01          # initial LR (YOLOv8 default)
 YOLO_PATIENCE          = 20            # epochs without improvement → stop
 YOLO_CONF_THRESHOLD    = 0.25          # detection confidence for inference

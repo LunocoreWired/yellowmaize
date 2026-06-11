@@ -57,13 +57,14 @@ import pandas as pd
 
 from config import (
     SEED,
+    YOLO_ANNOTATION_FILE, YOLO_IMAGES_DIR, YOLO_ANNOTATIONS_DIR,
     GOLD_ANNOTATION_FILE, GOLD_IMAGES_DIR, GOLD_ANNOTATIONS_DIR,
     GOLD_IOU_TARGET_MEAN,
     YOLO_DATASET_DIR, YOLO_WEIGHTS_DIR, YOLO_WEIGHTS_BEST,
     YOLO_IMG_SIZE, YOLO_EPOCHS, YOLO_BATCH_SIZE, YOLO_LR0,
     YOLO_PATIENCE, YOLO_CONF_THRESHOLD, YOLO_IOU_NMS,
     YOLO_MIN_ANNOTATIONS, YOLO_VAL_SPLIT, YOLO_CLASS_NAME,
-    YOLO_QA_CALIB_FILE,
+    YOLO_WORKERS, YOLO_QA_CALIB_FILE,
     SAM2_CHECKPOINT, SAM2_CONFIG,
     LOGS_DIR,
 )
@@ -277,6 +278,31 @@ def train_yolo(yaml_path: Path) -> None:
             "  pip install ultralytics>=8.0.0"
         )
 
+    # ── GPU preflight check ───────────────────────────────────────────────────
+    import torch
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_gb  = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"  GPU detected : {gpu_name}  ({vram_gb:.1f} GB VRAM)")
+        device = "0"
+    else:
+        print()
+        print("  [WARNING] CUDA is NOT available — training will run on CPU.")
+        print("            This will be extremely slow and will likely exhaust")
+        print("            your 16 GB RAM.  Possible causes:")
+        print("              1. PyTorch was installed without CUDA support.")
+        print("                 Run: pip install torch torchvision --index-url")
+        print("                      https://download.pytorch.org/whl/cu128")
+        print("              2. NVIDIA drivers not loaded — check: nvidia-smi")
+        print("              3. RTX 5060 (Blackwell) may need PyTorch nightly.")
+        print("                 See: https://pytorch.org/get-started/locally/")
+        print()
+        answer = input("  Continue on CPU anyway? [y/N]: ")
+        if answer.strip().lower() != "y":
+            print("  Aborted. Fix CUDA first and re-run.")
+            return
+        device = "cpu"
+
     YOLO_WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
 
     model = YOLO("yolov8n.pt")    # downloads pretrained weights on first run
@@ -290,11 +316,13 @@ def train_yolo(yaml_path: Path) -> None:
         batch     = YOLO_BATCH_SIZE,
         lr0       = YOLO_LR0,
         patience  = YOLO_PATIENCE,
+        workers   = YOLO_WORKERS,   # cap dataloader threads to limit RAM usage
+        cache     = False,          # do NOT cache images in RAM (prevents OOM on 16 GB)
         project   = str(YOLO_WEIGHTS_DIR.parent),
         name      = "yolo",
         exist_ok  = True,
         seed      = SEED,
-        device    = "0",          # GPU 0; falls back to CPU automatically
+        device    = device,
         verbose   = False,
     )
 
@@ -650,12 +678,12 @@ def main() -> None:
     print("=" * 72)
 
     # ── Preflight: annotation count check ────────────────────────────────────
-    if not GOLD_ANNOTATION_FILE.exists():
-        print(f"[FATAL] Annotation file not found: {GOLD_ANNOTATION_FILE}")
+    if not YOLO_ANNOTATION_FILE.exists():
+        print(f"[FATAL] Annotation file not found: {YOLO_ANNOTATION_FILE}")
         print("  Export from Label Studio → Export → JSON → place at that path.")
         return
 
-    with open(GOLD_ANNOTATION_FILE, encoding="utf-8") as f:
+    with open(YOLO_ANNOTATION_FILE, encoding="utf-8") as f:
         tasks = json.load(f)
 
     n_tasks = len(tasks)
@@ -673,7 +701,7 @@ def main() -> None:
     # ── Step 1: Parse Label Studio JSON ──────────────────────────────────────
     print(f"\n{'─' * 40}")
     print("  Step 1 — Parsing Label Studio annotations")
-    records = parse_label_studio_json(GOLD_ANNOTATION_FILE, GOLD_IMAGES_DIR)
+    records = parse_label_studio_json(YOLO_ANNOTATION_FILE, YOLO_IMAGES_DIR)
 
     if len(records) < 20:
         print(f"[FATAL] Only {len(records)} usable records after parsing. Check paths.")
