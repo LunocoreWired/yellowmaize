@@ -1,6 +1,24 @@
 """
 factory_master.py — Phase 4: Pseudo-Label Generation (Optimized & Fixed)
 Hardware Target: Ryzen 5 3600X (12T) / RTX 5060 (8GB) / 16GB RAM / WSL2
+
+Change-log (v4 → v5):
+  Fix 1  — LAB-based symptom detection replaces HSV (compute_lab_hard_mask /
+            compute_lab_soft_confidence). L* normalised per-image; a*/b*
+            thresholded for red-shift / yellowing. HSV functions retained as
+            labelled legacy fallback.
+  Fix 2  — Directional morphological opening (1×15 vertical kernel) applied
+            inside LAB mask functions to suppress continuous midrib structure
+            while keeping broken MSV/MLN streaks.
+  Fix 3  — Conditional HEALTHY zeroing: symptom signal < 2 % of leaf area is
+            treated as a false positive and zeroed.  Signal ≥ 2 % is preserved
+            for early-symptom learning (per Luno's guidance).
+  Fix 4  — HSV S floors tightened in config.py (interim until LAB is fully
+            validated in production).
+  Fix 6  — Reminder: verify train_student.py includes aggressive augmentation:
+              A.RandomBrightnessContrast(p=0.5)
+              A.HueSaturationValue(p=0.5)
+              A.RandomGamma(p=0.3)
 """
 import os
 # CRITICAL: Prevent OpenCV/NumPy from hijacking all CPU cores and choking DataLoader workers
@@ -203,6 +221,103 @@ def _compute_gabor_combined_mask(img_rgb: np.ndarray) -> np.ndarray:
     combined /= (len(GABOR_THETAS) * len(GABOR_NORMS))
     return (combined >= GABOR_THRESHOLD).astype(np.uint8)
 
+# ─── LAB-based symptom detection (Fix 1) ────────────────────────────────────
+# Replaces HSV for symptom isolation.  LAB separates luminance (L*) from
+# colour (a*, b*) so flash, shadow, and midrib specular shine don't shift the
+# chrominance channels — the root cause of HSV false positives on midribs.
+#
+# Thresholds (OpenCV scale: L* 0-255, a*/b* 0-255 centred at 128):
+#   a* > 128  → red-shift  (MSV chlorotic streaks, necrotic tissue)
+#   b* > 128  → yellow-shift (both MSV and MLN yellowing)
+#   a* < 128  → green-shift  (healthy — used for exclusion)
+#
+# L* is normalised per-image before thresholding to remove lighting variance.
+
+LAB_MSV_A_MIN   = 133   # slight red-shift: chlorotic/necrotic streaks
+LAB_MSV_B_MIN   = 135   # yellowing component
+LAB_MLN_A_MIN   = 130   # MLN lesions trend slightly less red than MSV
+LAB_MLN_B_MIN   = 138   # MLN necrosis more yellow-brown
+LAB_GREEN_A_MAX = 124   # pixels greener than this are healthy tissue
+
+def _normalize_L(lab: np.ndarray) -> np.ndarray:
+    """Stretch L* channel to [0, 255] per-image to remove lighting/flash bias."""
+    L = lab[:, :, 0].astype(np.float32)
+    lo, hi = L.min(), L.max()
+    if hi - lo < 1e-3:
+        return lab
+    lab = lab.copy()
+    lab[:, :, 0] = np.clip((L - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
+    return lab
+
+def compute_lab_hard_mask(img_rgb: np.ndarray, silhouette: np.ndarray, category: str) -> np.ndarray:
+    """LAB hard binary symptom mask with directional morphological opening (Fix 1 + Fix 2)."""
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+    lab = _normalize_L(lab)
+    a = lab[:, :, 1].astype(np.int32)  # 0-255, neutral=128
+    b = lab[:, :, 2].astype(np.int32)  # 0-255, neutral=128
+
+    green_excl = (a < LAB_GREEN_A_MAX)
+
+    if category == "MSV":
+        symptom = ((a >= LAB_MSV_A_MIN) | (b >= LAB_MSV_B_MIN)).astype(np.uint8)
+        symptom &= (~green_excl).astype(np.uint8)
+        symptom &= silhouette
+        # Gabor texture confirmation for MSV streaks
+        symptom &= _compute_gabor_combined_mask(img_rgb)
+    elif category == "MLN":
+        symptom = ((a >= LAB_MLN_A_MIN) | (b >= LAB_MLN_B_MIN)).astype(np.uint8)
+        symptom &= (~green_excl).astype(np.uint8)
+        symptom &= silhouette
+    else:
+        # HEALTHY: LAB mask still computed for non-zero early-symptom detection
+        symptom = ((a >= LAB_MSV_A_MIN) | (b >= LAB_MSV_B_MIN)).astype(np.uint8)
+        symptom &= (~green_excl).astype(np.uint8)
+        symptom &= silhouette
+
+    # Fix 2 — Directional morphological opening along leaf axis.
+    # A tall vertical kernel (1×15) breaks continuous midrib structure (long
+    # connected line) while preserving the short, discontinuous MSV/MLN streaks
+    # that span across the vein axis.
+    if symptom.any():
+        kernel_dir = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
+        symptom = cv2.morphologyEx(symptom, cv2.MORPH_OPEN, kernel_dir)
+
+    return (symptom * 255).astype(np.uint8)
+
+def compute_lab_soft_confidence(img_rgb: np.ndarray, silhouette: np.ndarray, category: str) -> np.ndarray:
+    """LAB soft confidence map (analogous to compute_hsv_soft_confidence, for mode_d)."""
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+    lab = _normalize_L(lab)
+    a = lab[:, :, 1].astype(np.float32)
+    b = lab[:, :, 2].astype(np.float32)
+
+    green_excl = (a < float(LAB_GREEN_A_MAX))
+
+    if category == "MSV":
+        a_min, b_min = float(LAB_MSV_A_MIN), float(LAB_MSV_B_MIN)
+    else:
+        a_min, b_min = float(LAB_MLN_A_MIN), float(LAB_MLN_B_MIN)
+
+    # Soft confidence: linear ramp from threshold to channel ceiling (255)
+    a_conf = np.clip((a - a_min) / max(255.0 - a_min, 1.0), 0.0, 1.0)
+    b_conf = np.clip((b - b_min) / max(255.0 - b_min, 1.0), 0.0, 1.0)
+    conf_map = np.maximum(a_conf, b_conf)
+    conf_map *= (~green_excl).astype(np.float32)
+    conf_map *= silhouette.astype(np.float32)
+
+    if category == "MSV":
+        conf_map *= _compute_gabor_combined_mask(img_rgb).astype(np.float32)
+
+    # Fix 2 — directional opening on binarised version, then reapply to conf
+    if conf_map.max() > 0:
+        binary_hint = (conf_map > 0).astype(np.uint8)
+        kernel_dir = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
+        binary_hint = cv2.morphologyEx(binary_hint, cv2.MORPH_OPEN, kernel_dir)
+        conf_map *= binary_hint.astype(np.float32)
+
+    return np.clip(conf_map, 0.0, 1.0)
+
+# ─── Legacy HSV detection (kept as fallback / comparison baseline) ────────────
 def compute_hsv_hard_mask(img_rgb, silhouette, category):
     img_hsv = to_hsv(img_rgb)
     h, s, v = img_hsv[:,:,0].astype(np.int32), img_hsv[:,:,1].astype(np.int32), img_hsv[:,:,2].astype(np.int32)
@@ -289,9 +404,35 @@ def process_single_image_cpu(args):
     for mode in FACTORY_MODES:
         mode = mode.strip()  # Safeguard against OCR spaces in config
         sil = SIL_MAP[mode]
-        symptom = compute_hsv_soft_confidence(img_rgb, sil, category) if mode == "mode_d" else compute_hsv_hard_mask(img_rgb, sil, category)
+
+        # Fix 1: use LAB-based detection for all modes (HSV kept as fallback).
+        # mode_d → soft confidence map; all others → hard binary mask.
+        symptom = compute_lab_soft_confidence(img_rgb, sil, category) if mode == "mode_d" else compute_lab_hard_mask(img_rgb, sil, category)
+
+        # Fix 3 (conditional): zero symptom signal for HEALTHY images.
+        # Rationale: confirmed-HEALTHY labels have no annotated disease by
+        # definition; any LAB/HSV signal is a false positive that corrupts
+        # regression targets and inflates severity.
+        # EXCEPTION (per Luno): early-stage / sub-clinical cases may carry
+        # faint real signal.  We therefore zero only when the detected
+        # symptom area is below a noise floor (< 2 % of leaf area), treating
+        # those as artefacts.  Genuine very-early symptoms (≥ 2 % leaf area)
+        # are preserved so the student can learn from them.
+        if category == "HEALTHY":
+            leaf_px_for_check = float(sil.sum())
+            if leaf_px_for_check > 0:
+                sym_area_frac = float((symptom > 0).sum()) / leaf_px_for_check
+                if sym_area_frac < 0.02:
+                    # Sub-threshold signal → almost certainly a false positive
+                    if mode == "mode_d":
+                        symptom = np.zeros_like(symptom, dtype=np.float32)
+                    else:
+                        symptom = np.zeros_like(symptom, dtype=np.uint8)
+            else:
+                symptom = np.zeros_like(symptom)
+
         sym_binary = (symptom >= 0.3).astype(np.uint8) if mode == "mode_d" else (symptom > 0).astype(np.uint8)
-        
+
         leaf_px = float(sil.sum())
         sev = (float(sym_binary.sum()) / leaf_px) * 100.0 if leaf_px >= 1 and weight is not None else -1.0
         
