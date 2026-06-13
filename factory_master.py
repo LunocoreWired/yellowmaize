@@ -19,6 +19,32 @@ Change-log (v4 → v5):
               A.RandomBrightnessContrast(p=0.5)
               A.HueSaturationValue(p=0.5)
               A.RandomGamma(p=0.3)
+
+Change-log (v5 → v6):
+  MSV-1  — Gabor now acts as a soft weight (raw response 0–1 multiplied into
+            the LAB mask; product thresholded at 0.4) instead of a hard binary
+            AND gate.  Strong LAB hits survive borderline Gabor response.
+  MSV-2  — Directional morphological kernel changed from (1, 15) → (1, 7)
+            for the MSV branch: shorter kernel preserves broken, shorter
+            streaks on yellow maize that the 15-px opening was destroying.
+  MLN-1  — Added dark-necrosis condition: (L_norm < 110) & (a ≥ 125).
+            OR-ed with the existing yellowing gate before green exclusion so
+            that low-L* necrotic patches are captured.
+  MLN-2  — (5×5) elliptical closing applied after MLN mask and before
+            directional opening to bridge fragmented necrotic patches that
+            would otherwise fall below FACTORY_R3_MIN_AREA_PX.
+  HLT-1  — HEALTHY branch uses its own stricter LAB thresholds (a ≥ 140,
+            b ≥ 145) instead of the MSV thresholds to avoid flagging normal
+            warm-yellow leaf coloration as symptom signal.
+  HLT-2  — Replaced the single 2%-floor zero with a three-band rule:
+              < 1 %  → zero completely (noise)
+              1–4 %  → multiply by 0.3 (confidence dampening)
+              ≥ 4 %  → preserve at full strength (genuine early signal)
+  CROSS-1 — _normalize_L() skips stretching when image L* range > 180 to
+            prevent over-amplification of lighting variation on uniformly-
+            yellow images.
+  CROSS-2 — LAB_GREEN_A_MAX raised from 124 → 121 to stop correctly
+            excluding chlorotic-yellow pixels in the 121–130 a* range.
 """
 import os
 # CRITICAL: Prevent OpenCV/NumPy from hijacking all CPU cores and choking DataLoader workers
@@ -237,50 +263,131 @@ LAB_MSV_A_MIN   = 133   # slight red-shift: chlorotic/necrotic streaks
 LAB_MSV_B_MIN   = 135   # yellowing component
 LAB_MLN_A_MIN   = 130   # MLN lesions trend slightly less red than MSV
 LAB_MLN_B_MIN   = 138   # MLN necrosis more yellow-brown
-LAB_GREEN_A_MAX = 124   # pixels greener than this are healthy tissue
+LAB_GREEN_A_MAX = 121   # pixels greener than this are healthy tissue (raised 124→121: tighter exclusion preserves chlorotic-yellow pixels in a* 121–130 range)
 
 def _normalize_L(lab: np.ndarray) -> np.ndarray:
-    """Stretch L* channel to [0, 255] per-image to remove lighting/flash bias."""
+    """Stretch L* channel to [0, 255] per-image to remove lighting/flash bias.
+
+    Guard: if the image already spans more than 180 L* units it has good
+    contrast on its own.  Stretching further amplifies small lighting
+    variations into large L* swings that shift which pixels cross the a*/b*
+    thresholds — a known source of false positives on uniformly-yellow maize
+    images.  Skip normalization in that case and return raw L* values.
+    """
     L = lab[:, :, 0].astype(np.float32)
     lo, hi = L.min(), L.max()
     if hi - lo < 1e-3:
+        return lab
+    # NEW: skip stretching when image already has wide L* range
+    if hi - lo > 180:
         return lab
     lab = lab.copy()
     lab[:, :, 0] = np.clip((L - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
     return lab
 
 def compute_lab_hard_mask(img_rgb: np.ndarray, silhouette: np.ndarray, category: str) -> np.ndarray:
-    """LAB hard binary symptom mask with directional morphological opening (Fix 1 + Fix 2)."""
+    """LAB hard binary symptom mask with directional morphological opening (Fix 1 + Fix 2).
+
+    Changes vs v5:
+      MSV  — Gabor acts as a soft weight (multiply LAB mask by raw Gabor
+             response 0–1) rather than a hard AND gate; threshold result at
+             0.4 so strong LAB hits survive borderline Gabor.
+           — Directional opening kernel changed from (1, 15) → (1, 7): shorter
+             kernel preserves the broken, shorter streaks typical of MSV on
+             yellow maize.
+      MLN  — Added dark-necrosis condition: L_norm < 110 AND a* ≥ 125 captures
+             necrotic patches with low L* that the yellowing condition misses.
+           — Small (5×5) elliptical closing applied before the directional
+             opening to bridge fragmented necrotic patches that would otherwise
+             fall below FACTORY_R3_MIN_AREA_PX and be dropped.
+      HEALTHY — Uses stricter own thresholds (a ≥ 140, b ≥ 145) instead of
+             the MSV thresholds so normal warm-yellow coloration does not
+             trigger a non-zero mask before the area check.
+    """
     lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
     lab = _normalize_L(lab)
-    a = lab[:, :, 1].astype(np.int32)  # 0-255, neutral=128
-    b = lab[:, :, 2].astype(np.int32)  # 0-255, neutral=128
+    L_norm = lab[:, :, 0].astype(np.int32)  # 0-255 after normalization
+    a = lab[:, :, 1].astype(np.int32)       # 0-255, neutral=128
+    b = lab[:, :, 2].astype(np.int32)       # 0-255, neutral=128
 
     green_excl = (a < LAB_GREEN_A_MAX)
 
     if category == "MSV":
-        symptom = ((a >= LAB_MSV_A_MIN) | (b >= LAB_MSV_B_MIN)).astype(np.uint8)
-        symptom &= (~green_excl).astype(np.uint8)
-        symptom &= silhouette
-        # Gabor texture confirmation for MSV streaks
-        symptom &= _compute_gabor_combined_mask(img_rgb)
+        # LAB colour gate
+        lab_mask = ((a >= LAB_MSV_A_MIN) | (b >= LAB_MSV_B_MIN)).astype(np.uint8)
+        lab_mask &= (~green_excl).astype(np.uint8)
+        lab_mask &= silhouette
+
+        # Gabor as a soft weight rather than a binary AND gate.
+        # _compute_gabor_combined_mask() returns a uint8 binary mask; we need
+        # the raw continuous response (0.0–1.0) that underlies it.  We
+        # recompute the raw combined response here and threshold the product.
+        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+        h_, w_ = img_rgb.shape[:2]
+        gabor_raw = np.zeros((h_, w_), dtype=np.float32)
+        for theta in GABOR_THETAS:
+            for norm_freq in GABOR_NORMS:
+                kernel = cv2.getGaborKernel(
+                    (GABOR_KERNEL_SIZE, GABOR_KERNEL_SIZE),
+                    GABOR_SIGMA, theta, GABOR_LAMBDA, GABOR_GAMMA, GABOR_PSI,
+                    ktype=cv2.CV_32F,
+                )
+                filtered = np.abs(cv2.filter2D(gray, cv2.CV_32F, kernel))
+                if filtered.max() > 0:
+                    filtered = filtered / filtered.max()
+                gabor_raw += filtered
+        gabor_raw /= len(GABOR_THETAS) * len(GABOR_NORMS)  # now in [0, 1]
+
+        # Multiply LAB mask by raw Gabor response; threshold product at 0.4.
+        # Strong LAB hits survive even when Gabor is borderline.
+        weighted = lab_mask.astype(np.float32) * gabor_raw
+        symptom = (weighted >= 0.4).astype(np.uint8)
+
+        # Directional opening: (1, 7) — shorter than the legacy (1, 15) so
+        # broken, shorter MSV streaks on yellow maize are not destroyed.
+        if symptom.any():
+            kernel_dir = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7))
+            symptom = cv2.morphologyEx(symptom, cv2.MORPH_OPEN, kernel_dir)
+
     elif category == "MLN":
-        symptom = ((a >= LAB_MLN_A_MIN) | (b >= LAB_MLN_B_MIN)).astype(np.uint8)
-        symptom &= (~green_excl).astype(np.uint8)
-        symptom &= silhouette
-    else:
-        # HEALTHY: LAB mask still computed for non-zero early-symptom detection
-        symptom = ((a >= LAB_MSV_A_MIN) | (b >= LAB_MSV_B_MIN)).astype(np.uint8)
+        # Primary yellowing / red-shift condition (unchanged)
+        yellowing = (a >= LAB_MLN_A_MIN) | (b >= LAB_MLN_B_MIN)
+
+        # NEW: dark necrosis condition — low L* (dark patches) with slight
+        # red-shift capture necrotic tissue that has low b* and would be missed
+        # by the yellowing gate.
+        dark_necrosis = (L_norm < 110) & (a >= 125)
+
+        symptom = (yellowing | dark_necrosis).astype(np.uint8)
         symptom &= (~green_excl).astype(np.uint8)
         symptom &= silhouette
 
-    # Fix 2 — Directional morphological opening along leaf axis.
-    # A tall vertical kernel (1×15) breaks continuous midrib structure (long
-    # connected line) while preserving the short, discontinuous MSV/MLN streaks
-    # that span across the vein axis.
-    if symptom.any():
-        kernel_dir = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
-        symptom = cv2.morphologyEx(symptom, cv2.MORPH_OPEN, kernel_dir)
+        # NEW: small closing to bridge fragmented necrotic patches before the
+        # directional opening removes them as isolated specks.
+        if symptom.any():
+            kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            symptom = cv2.morphologyEx(symptom, cv2.MORPH_CLOSE, kernel_close)
+
+        # Directional opening (same (1, 15) as before for MLN — streaks are
+        # longer and less broken than on yellow maize).
+        if symptom.any():
+            kernel_dir = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
+            symptom = cv2.morphologyEx(symptom, cv2.MORPH_OPEN, kernel_dir)
+
+    else:
+        # HEALTHY: use stricter own thresholds (a ≥ 140, b ≥ 145) so normal
+        # warm-yellow leaf coloration does not trigger a non-zero mask before
+        # the area check in process_single_image_cpu().
+        # The legacy code reused LAB_MSV_A_MIN / LAB_MSV_B_MIN here, which
+        # caused almost every yellow-maize healthy leaf to produce a non-zero
+        # mask, defeating the 2%-floor noise gate.
+        symptom = ((a >= 140) | (b >= 145)).astype(np.uint8)
+        symptom &= (~green_excl).astype(np.uint8)
+        symptom &= silhouette
+
+        if symptom.any():
+            kernel_dir = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
+            symptom = cv2.morphologyEx(symptom, cv2.MORPH_OPEN, kernel_dir)
 
     return (symptom * 255).astype(np.uint8)
 
@@ -422,12 +529,27 @@ def process_single_image_cpu(args):
             leaf_px_for_check = float(sil.sum())
             if leaf_px_for_check > 0:
                 sym_area_frac = float((symptom > 0).sum()) / leaf_px_for_check
-                if sym_area_frac < 0.02:
-                    # Sub-threshold signal → almost certainly a false positive
+                if sym_area_frac < 0.01:
+                    # Below 1 % → almost certainly noise; zero completely.
                     if mode == "mode_d":
                         symptom = np.zeros_like(symptom, dtype=np.float32)
                     else:
                         symptom = np.zeros_like(symptom, dtype=np.uint8)
+                elif sym_area_frac < 0.04:
+                    # 1 %–4 % → ambiguous early-symptom signal.  Apply
+                    # confidence dampening (×0.3) rather than zeroing so the
+                    # student sees the spatial pattern but at down-weighted
+                    # contribution.  The weight file already down-weights this
+                    # image; the 0.3 factor adds an additional signal-level
+                    # guard without destroying spatial information.
+                    if mode == "mode_d":
+                        symptom = (symptom.astype(np.float32) * 0.3)
+                    else:
+                        symptom = np.clip(
+                            (symptom.astype(np.float32) * 0.3).astype(np.uint8),
+                            0, 255,
+                        )
+                # ≥ 4 % → preserved at full strength (genuine early-stage signal)
             else:
                 symptom = np.zeros_like(symptom)
 
