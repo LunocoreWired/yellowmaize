@@ -111,10 +111,10 @@ SAM2_BROWN_H_MIN    = 5
 SAM2_BROWN_H_MAX    = 20
 SAM2_BROWN_S_MIN    = 30
 SAM2_BROWN_V_MIN    = 50
-SAM2_QA_MIN_COVERAGE     = 0.10
+SAM2_QA_MIN_COVERAGE     = 0.03  # v3 relaxed: diseased leaves are sparser
 SAM2_QA_MAX_COVERAGE     = 0.90
 SAM2_QA_MIN_CONFIDENCE   = 0.65
-SAM2_QA_MIN_ASPECT_RATIO = 1.20
+SAM2_QA_MIN_ASPECT_RATIO = 1.01  # v3 relaxed: overhead/square-frame leaves
 SAM2_QA_MAX_REJECT_RATE  = 0.08
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -148,7 +148,8 @@ FACTORY_MODES = ["mode_a", "mode_b", "mode_c", "mode_d"]
 FACTORY_SILHOUETTE_THRESHOLD = 0.35
 FACTORY_MIN_LEAF_COVERAGE    = 0.15
 FACTORY_WEIGHT_BRACKETS = [
-    (0.00, 0.15, None),
+    # (0.00, 0.15) is handled by get_reliability_weight() early-exit
+    # on FACTORY_MIN_LEAF_COVERAGE — bracket below that is dead code.
     (0.15, 0.25, 0.30),
     (0.25, 0.50, 0.70),
     (0.50, 1.00, 1.00),
@@ -197,7 +198,7 @@ STUDENT_LABEL_SMOOTHING = 0.10
 # ══════════════════════════════════════════════════════════════════════════════
 GABOR_KERNEL_SIZE = 21
 GABOR_SIGMA      = 4.0
-GABOR_LAMBDA     = 10.0
+GABOR_LAMBDA     = 10.0   # authoritative — used directly in factory_master.py
 GABOR_GAMMA      = 0.5
 GABOR_PSI        = 0
 GABOR_NORMS      = [0.1, 0.2, 0.3, 0.4]

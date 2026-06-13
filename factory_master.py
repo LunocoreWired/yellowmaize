@@ -35,7 +35,7 @@ from config import (
     FACTORY_MODES, FACTORY_SILHOUETTE_THRESHOLD, FACTORY_MIN_LEAF_COVERAGE,
     FACTORY_WEIGHT_BRACKETS, FACTORY_R3_MIN_AREA_PX, FACTORY_MORPH_KERNEL_SIZE, HSV_GREEN_EXCL,
     HSV_MSV_RANGES, HSV_MLN_RANGES, BOUNCER_THRESHOLD, VALID_EXTENSIONS, CLASSES,
-    GABOR_KERNEL_SIZE, GABOR_SIGMA, GABOR_GAMMA, GABOR_PSI, GABOR_NORMS,
+    GABOR_KERNEL_SIZE, GABOR_SIGMA, GABOR_LAMBDA, GABOR_GAMMA, GABOR_PSI, GABOR_NORMS,
     GABOR_THETAS, GABOR_THRESHOLD, BOUNCER_IMG_SIZE
 )
 
@@ -191,7 +191,7 @@ def _compute_gabor_combined_mask(img_rgb: np.ndarray) -> np.ndarray:
     
     for theta in GABOR_THETAS:
         for norm_freq in GABOR_NORMS:
-            lambd = norm_freq * min(h, w) * 0.1
+            lambd = GABOR_LAMBDA  # config constant — image-size-independent, reproducible
             # FIX: cv2.CV_32F prevents memory corruption on 1-channel grayscale
             kernel = cv2.getGaborKernel((GABOR_KERNEL_SIZE, GABOR_KERNEL_SIZE), GABOR_SIGMA, theta, lambd, GABOR_GAMMA, GABOR_PSI, ktype=cv2.CV_32F)
             filtered = cv2.filter2D(gray, cv2.CV_32F, kernel)
@@ -258,6 +258,16 @@ def process_single_image_cpu(args):
     # mode_c: raw soft_prob thresholded without morphology cleanup
     # mode_d: same sil as mode_b, but soft confidence symptom map
     binary_sil    = refine_silhouette(soft_prob)                          # morph-refined  (mode_b, mode_d)
+
+    # Convex hull fill — recovers leaf area lost to necrotic patches that
+    # break silhouette connectivity. Maize leaves are convex along their
+    # long axis, so the hull is a valid geometric constraint.
+    _contours, _ = cv2.findContours(binary_sil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if _contours:
+        _hull = cv2.convexHull(max(_contours, key=cv2.contourArea))
+        binary_sil = cv2.drawContours(
+            np.zeros_like(binary_sil), [_hull], -1, 1, -1)
+
     raw_thresh_sil = (soft_prob >= FACTORY_SILHOUETTE_THRESHOLD).astype(np.uint8)  # no morph (mode_c)
     otsu_sil      = (cv2.threshold(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY), 0, 255,
                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1] > 0).astype(np.uint8)
