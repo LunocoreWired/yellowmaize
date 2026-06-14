@@ -96,23 +96,15 @@ import cv2
 import numpy as np
 
 # ── Try importing config from the project root ─────────────────────────────
+sys.path.insert(0, str(Path(__file__).parent))
 try:
-    sys.path.insert(0, str(Path(__file__).parent))
     from config import (
         PSEUDO_DIR, GLOBAL_MANIFEST, FACTORY_MODES, CLASSES,
         STUDENT_IMG_SIZE, REPORTS_DIR,
-        LAB_MSV_A_MIN_HINT := None,   # might not be exported; we define fallbacks
     )
-except (ImportError, SyntaxError):
-    # walrus / hint syntax guard — just import what exists
-    try:
-        from config import (
-            PSEUDO_DIR, GLOBAL_MANIFEST, FACTORY_MODES, CLASSES,
-            STUDENT_IMG_SIZE, REPORTS_DIR,
-        )
-    except ImportError:
-        print("[FATAL] config.py not found. Run from the project root or add it to PYTHONPATH.")
-        sys.exit(1)
+except ImportError:
+    print("[FATAL] config.py not found. Run from the project root or add it to PYTHONPATH.")
+    sys.exit(1)
 
 # Inline LAB/config constants mirrored from factory_master.py for display
 # (update these if you change them in factory_master.py)
@@ -131,6 +123,10 @@ DISPLAY_CONSTANTS = {
     "MSV_DIR_KERNEL":               "(1, 7)",
     "MLN_DIR_KERNEL":               "(1, 15)",
     "HEALTHY_3BAND_NOISE_FLOOR":    "< 1%  → zero | 1-4% → ×0.3 | ≥ 4% → keep",
+    "MSV_CIMMYT_SCALE":             "1=<5% | 3=5-25% | 5=25-50% | 7=50-75% | 9=>75%",
+    "MLN_CIMMYT_SCALE":             "1=<10% | 2=10-25% | 3=25-50% | 4=50-75% | 5=>75%",
+    "OTSU_GUIDED_THRESH":           "Otsu per-image, clamped to fixed LAB floor",
+    "CLAHE_L_LEAF_ONLY":            "clipLimit=2.0, tileGrid=(4,4), leaf mask only",
 }
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -179,8 +175,10 @@ def _load_pseudo_mask(stem: str, mode: str) -> tuple[np.ndarray | None, np.ndarr
 
     severity = float(sev_txt.read_text().strip()) if sev_txt.exists() else -1.0
     weight   = float(weight_txt.read_text().strip()) if weight_txt.exists() else -1.0
+    grade_txt = mode_dir / f"{stem}_grade.txt"
+    grade     = int(grade_txt.read_text().strip()) if grade_txt.exists() else -1
 
-    return sil, sym, severity, weight
+    return sil, sym, severity, weight, grade
 
 
 def _overlay_symptom_on_raw(raw_rgb: np.ndarray, symptom: np.ndarray,
@@ -689,6 +687,7 @@ def _build_html_report(entries_data: list[dict], mode: str, all_modes: list[str]
             stats = e.get("stats", {})
             severity = e.get("severity", -1)
             weight = e.get("weight", -1)
+            grade = e.get("grade", -1)
             missing = e.get("missing", False)
 
             sym_pct = stats.get("sym_pct", 0)
@@ -781,7 +780,7 @@ def _process_entry(entry: dict, mode: str) -> dict:
     result = {
         "stem": stem, "category": category,
         "flag": "❓", "diag": "", "missing": False,
-        "stats": {}, "severity": -1.0, "weight": -1.0,
+        "stats": {}, "severity": -1.0, "weight": -1.0, "grade": -1,
         "raw_b64": "", "sym_b64": "", "ovly_b64": "",
     }
 
@@ -793,9 +792,10 @@ def _process_entry(entry: dict, mode: str) -> dict:
             raw_rgb = cv2.cvtColor(raw_bgr, cv2.COLOR_BGR2RGB)
 
     # Load pseudo masks
-    sil, sym, severity, weight = _load_pseudo_mask(stem, mode)
+    sil, sym, severity, weight, grade = _load_pseudo_mask(stem, mode)
     result["severity"] = severity
     result["weight"]   = weight
+    result["grade"]    = grade
 
     if sym is None:
         result["missing"] = True
@@ -852,17 +852,68 @@ def _process_entry(entry: dict, mode: str) -> dict:
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _discover_borderline_images(mode: str, margin: float = 5.0) -> list[dict]:
+    """
+    Sample images near CIMMYT severity grade boundaries for targeted human review.
+    Boundary thresholds: 5%, 25%, 50%, 75% (MSV) and 10%, 25%, 50%, 75% (MLN).
+    Returns images whose severity % falls within ±margin of any boundary.
+    """
+    import pandas as pd
+    boundary_thresholds = [5.0, 10.0, 25.0, 50.0, 75.0]
+    entries = []
+
+    if not GLOBAL_MANIFEST.exists():
+        print("[WARN] global_split_manifest.csv not found for borderline sampling.")
+        return []
+
+    df = pd.read_csv(GLOBAL_MANIFEST)
+    df = df[df["split"] != "test"].reset_index(drop=True)
+    mode_dir = PSEUDO_DIR / mode
+
+    for _, row in df.iterrows():
+        stem = Path(row.get("filename", row.get("source_path", ""))).stem
+        sev_path = mode_dir / f"{stem}_sev.txt"
+        if not sev_path.exists():
+            continue
+        try:
+            sev = float(sev_path.read_text().strip())
+        except ValueError:
+            continue
+        if sev < 0:
+            continue
+        # Check if within margin of any boundary
+        if any(abs(sev - t) <= margin for t in boundary_thresholds):
+            entries.append({
+                "stem":        stem,
+                "source_path": row.get("source_path", ""),
+                "category":    row.get("category", "UNKNOWN"),
+            })
+
+    # Limit to max 30 per class to keep report manageable
+    from collections import defaultdict
+    by_class = defaultdict(list)
+    for e in entries:
+        by_class[e["category"]].append(e)
+    result = []
+    for cls_entries in by_class.values():
+        result.extend(cls_entries[:30])
+    print(f"  [Borderline] Found {len(result)} images within ±{margin}% of grade boundaries.")
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Validate factory_master.py pseudo-label outputs visually.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--n",         type=int,  default=10,       help="Images per class to sample (default: 10)")
-    parser.add_argument("--mode",      type=str,  default="mode_b", help="Factory mode to validate (default: mode_b)")
-    parser.add_argument("--all-modes", action="store_true",          help="Validate all 4 modes (mode_a/b/c/d)")
-    parser.add_argument("--img",       type=str,  default=None,      help="Path to a single raw image to validate")
-    parser.add_argument("--out",       type=str,  default=None,      help="Output HTML path (default: reports/validate_factory_<mode>.html)")
+    parser.add_argument("--n",          type=int,  default=10,       help="Images per class to sample (default: 10)")
+    parser.add_argument("--mode",       type=str,  default="mode_b", help="Factory mode to validate (default: mode_b)")
+    parser.add_argument("--all-modes",  action="store_true",          help="Validate all 4 modes (mode_a/b/c/d)")
+    parser.add_argument("--img",        type=str,  default=None,      help="Path to a single raw image to validate")
+    parser.add_argument("--out",        type=str,  default=None,      help="Output HTML path (default: reports/validate_factory_<mode>.html)")
+    parser.add_argument("--borderline", action="store_true",
+                        help="Sample images near CIMMYT grade boundaries (5%%, 25%%, 50%%, 75%%) for human review")
     args = parser.parse_args()
 
     modes_to_run = FACTORY_MODES if args.all_modes else [args.mode]
@@ -876,7 +927,13 @@ def main():
         if mode not in [m.strip() for m in FACTORY_MODES]:
             print(f"[WARN] '{mode}' not in FACTORY_MODES config: {FACTORY_MODES}")
 
-        entries = _discover_images(args.n, mode, args.img)
+        if args.borderline:
+            entries = _discover_borderline_images(mode)
+            if not entries:
+                print(f"  [WARN] No borderline images found for mode {mode}. Run factory_master.py first.")
+                continue
+        else:
+            entries = _discover_images(args.n, mode, args.img)
         if not entries:
             print(f"[ERROR] No images found for mode '{mode}'. Skipping.")
             continue

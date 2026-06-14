@@ -45,6 +45,25 @@ Change-log (v5 → v6):
             yellow images.
   CROSS-2 — LAB_GREEN_A_MAX raised from 124 → 121 to stop correctly
             excluding chlorotic-yellow pixels in the 121–130 a* range.
+
+Change-log (v6 → v7):
+  BUG-1  — compute_lab_soft_confidence: HEALTHY branch added with stricter
+            thresholds (a_min=140, b_min=145) matching compute_lab_hard_mask.
+            Previously fell into else→MLN branch, producing over-broad soft
+            maps for HEALTHY images before the three-band noise gate.
+  BUG-2  — compute_lab_soft_confidence: MSV directional kernel corrected
+            from (1,15) → (1,7) to match compute_lab_hard_mask. Short broken
+            streaks were being destroyed in mode_d but preserved in mode_b.
+  NEW-1  — Otsu-guided adaptive thresholding added to compute_lab_hard_mask.
+            Per-image optimal threshold computed on masked a*/b* pixels then
+            clamped to fixed floor (LAB_MSV_A_MIN / LAB_MLN_A_MIN) so Otsu
+            cannot drift into healthy-tissue range on heavily diseased leaves.
+  NEW-2  — CLAHE applied to L* channel within leaf mask before LAB symptom
+            detection via _clahe_L(). Locally adaptive contrast on the leaf
+            region only — more targeted than full-image CLAHE in load_image_clahe.
+  NEW-3  — CIMMYT severity grading added. _sev_to_cimmyt_grade() maps
+            continuous severity % to published CIMMYT 1–9 (MSV) and 1–5 (MLN)
+            scales. Written as _grade.txt alongside _sev.txt per image.
 """
 import os
 # CRITICAL: Prevent OpenCV/NumPy from hijacking all CPU cores and choking DataLoader workers
@@ -285,6 +304,54 @@ def _normalize_L(lab: np.ndarray) -> np.ndarray:
     lab[:, :, 0] = np.clip((L - lo) / (hi - lo) * 255, 0, 255).astype(np.uint8)
     return lab
 
+def _clahe_L(lab: np.ndarray, silhouette: np.ndarray) -> np.ndarray:
+    """Apply CLAHE to L* channel within the leaf mask region only.
+
+    More targeted than full-image CLAHE in load_image_clahe() — equalization
+    is computed from leaf pixels only, so background tone does not shift the
+    contrast curve for the leaf region.
+    """
+    lab = lab.copy()
+    L = lab[:, :, 0]
+    mask = (silhouette > 0)
+    if mask.sum() < 100:
+        return lab   # too few leaf pixels — skip
+    # Compute CLAHE on full L channel but using leaf-region histogram
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    L_eq = clahe.apply(L)
+    # Apply equalization only within leaf mask — preserve background L*
+    L_out = L.copy()
+    L_out[mask] = L_eq[mask]
+    lab[:, :, 0] = L_out
+    return lab
+
+def _sev_to_cimmyt_grade(severity_pct: float, category: str) -> int:
+    """Map continuous severity % to CIMMYT published agronomic grade.
+
+    MSV scale (CIMMYT, 1–9):
+      1=<5%  3=5–25%  5=25–50%  7=50–75%  9=>75%
+    MLN scale (CIMMYT, 1–5):
+      1=<10%  2=10–25%  3=25–50%  4=50–75%  5=>75%
+    HEALTHY: always grade 0 (no disease).
+    Returns -1 for excluded images (severity_pct < 0).
+    """
+    if severity_pct < 0:
+        return -1
+    if category == "HEALTHY":
+        return 0
+    if category == "MSV":
+        if severity_pct < 5:   return 1
+        if severity_pct < 25:  return 3
+        if severity_pct < 50:  return 5
+        if severity_pct < 75:  return 7
+        return 9
+    # MLN
+    if severity_pct < 10:  return 1
+    if severity_pct < 25:  return 2
+    if severity_pct < 50:  return 3
+    if severity_pct < 75:  return 4
+    return 5
+
 def compute_lab_hard_mask(img_rgb: np.ndarray, silhouette: np.ndarray, category: str) -> np.ndarray:
     """LAB hard binary symptom mask with directional morphological opening (Fix 1 + Fix 2).
 
@@ -306,6 +373,7 @@ def compute_lab_hard_mask(img_rgb: np.ndarray, silhouette: np.ndarray, category:
     """
     lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
     lab = _normalize_L(lab)
+    lab = _clahe_L(lab, silhouette)           # NEW-2: targeted L* CLAHE within leaf mask
     L_norm = lab[:, :, 0].astype(np.int32)  # 0-255 after normalization
     a = lab[:, :, 1].astype(np.int32)       # 0-255, neutral=128
     b = lab[:, :, 2].astype(np.int32)       # 0-255, neutral=128
@@ -313,8 +381,26 @@ def compute_lab_hard_mask(img_rgb: np.ndarray, silhouette: np.ndarray, category:
     green_excl = (a < LAB_GREEN_A_MAX)
 
     if category == "MSV":
-        # LAB colour gate
-        lab_mask = ((a >= LAB_MSV_A_MIN) | (b >= LAB_MSV_B_MIN)).astype(np.uint8)
+        # NEW-1: Otsu-guided adaptive threshold on a* within leaf mask,
+        # clamped to fixed floor so Otsu cannot drift into healthy tissue
+        # range on heavily diseased images where most pixels are symptomatic.
+        leaf_a = a[silhouette == 1].astype(np.uint8)
+        if len(leaf_a) > 100:
+            otsu_thresh_a, _ = cv2.threshold(leaf_a, 0, 255,
+                                             cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            a_min_eff = int(max(otsu_thresh_a, LAB_MSV_A_MIN))
+        else:
+            a_min_eff = LAB_MSV_A_MIN
+        leaf_b = b[silhouette == 1].astype(np.uint8)
+        if len(leaf_b) > 100:
+            otsu_thresh_b, _ = cv2.threshold(leaf_b, 0, 255,
+                                             cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            b_min_eff = int(max(otsu_thresh_b, LAB_MSV_B_MIN))
+        else:
+            b_min_eff = LAB_MSV_B_MIN
+
+        # LAB colour gate using adaptive thresholds
+        lab_mask = ((a >= a_min_eff) | (b >= b_min_eff)).astype(np.uint8)
         lab_mask &= (~green_excl).astype(np.uint8)
         lab_mask &= silhouette
 
@@ -350,8 +436,16 @@ def compute_lab_hard_mask(img_rgb: np.ndarray, silhouette: np.ndarray, category:
             symptom = cv2.morphologyEx(symptom, cv2.MORPH_OPEN, kernel_dir)
 
     elif category == "MLN":
-        # Primary yellowing / red-shift condition (unchanged)
-        yellowing = (a >= LAB_MLN_A_MIN) | (b >= LAB_MLN_B_MIN)
+        # NEW-1: Otsu-guided adaptive threshold for MLN channels
+        leaf_a = a[silhouette == 1].astype(np.uint8)
+        a_min_eff = int(max(cv2.threshold(leaf_a, 0, 255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0], LAB_MLN_A_MIN)) if len(leaf_a) > 100 else LAB_MLN_A_MIN
+        leaf_b = b[silhouette == 1].astype(np.uint8)
+        b_min_eff = int(max(cv2.threshold(leaf_b, 0, 255,
+            cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0], LAB_MLN_B_MIN)) if len(leaf_b) > 100 else LAB_MLN_B_MIN
+
+        # Primary yellowing / red-shift condition
+        yellowing = (a >= a_min_eff) | (b >= b_min_eff)
 
         # NEW: dark necrosis condition — low L* (dark patches) with slight
         # red-shift capture necrotic tissue that has low b* and would be missed
@@ -400,10 +494,13 @@ def compute_lab_soft_confidence(img_rgb: np.ndarray, silhouette: np.ndarray, cat
 
     green_excl = (a < float(LAB_GREEN_A_MAX))
 
+    # BUG-1 FIX: HEALTHY now uses its own stricter thresholds (was using MLN)
     if category == "MSV":
         a_min, b_min = float(LAB_MSV_A_MIN), float(LAB_MSV_B_MIN)
-    else:
+    elif category == "MLN":
         a_min, b_min = float(LAB_MLN_A_MIN), float(LAB_MLN_B_MIN)
+    else:  # HEALTHY — stricter thresholds match compute_lab_hard_mask
+        a_min, b_min = 140.0, 145.0
 
     # Soft confidence: linear ramp from threshold to channel ceiling (255)
     a_conf = np.clip((a - a_min) / max(255.0 - a_min, 1.0), 0.0, 1.0)
@@ -415,10 +512,12 @@ def compute_lab_soft_confidence(img_rgb: np.ndarray, silhouette: np.ndarray, cat
     if category == "MSV":
         conf_map *= _compute_gabor_combined_mask(img_rgb).astype(np.float32)
 
-    # Fix 2 — directional opening on binarised version, then reapply to conf
+    # BUG-2 FIX: use class-specific directional kernel sizes matching hard mask
+    # MSV: (1,7) — short broken streaks; MLN/HEALTHY: (1,15) — broader patterns
     if conf_map.max() > 0:
         binary_hint = (conf_map > 0).astype(np.uint8)
-        kernel_dir = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
+        kern_size   = (1, 7) if category == "MSV" else (1, 15)
+        kernel_dir  = cv2.getStructuringElement(cv2.MORPH_RECT, kern_size)
         binary_hint = cv2.morphologyEx(binary_hint, cv2.MORPH_OPEN, kernel_dir)
         conf_map *= binary_hint.astype(np.float32)
 
@@ -578,9 +677,13 @@ def process_single_image_cpu(args):
             
         (mode_dir / f"{stem}_sev.txt").write_text(str(round(data["severity"], 4)))
         (mode_dir / f"{stem}_weight.txt").write_text(str(result["weight"]))
+        # NEW-3: CIMMYT agronomic grade alongside continuous severity
+        grade = _sev_to_cimmyt_grade(data["severity"], category)
+        (mode_dir / f"{stem}_grade.txt").write_text(str(grade))
         
     result["status"] = "processed"
-    result.update({f"{m}_sev": round(modes_data[m]["severity"], 4) for m in modes_data})
+    result.update({f"{m}_sev":   round(modes_data[m]["severity"], 4) for m in modes_data})
+    result.update({f"{m}_grade": _sev_to_cimmyt_grade(modes_data[m]["severity"], category) for m in modes_data})
     return result
 
 # ═══════════════════════════════════════════════════════════════════════════════

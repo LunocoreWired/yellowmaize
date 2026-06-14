@@ -72,9 +72,9 @@ BOUNCER_LR               = 1e-4
 BOUNCER_WEIGHT_DECAY     = 1e-4
 BOUNCER_VAL_SPLIT        = 0.20
 BOUNCER_PATIENCE         = 5
-BOUNCER_MIN_ASPECT_RATIO = 1.5
-BOUNCER_MAX_ASPECT_RATIO = 18.0
-BOUNCER_MIN_GREEN_COVERAGE = 0.15
+# BOUNCER_MIN/MAX_ASPECT_RATIO and BOUNCER_MIN_GREEN_COVERAGE removed:
+# heuristic prefilter is a passthrough (bouncer_inference.py); these
+# constants were never read by any active code path.
 BOUNCER_THRESHOLD        = 0.65
 BOUNCER_VARIANTS = [
     "gabor_lbp", "mobilenet_v2", "mobilenet_v3_large", "edgevit_xxs",
@@ -264,6 +264,27 @@ GOLD_ANNOTATION_FILE = GOLD_ANNOTATIONS_DIR / "annotations.json"
 GOLD_MANIFEST        = GOLD_DIR / "gold_manifest.csv"
 GOLD_IOU_WARN_THRESHOLD  = 0.75
 GOLD_IOU_TARGET_MEAN     = 0.85
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CIMMYT SEVERITY GRADING
+# ══════════════════════════════════════════════════════════════════════════════
+# Published agronomic scales used by _sev_to_cimmyt_grade() in factory_master.py
+# MSV: 1–9 odd-number scale; MLN: 1–5 linear scale
+# Brackets: (lower_pct_inclusive, upper_pct_exclusive, grade)
+CIMMYT_MSV_BRACKETS = [
+    (0,   5,   1),
+    (5,   25,  3),
+    (25,  50,  5),
+    (50,  75,  7),
+    (75,  101, 9),
+]
+CIMMYT_MLN_BRACKETS = [
+    (0,   10,  1),
+    (10,  25,  2),
+    (25,  50,  3),
+    (50,  75,  4),
+    (75,  101, 5),
+]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EVALUATION
