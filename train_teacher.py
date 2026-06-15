@@ -97,6 +97,7 @@ def make_train_transforms(img_size: int):
         A.RandomRotate90(p=0.5),
         A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.3),
         A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=20, val_shift_limit=10, p=0.2),
+        A.RandomGamma(gamma_limit=(80, 120), p=0.3),  # lighting gamma robustness
         A.ElasticTransform(alpha=60, sigma=6, p=0.3),
         A.CoarseDropout(
             num_holes_range=(1, 6),

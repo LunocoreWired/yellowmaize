@@ -65,7 +65,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
-from image_utils import load_image_rgb, to_hsv   # EXIF correction
+from image_utils import load_image_rgb, load_image_clahe, to_hsv   # EXIF correction
 
 from config import (
     SEED,
@@ -695,7 +695,9 @@ def main() -> None:
 
     executor      = ThreadPoolExecutor(max_workers=_PREFETCH_WORKERS)
     chunk_paths   = images[:_YOLO_BATCH_SIZE]
-    chunk_futures = [executor.submit(load_image_rgb, p) for p in chunk_paths]
+    # load_image_clahe: CLAHE applied before HSV tissue detection improves
+    # yellow/brown channel sensitivity on dark underexposed field images.
+    chunk_futures = [executor.submit(load_image_clahe, p) for p in chunk_paths]
     chunk_start   = 0
 
     try:
@@ -705,7 +707,7 @@ def main() -> None:
             # Pre-load NEXT chunk while this one is on the GPU
             next_start    = chunk_start + _YOLO_BATCH_SIZE
             next_paths    = images[next_start : next_start + _YOLO_BATCH_SIZE]
-            next_futures  = [executor.submit(load_image_rgb, p) for p in next_paths]
+            next_futures  = [executor.submit(load_image_clahe, p) for p in next_paths]
 
             # ── 1. Batch YOLO ─────────────────────────────────────────────────
             yolo_boxes_chunk = (get_yolo_boxes_batch(chunk_imgs)

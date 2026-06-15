@@ -414,12 +414,43 @@ def main() -> None:
         pred_name = CLASSES[pred_cls]
         pred_sev  = round(sev_out.item() * 100, 1)
 
+        # CIMMYT grade from predicted severity
+        def _cimmyt_grade(sev_pct: float, cat: str) -> str:
+            if cat == "HEALTHY": return "0 (none)"
+            if cat == "MSV":
+                for lo, hi, g in [(0,5,1),(5,25,3),(25,50,5),(50,75,7),(75,101,9)]:
+                    if lo <= sev_pct < hi: return str(g)
+            for lo, hi, g in [(0,10,1),(10,25,2),(25,50,3),(50,75,4),(75,101,5)]:
+                if lo <= sev_pct < hi: return str(g)
+            return "?"
+        pred_grade = _cimmyt_grade(pred_sev, pred_name)
+
+        # Leaf-mask-constrained GradCAM++ severity
+        # Uses Ch0 sigmoid as leaf mask to restrict activation to leaf region.
+        # More robust than pixel ratio — tied to what the model actually learned.
+        leaf_prob  = torch.sigmoid(seg_logits[0, 0]).cpu().numpy()  # Ch0
+        leaf_mask  = (leaf_prob >= 0.5)
+
         # Segmentation boundary overlay (same for all XAI methods)
         seg_ov = seg_boundary_overlay(img_rgb, seg_logits, channel=0)
 
         # Per-method XAI
         for method, cam in cam_wrappers.items():
             heatmap = cam(inp_t, true_cls)
+
+            # Leaf-constrained GradCAM++ severity (within leaf mask only)
+            if heatmap is not None and leaf_mask.sum() > 0:
+                heatmap_np = heatmap[0] if heatmap.ndim == 3 else heatmap
+                # Resize heatmap to match leaf_mask if needed
+                if heatmap_np.shape != leaf_mask.shape:
+                    import cv2 as _cv2
+                    heatmap_np = _cv2.resize(heatmap_np,
+                        (leaf_mask.shape[1], leaf_mask.shape[0]),
+                        interpolation=_cv2.INTER_LINEAR)
+                gradcam_sev = round(
+                    float(heatmap_np[leaf_mask].mean()) * 100, 1)
+            else:
+                gradcam_sev = -1.0
 
             # Qualitative overlay
             if heatmap is not None:

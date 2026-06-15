@@ -580,15 +580,6 @@ def process_single_image_cpu(args):
     # mode_d: same sil as mode_b, but soft confidence symptom map
     binary_sil    = refine_silhouette(soft_prob)                          # morph-refined  (mode_b, mode_d)
 
-    # Convex hull fill — recovers leaf area lost to necrotic patches that
-    # break silhouette connectivity. Maize leaves are convex along their
-    # long axis, so the hull is a valid geometric constraint.
-    _contours, _ = cv2.findContours(binary_sil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if _contours:
-        _hull = cv2.convexHull(max(_contours, key=cv2.contourArea))
-        binary_sil = cv2.drawContours(
-            np.zeros_like(binary_sil), [_hull], -1, 1, -1)
-
     raw_thresh_sil = (soft_prob >= FACTORY_SILHOUETTE_THRESHOLD).astype(np.uint8)  # no morph (mode_c)
     otsu_sil      = (cv2.threshold(cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY), 0, 255,
                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1] > 0).astype(np.uint8)

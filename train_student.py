@@ -446,6 +446,7 @@ def make_student_transforms(img_size: int, is_train: bool):
                 hue_shift_limit=15, sat_shift_limit=20,
                 val_shift_limit=10, p=0.2),
             A.RandomShadow(p=0.2),          # tropical domain adaptation
+            A.RandomGamma(gamma_limit=(80, 120), p=0.3),  # lighting gamma robustness
             A.Normalize(mean=[0.485, 0.456, 0.406],
                         std=[0.229, 0.224, 0.225]),
             ToTensorV2(),
@@ -561,7 +562,7 @@ def seg_metrics_from_stats(tp: float, fp: float,
 # ══════════════════════════════════════════════════════════════════════════════
 
 def train_one_epoch(model, loader, optimizer,
-                    seg_criterion, cls_criterion, sev_criterion,
+                    seg_criterion, cls_criterion,
                     unc_loss, device) -> float:
     model.train()
     total_loss = 0.0
@@ -1042,7 +1043,8 @@ def train_one(encoder_variant: str, factory_mode: str) -> dict:
 
     seg_criterion = smp.losses.DiceLoss(mode="binary", from_logits=True)
     cls_criterion = AsymmetricLabelSmoothingLoss(ASYMMETRIC_PRIOR).to(DEVICE)
-    sev_criterion = nn.MSELoss()
+    # sev_criterion removed — MSE computed inline with F.mse_loss in
+    # train_one_epoch/validate; nn.MSELoss() was instantiated but never called.
     unc_loss      = HomoscedasticUncertaintyLoss().to(DEVICE)
 
     # Optimizer includes uncertainty loss parameters
@@ -1061,11 +1063,13 @@ def train_one(encoder_variant: str, factory_mode: str) -> dict:
     scheduler_p1 = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=STUDENT_PHASE1_EPOCHS, eta_min=1e-6)
 
-    # Stage 1 checkpoints saved to stage1/ subfolder to prevent
-    # Stage 2 mode_b run from overwriting the Stage 1 result
-    stage1_dir = STUDENT_CKPT_DIR / "stage1"
-    stage1_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path   = stage1_dir / f"student_{ckpt_name}_best.pth"
+    # Stage-specific checkpoint subdirectory prevents cross-stage overwrites.
+    # Stage 1 (encoder ablation, mode_b fixed) → stage1/
+    # Stage 2 (mode ablation, best encoder fixed) → stage2/
+    from __main__ import args as _args  # noqa: avoid circular; args set in main
+    _stage_dir = STUDENT_CKPT_DIR / (f"stage{_args.stage}" if hasattr(_args, "stage") else "stage1")
+    _stage_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path   = _stage_dir / f"student_{ckpt_name}_best.pth"
     metrics_log = LOGS_DIR / f"student_{ckpt_name}_metrics.csv"
     log_rows    = []
     best_composite = 0.0
@@ -1268,7 +1272,7 @@ def main() -> None:
         # Find best encoder
         if all_results:
             best = max(all_results,
-                       key=lambda r: r.get("test_test_composite", 0))
+                       key=lambda r: r.get("test_composite", 0))
             print(f"\n  Best encoder: {best['encoder']}")
             print(f"  Update STUDENT_BEST_VARIANT in config.py to: "
                   f"'{best['encoder']}'")
@@ -1284,7 +1288,7 @@ def main() -> None:
 
         if all_results:
             best = max(all_results,
-                       key=lambda r: r.get("test_test_composite", 0))
+                       key=lambda r: r.get("test_composite", 0))
             print(f"\n  Best mode: {best['mode']}")
             print(f"  Best composite: {best.get('best_composite','N/A')}")
 
