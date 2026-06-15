@@ -91,6 +91,7 @@ from torchvision import models
 cv2.setNumThreads(2)  # Force OpenCV to respect thread limits
 
 from image_utils import load_image_clahe, to_hsv
+from skimage.filters import frangi
 from config import (
     SEED, GLOBAL_MANIFEST, TIER1_MANIFEST, TIER1_MASKS_DIR, PSEUDO_DIR, REPORTS_DIR,
     TEACHER_CKPT_DIR, BOUNCER_CKPT_DIR, BOUNCER_DEPLOYED_VARIANT,
@@ -286,6 +287,12 @@ LAB_MLN_A_MIN   = 130   # MLN lesions trend slightly less red than MSV
 LAB_MLN_B_MIN   = 138   # MLN necrosis more yellow-brown
 LAB_GREEN_A_MAX = 121   # pixels greener than this are healthy tissue (raised 124→121: tighter exclusion preserves chlorotic-yellow pixels in a* 121–130 range)
 
+# Multi-scale morphological union threshold.
+# The large-kernel (1×15) opening is only added to the union when the
+# symptomatic area fraction exceeds this value. Below it, only the small
+# kernel (1×7) is used to preserve early-stage flecks.
+MULTISCALE_LARGE_KERNEL_THRESHOLD = 0.08   # 8% of leaf silhouette area
+
 def _normalize_L(lab: np.ndarray) -> np.ndarray:
     """Stretch L* channel to [0, 255] per-image to remove lighting/flash bias.
 
@@ -365,24 +372,121 @@ def _sev_to_cimmyt_grade(severity_pct: float, category: str) -> int:
     if severity_pct < 75:  return 4
     return 5
 
-def compute_lab_hard_mask(img_rgb: np.ndarray, silhouette: np.ndarray, category: str) -> np.ndarray:
-    """LAB hard binary symptom mask with directional morphological opening (Fix 1 + Fix 2).
+def _compute_vein_suppression(img_rgb: np.ndarray, silhouette: np.ndarray) -> np.ndarray:
+    """Frangi vesselness filter on L* channel to produce a vein suppression weight.
 
-    Changes vs v5:
-      MSV  — Gabor acts as a soft weight (multiply LAB mask by raw Gabor
-             response 0–1) rather than a hard AND gate; threshold result at
-             0.4 so strong LAB hits survive borderline Gabor.
-           — Directional opening kernel changed from (1, 15) → (1, 7): shorter
-             kernel preserves the broken, shorter streaks typical of MSV on
-             yellow maize.
-      MLN  — Added dark-necrosis condition: L_norm < 110 AND a* ≥ 125 captures
-             necrotic patches with low L* that the yellowing condition misses.
-           — Small (5×5) elliptical closing applied before the directional
-             opening to bridge fragmented necrotic patches that would otherwise
-             fall below FACTORY_R3_MIN_AREA_PX and be dropped.
-      HEALTHY — Uses stricter own thresholds (a ≥ 140, b ≥ 145) instead of
-             the MSV thresholds so normal warm-yellow coloration does not
-             trigger a non-zero mask before the area check.
+    Maize leaf veins are elongated ridge structures in the L* channel.
+    The Frangi filter responds strongly to these ridges and weakly to the
+    interveinal tissue where MSV chlorosis and MLN necrosis actually appear.
+
+    Returns a float32 suppression weight in [0, 1] where:
+      - values near 0 = strong vein response → suppress symptom mask here
+      - values near 1 = weak vein response  → keep symptom mask here
+
+    The weight is multiplied into the symptom mask after morphological processing,
+    so vein pixels are down-weighted without being hard-excluded (which would
+    create holes in severe images where veins and symptoms overlap).
+
+    Parameters tuned for maize leaf morphology:
+      sigmas=(0.5, 1.5, 3)  — captures fine veins (0.5) and mid veins (3)
+      black_ridges=False     — veins are bright ridges in L* (light on dark)
+    """
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
+    L = lab[:, :, 0].astype(np.float32)
+
+    # Frangi expects float in [0, 1]
+    L_norm = L / 255.0
+
+    # Compute vesselness — responds to elongated ridge structures (veins)
+    vesselness = frangi(
+        L_norm,
+        sigmas=(0.5, 1.5, 3.0),   # fine → mid vein scale range
+        black_ridges=False,         # veins are bright in L*
+        mode="reflect",
+    ).astype(np.float32)
+
+    # Normalise vesselness to [0, 1] within the leaf silhouette
+    leaf_vals = vesselness[silhouette == 1]
+    if leaf_vals.max() > 1e-6:
+        vesselness = vesselness / leaf_vals.max()
+
+    # Convert to suppression weight: high vesselness → low weight
+    # Use soft suppression (1 - v^0.5) rather than hard threshold so
+    # partial-vein pixels are smoothly reduced, not binary-excluded.
+    suppression_weight = 1.0 - np.sqrt(np.clip(vesselness, 0.0, 1.0))
+    suppression_weight = np.clip(suppression_weight, 0.0, 1.0)
+
+    # Outside silhouette: weight = 0 (already excluded by silhouette &)
+    suppression_weight *= silhouette.astype(np.float32)
+
+    return suppression_weight
+
+
+def _multiscale_symptom_union(lab_mask: np.ndarray,
+                               category: str,
+                               sym_area_frac: float = 0.0) -> np.ndarray:
+    """Multi-scale directional morphological opening and union.
+
+    Runs directional opening at two kernel sizes and combines them:
+      - Small kernel (1×7):  preserves early-stage flecks and short streaks
+      - Large kernel (1×15): targets late-stage long streaks
+
+    Union strategy:
+      - Always include small-kernel result (catches early flecks)
+      - Include large-kernel result only when symptomatic area is substantial
+        (> MULTISCALE_LARGE_KERNEL_THRESHOLD of leaf area), so late-stage
+        images get both scales while early-stage images avoid over-smoothing.
+
+    For MLN: applies a 5×5 elliptical closing before directional opening
+    to bridge fragmented necrotic patches (unchanged from existing logic).
+    """
+    if not lab_mask.any():
+        return lab_mask
+
+    # ── MLN: close fragmented necrotic patches first ─────────────────────────
+    if category == "MLN":
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        lab_mask = cv2.morphologyEx(lab_mask, cv2.MORPH_CLOSE, kernel_close)
+
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7))
+    kernel_large = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
+
+    opened_small = cv2.morphologyEx(lab_mask, cv2.MORPH_OPEN, kernel_small)
+
+    # Only add the large-kernel result when symptom area is already substantial.
+    # This avoids destroying early flecks on low-severity images.
+    if sym_area_frac > MULTISCALE_LARGE_KERNEL_THRESHOLD:
+        opened_large = cv2.morphologyEx(lab_mask, cv2.MORPH_OPEN, kernel_large)
+        result = cv2.bitwise_or(opened_small, opened_large)
+    else:
+        result = opened_small
+
+    return result
+
+
+def compute_lab_hard_mask(img_rgb: np.ndarray, silhouette: np.ndarray, category: str) -> np.ndarray:
+    """LAB hard binary symptom mask with Frangi vein suppression + multi-scale opening (v7).
+
+    Changes vs v6 (previous fixed version):
+      ALL   — Frangi vesselness filter (skimage.filters.frangi) applied to L*
+               channel after morphological opening to suppress vein-ridge pixels.
+               Veins score high in LAB a*/b* space on yellow maize and are the
+               primary source of false detections. Suppression is soft
+               (1 - sqrt(vesselness)) so partial-vein pixels are smoothly reduced.
+               HEALTHY uses the most aggressive threshold (0.6) since any surviving
+               symptom there is almost certainly a false positive.
+               MSV: threshold 0.5. MLN: threshold 0.35 (necrosis crosses veins).
+
+      ALL   — Single directional opening replaced with _multiscale_symptom_union():
+               small kernel (1×7) always runs; large kernel (1×15) added only when
+               symptomatic area fraction exceeds 8% of leaf area. This preserves
+               early-stage flecks on low-severity images while still capturing
+               late-stage long streaks.
+
+      MLN   — The 5×5 elliptical closing (bridges fragmented necrotic patches) is
+               now handled inside _multiscale_symptom_union() so the order is
+               always: close → open_small → union_large (if area > threshold)
+               → vein suppression.
     """
     lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
     lab = _normalize_L(lab)
@@ -448,11 +552,26 @@ def compute_lab_hard_mask(img_rgb: np.ndarray, silhouette: np.ndarray, category:
         weighted = lab_mask.astype(np.float32) * gabor_raw
         symptom = (weighted >= 0.4).astype(np.uint8)
 
-        # Directional opening: (1, 7) — shorter than the legacy (1, 15) so
-        # broken, shorter MSV streaks on yellow maize are not destroyed.
+        # ── Multi-scale directional opening (NEW) ────────────────────────────
+        # Replaces the single (1,7) opening with a two-scale union:
+        #   (1,7)  — preserves early-stage flecks and short broken streaks
+        #   (1,15) — added only when symptomatic area is already substantial
+        #            (> 8% leaf area), targeting late-stage long streaks.
+        # sym_area_frac computed from pre-opening symptom to decide scale.
+        leaf_px = max(silhouette.sum(), 1)
+        sym_area_frac = symptom.sum() / leaf_px
+        symptom = _multiscale_symptom_union(symptom, "MSV", sym_area_frac)
+
+        # ── Frangi vein suppression (NEW) ────────────────────────────────────
+        # Down-weight pixels where the Frangi vesselness filter detected vein
+        # ridges. Uses soft suppression (1 - sqrt(vesselness)) so partial-vein
+        # pixels are smoothly reduced rather than hard-excluded.
+        # Applied after morphological opening so vein suppression acts on the
+        # cleaned mask, not on raw noisy detections.
         if symptom.any():
-            kernel_dir = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 7))
-            symptom = cv2.morphologyEx(symptom, cv2.MORPH_OPEN, kernel_dir)
+            vein_weight = _compute_vein_suppression(img_rgb, silhouette)
+            symptom_f   = symptom.astype(np.float32) * vein_weight
+            symptom     = (symptom_f >= 0.5).astype(np.uint8)
 
     elif category == "MLN":
         # NEW-1: Otsu-guided adaptive threshold for MLN channels
@@ -482,32 +601,49 @@ def compute_lab_hard_mask(img_rgb: np.ndarray, silhouette: np.ndarray, category:
         symptom &= (~green_excl).astype(np.uint8)
         symptom &= silhouette
 
-        # NEW: small closing to bridge fragmented necrotic patches before the
-        # directional opening removes them as isolated specks.
-        if symptom.any():
-            kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-            symptom = cv2.morphologyEx(symptom, cv2.MORPH_CLOSE, kernel_close)
+        # ── Multi-scale directional opening with MLN closing (NEW) ───────────
+        # _multiscale_symptom_union handles the 5×5 elliptical closing
+        # (to bridge fragmented necrotic patches) before the two-scale opening.
+        # Large kernel (1×15) is added when symptomatic area > 8% leaf area.
+        leaf_px = max(silhouette.sum(), 1)
+        sym_area_frac = symptom.sum() / leaf_px
+        symptom = _multiscale_symptom_union(symptom, "MLN", sym_area_frac)
 
-        # Directional opening (same (1, 15) as before for MLN — streaks are
-        # longer and less broken than on yellow maize).
+        # ── Frangi vein suppression (NEW) ────────────────────────────────────
+        # MLN necrotic patches tend to cross veins more than MSV streaks do,
+        # so suppression is softer here — threshold lowered to 0.35 so that
+        # necrotic tissue overlapping vein pixels is not over-suppressed.
         if symptom.any():
-            kernel_dir = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
-            symptom = cv2.morphologyEx(symptom, cv2.MORPH_OPEN, kernel_dir)
+            vein_weight = _compute_vein_suppression(img_rgb, silhouette)
+            symptom_f   = symptom.astype(np.float32) * vein_weight
+            symptom     = (symptom_f >= 0.35).astype(np.uint8)
 
     else:
         # HEALTHY: use stricter own thresholds (a ≥ 140, b ≥ 145) so normal
         # warm-yellow leaf coloration does not trigger a non-zero mask before
         # the area check in process_single_image_cpu().
-        # The legacy code reused LAB_MSV_A_MIN / LAB_MSV_B_MIN here, which
-        # caused almost every yellow-maize healthy leaf to produce a non-zero
-        # mask, defeating the 2%-floor noise gate.
         symptom = ((a >= 140) | (b >= 145)).astype(np.uint8)
         symptom &= (~green_excl).astype(np.uint8)
         symptom &= silhouette
 
+        # ── Multi-scale opening (NEW) ─────────────────────────────────────────
+        # HEALTHY images rarely exceed the 8% threshold so in practice only
+        # the small (1×7) kernel fires — this is intentional and conservative.
+        leaf_px = max(silhouette.sum(), 1)
+        sym_area_frac = symptom.sum() / leaf_px
+        symptom = _multiscale_symptom_union(symptom, "HEALTHY", sym_area_frac)
+
+        # ── Frangi vein suppression (NEW) ────────────────────────────────────
+        # Most beneficial for HEALTHY: vein ridges on yellow maize score highly
+        # in LAB a*/b* space and are the primary source of false-positive
+        # symptom detections. Suppressing them is the single biggest improvement
+        # for HEALTHY noise gate accuracy.
+        # Higher threshold (0.6) than MSV/MLN — be aggressive at suppression
+        # since any surviving symptom on HEALTHY is almost certainly a false positive.
         if symptom.any():
-            kernel_dir = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
-            symptom = cv2.morphologyEx(symptom, cv2.MORPH_OPEN, kernel_dir)
+            vein_weight = _compute_vein_suppression(img_rgb, silhouette)
+            symptom_f   = symptom.astype(np.float32) * vein_weight
+            symptom     = (symptom_f >= 0.6).astype(np.uint8)
 
     return (symptom * 255).astype(np.uint8)
 
@@ -538,14 +674,19 @@ def compute_lab_soft_confidence(img_rgb: np.ndarray, silhouette: np.ndarray, cat
     if category == "MSV":
         conf_map *= _compute_gabor_combined_mask(img_rgb).astype(np.float32)
 
-    # BUG-2 FIX: use class-specific directional kernel sizes matching hard mask
-    # MSV: (1,7) — short broken streaks; MLN/HEALTHY: (1,15) — broader patterns
+    # BUG-2 FIX: use class-specific directional kernel sizes matching hard mask.
+    # NEW: use _multiscale_symptom_union for consistency with hard mask.
+    # Vein suppression applied as a soft multiply on the confidence map.
     if conf_map.max() > 0:
-        binary_hint = (conf_map > 0).astype(np.uint8)
-        kern_size   = (1, 7) if category == "MSV" else (1, 15)
-        kernel_dir  = cv2.getStructuringElement(cv2.MORPH_RECT, kern_size)
-        binary_hint = cv2.morphologyEx(binary_hint, cv2.MORPH_OPEN, kernel_dir)
-        conf_map *= binary_hint.astype(np.float32)
+        binary_hint   = (conf_map > 0).astype(np.uint8)
+        sym_area_frac = binary_hint.sum() / max(silhouette.sum(), 1)
+        binary_hint   = _multiscale_symptom_union(binary_hint, category, float(sym_area_frac))
+        conf_map     *= binary_hint.astype(np.float32)
+
+        # Frangi vein suppression — same logic as hard mask but applied as a
+        # soft multiply directly on the confidence values (no threshold).
+        vein_weight = _compute_vein_suppression(img_rgb, silhouette)
+        conf_map   *= vein_weight
 
     return np.clip(conf_map, 0.0, 1.0)
 
