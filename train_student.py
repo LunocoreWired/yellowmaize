@@ -482,16 +482,29 @@ def build_sample_list(split: str, mode: str) -> list[dict]:
         else:
             continue
 
-        # Get reliability weight
+        # Get reliability weight (written by factory_master.py, 0.0–1.0)
         wt_path = mode_dir / f"{stem}_weight.txt"
         weight  = float(wt_path.read_text().strip()) if wt_path.exists() else 1.0
 
+        # Guard: also skip CIMMYT grade == -1 if grade files are ever introduced
+        # into curriculum training. The -1 sentinel means the same as sev == -1.0
+        # (excluded / insufficient coverage). Filtering here ensures the sample
+        # list never contains grade=-1 even if a future curriculum loader reads it.
+        grade_path = mode_dir / f"{stem}_grade.txt"
+        if grade_path.exists():
+            try:
+                if int(grade_path.read_text().strip()) == -1:
+                    continue   # excluded — same reason as sev == -1.0
+            except ValueError:
+                pass   # malformed grade file — include anyway
+
         samples.append({
-            "source_path": str(src),
-            "stem":        stem,
-            "category":    cat,
-            "split":       split,
-            "weight":      weight,
+            "source_path":       str(src),
+            "stem":              stem,
+            "category":          cat,
+            "split":             split,
+            "weight":            weight,
+            "reliability_weight": weight,   # alias used by WeightedRandomSampler
         })
 
     return samples
@@ -564,6 +577,8 @@ def seg_metrics_from_stats(tp: float, fp: float,
 def train_one_epoch(model, loader, optimizer,
                     seg_criterion, cls_criterion,
                     unc_loss, device) -> float:
+    # NOTE: sev_criterion removed — MSE for severity is computed inline
+    # via F.mse_loss inside this function. Do not re-add as a parameter.
     model.train()
     total_loss = 0.0
     n_samples = 0
@@ -614,7 +629,8 @@ def train_one_epoch(model, loader, optimizer,
 
 @torch.no_grad()
 def validate(model, loader, seg_criterion, cls_criterion,
-             sev_criterion, unc_loss, device) -> dict:
+             unc_loss, device) -> dict:
+    # NOTE: sev_criterion removed — MSE for severity computed inline via F.mse_loss.
     model.eval()
 
     total_loss  = 0.0
@@ -990,7 +1006,10 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
 # TRAIN ONE VARIANT + MODE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def train_one(encoder_variant: str, factory_mode: str) -> dict:
+def train_one(encoder_variant: str, factory_mode: str, stage: int = 1) -> dict:
+    # FIX: stage passed as explicit parameter instead of imported from __main__.
+    # from __main__ import args is fragile — breaks if module is ever imported
+    # rather than run directly (e.g. during testing or ablation scripting).
     set_seeds(SEED)
 
     use_cbam  = "cbam" in encoder_variant
@@ -1018,11 +1037,17 @@ def train_one(encoder_variant: str, factory_mode: str) -> dict:
     val_ds   = StudentDataset(val_samples,   factory_mode, val_tf)
 
     # WeightedRandomSampler — ensures every batch has proportional MSV
-    # representation despite class imbalance (HEALTHY/MLN ~38%, MSV ~24%)
+    # representation despite class imbalance (HEALTHY/MLN ~38%, MSV ~24%).
+    # FIX: multiply class-balance weight by per-sample reliability_weight from
+    # factory output so high-coverage, high-confidence samples are proportionally
+    # favoured. Samples without a factory reliability_weight default to 1.0.
     class_counts  = {cls: sum(1 for s in train_samples if s["category"] == cls)
                      for cls in CLASSES}
-    sample_weights = [1.0 / max(class_counts.get(s["category"], 1), 1)
-                      for s in train_samples]
+    sample_weights = [
+        (1.0 / max(class_counts.get(s["category"], 1), 1))
+        * float(s.get("reliability_weight", 1.0))
+        for s in train_samples
+    ]
     sampler = torch.utils.data.WeightedRandomSampler(
         weights=sample_weights, num_samples=len(sample_weights), replacement=True)
 
@@ -1066,8 +1091,8 @@ def train_one(encoder_variant: str, factory_mode: str) -> dict:
     # Stage-specific checkpoint subdirectory prevents cross-stage overwrites.
     # Stage 1 (encoder ablation, mode_b fixed) → stage1/
     # Stage 2 (mode ablation, best encoder fixed) → stage2/
-    from __main__ import args as _args  # noqa: avoid circular; args set in main
-    _stage_dir = STUDENT_CKPT_DIR / (f"stage{_args.stage}" if hasattr(_args, "stage") else "stage1")
+    # FIX: use stage parameter directly — no __main__ import needed
+    _stage_dir = STUDENT_CKPT_DIR / f"stage{stage}"
     _stage_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path   = _stage_dir / f"student_{ckpt_name}_best.pth"
     metrics_log = LOGS_DIR / f"student_{ckpt_name}_metrics.csv"
@@ -1079,11 +1104,11 @@ def train_one(encoder_variant: str, factory_mode: str) -> dict:
     for epoch in range(1, STUDENT_PHASE1_EPOCHS + 1):
         train_loss = train_one_epoch(
             model, train_loader, optimizer,
-            seg_criterion, cls_criterion, sev_criterion,
+            seg_criterion, cls_criterion,
             unc_loss, DEVICE)
         val_m = validate(
             model, val_loader, seg_criterion, cls_criterion,
-            sev_criterion, unc_loss, DEVICE)
+            unc_loss, DEVICE)
         scheduler_p1.step()
 
         row = {
@@ -1157,11 +1182,11 @@ def train_one(encoder_variant: str, factory_mode: str) -> dict:
     for epoch in range(1, STUDENT_PHASE2_EPOCHS + 1):
         train_loss = train_one_epoch(
             model, train_loader, optimizer,
-            seg_criterion, cls_criterion, sev_criterion,
+            seg_criterion, cls_criterion,
             unc_loss, DEVICE)
         val_m = validate(
             model, val_loader, seg_criterion, cls_criterion,
-            sev_criterion, unc_loss, DEVICE)
+            unc_loss, DEVICE)
         scheduler_p2.step()
 
         row = {
@@ -1265,7 +1290,7 @@ def main() -> None:
         print(f"  Variants  : {STUDENT_VARIANTS}")
         print(f"  Mode      : mode_b (fixed for encoder ablation)")
         for variant in STUDENT_VARIANTS:
-            result = train_one(variant, "mode_b")
+            result = train_one(variant, "mode_b", stage=1)
             if result:
                 all_results.append(result)
 
@@ -1282,7 +1307,7 @@ def main() -> None:
         print(f"  Encoder   : {args.encoder}")
         print(f"  Modes     : {FACTORY_MODES}")
         for mode in FACTORY_MODES:
-            result = train_one(args.encoder, mode)
+            result = train_one(args.encoder, mode, stage=2)
             if result:
                 all_results.append(result)
 

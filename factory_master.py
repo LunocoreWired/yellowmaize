@@ -196,8 +196,10 @@ class FactoryDataset(Dataset):
             "img_rgb": img_rgb, "b_tensor": b_tensor, "t_tensor": t_tensor, "tier1_mask": tier1_mask
         }
 
-def safe_collate(batch):
-    """Custom collate to handle mixed tensors and variable-shape numpy arrays."""
+def factory_collate(batch):
+    """Custom collate to handle mixed tensors and variable-shape numpy arrays.
+    Named factory_collate (not safe_collate) to avoid shadowing scripts/safe_collate.py.
+    """
     batch = [b for b in batch if b is not None]
     if not batch: return None
     
@@ -205,7 +207,7 @@ def safe_collate(batch):
     elem = batch[0]
     for key in elem:
         if key in ("img_rgb", "tier1_mask"):
-            # Keep variable-shape arrays as Python lists
+            # Keep variable-shape arrays as Python lists (variable image dimensions)
             collated[key] = [d[key] for d in batch]
         elif isinstance(elem[key], torch.Tensor):
             collated[key] = torch.stack([d[key] for d in batch])
@@ -310,14 +312,25 @@ def _clahe_L(lab: np.ndarray, silhouette: np.ndarray) -> np.ndarray:
     More targeted than full-image CLAHE in load_image_clahe() — equalization
     is computed from leaf pixels only, so background tone does not shift the
     contrast curve for the leaf region.
+
+    FIX: tileGridSize is now proportional to image resolution.
+    Fixed (4,4) on a 3000×4000 field image produces tiles of ~750×1000px —
+    effectively global histogram equalization, defeating the local adaptation.
+    We target ~56px tiles (matching Student input resolution scale) clamped
+    to a minimum of 4 and rounded to even numbers for OpenCV compatibility.
     """
     lab = lab.copy()
     L = lab[:, :, 0]
     mask = (silhouette > 0)
     if mask.sum() < 100:
         return lab   # too few leaf pixels — skip
-    # Compute CLAHE on full L channel but using leaf-region histogram
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+
+    # Proportional tile size: target ~1/56th of each dimension, min 4, even numbers
+    h, w = L.shape[:2]
+    tile_h = max(4, (h // 56) // 2 * 2)   # round down to even
+    tile_w = max(4, (w // 56) // 2 * 2)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(tile_w, tile_h))
+
     L_eq = clahe.apply(L)
     # Apply equalization only within leaf mask — preserve background L*
     L_out = L.copy()
@@ -388,14 +401,20 @@ def compute_lab_hard_mask(img_rgb: np.ndarray, silhouette: np.ndarray, category:
         if len(leaf_a) > 100:
             otsu_thresh_a, _ = cv2.threshold(leaf_a, 0, 255,
                                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            a_min_eff = int(max(otsu_thresh_a, LAB_MSV_A_MIN))
+            # FIX: clamp Otsu with both floor AND ceiling.
+            # On heavily diseased images where most pixels are symptomatic,
+            # Otsu can drift very high (>148) and kill real signal.
+            # Floor: never go below LAB_MSV_A_MIN (133).
+            # Ceiling: never exceed 148 (~80% of 0-255 range above neutral 128).
+            a_min_eff = int(min(max(otsu_thresh_a, LAB_MSV_A_MIN), 148))
         else:
             a_min_eff = LAB_MSV_A_MIN
         leaf_b = b[silhouette == 1].astype(np.uint8)
         if len(leaf_b) > 100:
             otsu_thresh_b, _ = cv2.threshold(leaf_b, 0, 255,
                                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            b_min_eff = int(max(otsu_thresh_b, LAB_MSV_B_MIN))
+            # FIX: same floor+ceiling clamp for b* channel.
+            b_min_eff = int(min(max(otsu_thresh_b, LAB_MSV_B_MIN), 150))
         else:
             b_min_eff = LAB_MSV_B_MIN
 
@@ -437,12 +456,19 @@ def compute_lab_hard_mask(img_rgb: np.ndarray, silhouette: np.ndarray, category:
 
     elif category == "MLN":
         # NEW-1: Otsu-guided adaptive threshold for MLN channels
+        # FIX: clamp Otsu with both floor AND ceiling for MLN branch.
         leaf_a = a[silhouette == 1].astype(np.uint8)
-        a_min_eff = int(max(cv2.threshold(leaf_a, 0, 255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0], LAB_MLN_A_MIN)) if len(leaf_a) > 100 else LAB_MLN_A_MIN
+        if len(leaf_a) > 100:
+            otsu_a = cv2.threshold(leaf_a, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0]
+            a_min_eff = int(min(max(otsu_a, LAB_MLN_A_MIN), 146))
+        else:
+            a_min_eff = LAB_MLN_A_MIN
         leaf_b = b[silhouette == 1].astype(np.uint8)
-        b_min_eff = int(max(cv2.threshold(leaf_b, 0, 255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0], LAB_MLN_B_MIN)) if len(leaf_b) > 100 else LAB_MLN_B_MIN
+        if len(leaf_b) > 100:
+            otsu_b = cv2.threshold(leaf_b, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0]
+            b_min_eff = int(min(max(otsu_b, LAB_MLN_B_MIN), 150))
+        else:
+            b_min_eff = LAB_MLN_B_MIN
 
         # Primary yellowing / red-shift condition
         yellowing = (a >= a_min_eff) | (b >= b_min_eff)
@@ -708,6 +734,17 @@ def generate_factory_summary(report_rows):
         for cls in df["category"].unique():
             cls_df = df[df["category"] == cls]
             valid_sev = cls_df[sev_col].replace(-1.0, np.nan).dropna()
+
+            # FIX: warn when mode_a + HEALTHY combination may produce inflated
+            # false-positive rates. Otsu silhouette on yellow maize frequently
+            # captures background, inflating leaf_px and deflating sym_area_frac,
+            # allowing HEALTHY false positives to slip the three-band noise gate.
+            if mode == "mode_a" and cls == "HEALTHY":
+                pct_sym = round(100*(valid_sev > 0).mean(), 1) if len(valid_sev) else 0.0
+                if pct_sym > 15.0:
+                    print(f"  [WARN] mode_a / HEALTHY: {pct_sym:.1f}% of images have non-zero "
+                          f"severity. Otsu silhouette likely inflating leaf_px on yellow maize, "
+                          f"suppressing the noise gate. Use mode_b silhouette as reference.")
             
             summary_rows.append({
                 "mode": mode, "class": cls,
@@ -753,7 +790,7 @@ def main() -> None:
     teacher_model = load_teacher()
     
     dataset = FactoryDataset(trainval, tier1_fnames, test_fnames)
-    loader = DataLoader(dataset, batch_size=16, num_workers=4, pin_memory=True, collate_fn=safe_collate, prefetch_factor=2)
+    loader = DataLoader(dataset, batch_size=16, num_workers=4, pin_memory=True, collate_fn=factory_collate, prefetch_factor=2)
     
     report_rows = []
     t_start = time.time()
@@ -789,12 +826,23 @@ def main() -> None:
                 orig_h = int(batch["orig_h"][idx])
                 orig_w = int(batch["orig_w"][idx])
                 is_tier1 = bool(batch["is_tier1"][idx])
+
+                # FIX: explicitly squeeze to 2D before resize.
+                # Teacher output after sigmoid+squeeze(1) should be (H,W) but a
+                # stray channel dim from the model or autocast produces (1,H,W)
+                # or (H,W,1), both of which crash cv2.resize silently or corrupt.
                 prob = t_probs_batch[i_rel]
-                
+                prob = np.squeeze(prob)          # removes all size-1 dimensions
+                assert prob.ndim == 2, (
+                    f"Teacher prob map has unexpected shape {prob.shape} "
+                    f"after squeeze for image {batch['img_path'][idx]}"
+                )
+
                 if is_tier1 and batch["tier1_mask"][idx] is not None:
-                    soft_prob = cv2.resize(batch["tier1_mask"][idx], (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+                    tier1_raw = np.squeeze(batch["tier1_mask"][idx])
+                    soft_prob = cv2.resize(tier1_raw.astype(np.float32), (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
                 else:
-                    soft_prob = cv2.resize(prob, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+                    soft_prob = cv2.resize(prob.astype(np.float32), (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
                     
                 args = (batch["img_path"][idx], batch["stem"][idx], batch["category"][idx], 
                         is_tier1, orig_h, orig_w, batch["img_rgb"][idx], soft_prob, mode_dirs)
