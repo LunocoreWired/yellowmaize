@@ -81,6 +81,7 @@ from config import (
     STUDENT_PHASE2_PATIENCE,
     STUDENT_WEIGHT_DECAY, STUDENT_DROPOUT,
     STUDENT_CKPT_W_MIOU, STUDENT_CKPT_W_MSV_F1, STUDENT_CKPT_W_MLN_F1, STUDENT_CKPT_W_MAE,
+    STUDENT_CKPT_W_MSV_F1_EARLY, STUDENT_CKPT_W_MSV_F1_MID, STUDENT_CKPT_W_MSV_F1_SEVERE,
     STUDENT_MAX_SEVERITY,
     STUDENT_LABEL_SMOOTHING, ASYMMETRIC_PRIOR,
     STUDENT_VARIANTS, STUDENT_BEST_VARIANT, STUDENT_FACTORY_MODE,
@@ -396,6 +397,17 @@ class StudentDataset(Dataset):
             sev_raw = -1.0
         sev_norm = max(0.0, min(1.0, sev_raw / 100.0)) if sev_raw >= 0 else -1.0
 
+        # ── CIMMYT agronomic grade (written by factory_master._sev_to_cimmyt_grade) ──
+        # MSV: 1/3/5/7/9 ; MLN: 1-5 ; HEALTHY: 0 ; -1 = excluded/missing.
+        grade_path = self.mode_dir / f"{stem}_grade.txt"
+        if grade_path.exists():
+            try:
+                grade = int(grade_path.read_text().strip())
+            except Exception:
+                grade = -1
+        else:
+            grade = -1
+
         # ── Class label ─────────────────────────────────────────────────────
         cls_idx = CLASS_TO_IDX[category]
 
@@ -428,6 +440,7 @@ class StudentDataset(Dataset):
             "sev":       torch.tensor(max(sev_norm, 0.0), dtype=torch.float32),
             "weight":    torch.tensor(weight, dtype=torch.float32),
             "valid_sev": torch.tensor(sev_norm >= 0.0, dtype=torch.bool),
+            "grade":     torch.tensor(grade, dtype=torch.long),
         }
 
 
@@ -514,11 +527,78 @@ def build_sample_list(split: str, mode: str) -> list[dict]:
 # METRICS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def compute_composite_score(miou: float, msv_f1: float,
-                             mln_f1: float, norm_mae: float) -> float:
+def msv_grade_to_tier(grade: int) -> str | None:
+    """
+    Map a CIMMYT MSV grade (1/3/5/7/9) to its severity tier, aligned with
+    CIMMYT_MSV_BRACKETS in config.py:
+      grade 1-3 (<25% area)  → "early"  (clinically critical — early detection)
+      grade 3-5 (25-50%)     → "mid"
+      grade 5-9 (>50%)       → "severe"
+    Grade 3 and 5 sit on tier boundaries; assigned to the lower (earlier,
+    higher-priority) tier per CIMMYT_MSV_BRACKETS upper-exclusive convention.
+    Returns None for grade <= 0 (HEALTHY / excluded) — not an MSV sample.
+    """
+    if grade <= 0:
+        return None
+    if grade <= 3:
+        return "early"
+    if grade <= 5:
+        return "mid"
+    return "severe"
+
+
+def compute_msv_f1_by_tier(targets: list[int], preds: list[int],
+                            grades: list[int], msv_idx: int) -> dict:
+    """
+    Grade-stratified MSV F1 (CIMMYT-aligned), consuming STUDENT_CKPT_W_MSV_F1_EARLY/
+    MID/SEVERE from config.py. Surfaces early-stage MSV detection — the
+    clinically critical case — instead of letting it get averaged away in the
+    aggregate MSV F1 (see config.py STUDENT_CKPT_W_MSV_F1 comment, v8 P8).
+
+    A sample contributes to tier T's binary "is this early/mid/severe MSV"
+    task only if it's a genuine member of tier T (ground-truth MSV graded
+    into T — true positive/false negative side) or a true negative/false
+    positive for that task (i.e. not MSV at all, or MSV but in a *different*
+    tier AND mis-predicted as MSV — a real confusion). Samples that are MSV
+    in another tier and correctly predicted as MSV are excluded from this
+    tier's set entirely: they're neither a tier-T detection nor a tier-T
+    confusion, so counting them as a false positive here would wrongly
+    penalize the model for correctly spotting severe/mid MSV while scoring
+    the early tier.
+    """
+    tier_f1 = {}
+    for tier in ("early", "mid", "severe"):
+        y_true, y_pred = [], []
+        for t, p, g in zip(targets, preds, grades):
+            is_tier_member = (t == msv_idx) and (msv_grade_to_tier(g) == tier)
+            is_other_tier_msv_correct = (
+                t == msv_idx and msv_grade_to_tier(g) != tier and p == msv_idx
+            )
+            if is_other_tier_msv_correct:
+                continue  # not relevant to this tier's binary task
+            y_true.append(1 if is_tier_member else 0)
+            y_pred.append(1 if p == msv_idx else 0)
+        if any(y_true):
+            tier_f1[tier] = f1_score(y_true, y_pred, zero_division=0)
+        else:
+            tier_f1[tier] = 0.0
+    return tier_f1
+
+
+def compute_composite_score(miou: float, msv_f1_early: float, msv_f1_mid: float,
+                             msv_f1_severe: float, mln_f1: float,
+                             norm_mae: float) -> float:
     """
     TRAINING composite checkpoint criterion (used during training for checkpoint saving).
-    Formula: 0.40×mIoU + 0.35×MSV_F1 + 0.15×MLN_F1 + 0.10×(1−NormMAE)
+    Formula: 0.40×mIoU + 0.20×MSV_F1_early + 0.10×MSV_F1_mid + 0.05×MSV_F1_severe
+             + 0.15×MLN_F1 + 0.10×(1−NormMAE)
+
+    Grade-stratified MSV terms (v8 P8) replace the flat STUDENT_CKPT_W_MSV_F1
+    (now 0.00 — dead weight, see config.py), so early-stage MSV detection is
+    rewarded ~4x more per-tier than the severe tier, since early detection is
+    the clinically actionable case and severe MSV is visually unambiguous
+    even to a weak model. Sum of MSV tier weights + flat weight == 0.35,
+    preserving the original checkpoint-weight budget split with mIoU/MLN/MAE.
 
     NOTE: This is the QUALITY composite — optimised for segmentation + classification
     accuracy during training. The MOBILE composite (which adds speed, ROC-AUC, and
@@ -527,10 +607,13 @@ def compute_composite_score(miou: float, msv_f1: float,
         mobile_composite = MSV_F1×0.32 + MSV_ROC_AUC×0.18 + mIoU×0.18
                          + speed×0.16 + MLN_F1×0.08 + sev×0.05 + size×0.03
     """
-    return (STUDENT_CKPT_W_MIOU   * miou
-          + STUDENT_CKPT_W_MSV_F1 * msv_f1
-          + STUDENT_CKPT_W_MLN_F1 * mln_f1
-          + STUDENT_CKPT_W_MAE    * (1.0 - norm_mae))
+    return (STUDENT_CKPT_W_MIOU         * miou
+          + STUDENT_CKPT_W_MSV_F1_EARLY * msv_f1_early
+          + STUDENT_CKPT_W_MSV_F1_MID   * msv_f1_mid
+          + STUDENT_CKPT_W_MSV_F1_SEVERE * msv_f1_severe
+          + STUDENT_CKPT_W_MSV_F1       * 0.0  # retained at 0.0 — see config.py note
+          + STUDENT_CKPT_W_MLN_F1       * mln_f1
+          + STUDENT_CKPT_W_MAE          * (1.0 - norm_mae))
 
 
 def seg_stats_from_logits(logits: torch.Tensor,
@@ -649,6 +732,7 @@ def validate(model, loader, seg_criterion, cls_criterion,
     n_samples    = 0
     all_cls_preds   = []
     all_cls_targets = []
+    all_grades      = []
 
     for batch in loader:
         if batch is None:
@@ -659,6 +743,7 @@ def validate(model, loader, seg_criterion, cls_criterion,
         sev_tgt  = batch["sev"].to(device)
         weights  = batch["weight"].to(device)
         valid_sv = batch["valid_sev"].to(device)
+        grades   = batch["grade"]
 
         seg_logits, cls_out, sev_out = model(imgs)
 
@@ -701,6 +786,7 @@ def validate(model, loader, seg_criterion, cls_criterion,
         cls_tgts  = cls_tgt.cpu().numpy().tolist()
         all_cls_preds.extend(cls_preds)
         all_cls_targets.extend(cls_tgts)
+        all_grades.extend(grades.numpy().tolist())
 
     # Classification report — per-class P/R/F1, macro, weighted, MCC
     report  = classification_report(
@@ -732,7 +818,18 @@ def validate(model, loader, seg_criterion, cls_criterion,
     norm_mae  = sev_mae / STUDENT_MAX_SEVERITY
 
     mln_f1    = report.get("MLN", {}).get("f1-score", 0.0)
-    composite = compute_composite_score(seg0["iou"], msv_f1, mln_f1, norm_mae)
+
+    # CIMMYT grade-stratified MSV F1 (early/mid/severe) — see config.py
+    # STUDENT_CKPT_W_MSV_F1_EARLY/MID/SEVERE.
+    msv_idx = CLASSES.index("MSV")
+    msv_tier_f1 = compute_msv_f1_by_tier(
+        all_cls_targets, all_cls_preds, all_grades, msv_idx)
+
+    composite = compute_composite_score(
+        seg0["iou"],
+        msv_tier_f1["early"], msv_tier_f1["mid"], msv_tier_f1["severe"],
+        mln_f1, norm_mae,
+    )
 
     return {
         "loss":         total_loss / max(n_samples, 1),
@@ -747,6 +844,10 @@ def validate(model, loader, seg_criterion, cls_criterion,
         # Classification
         "cls_acc":      cls_acc,  "msv_f1":     msv_f1,  "mln_f1": mln_f1,
         "macro_f1":     macro_f1, "weighted_f1":weighted_f1, "mcc": mcc,
+        # CIMMYT grade-stratified MSV F1
+        "msv_f1_early":  msv_tier_f1["early"],
+        "msv_f1_mid":    msv_tier_f1["mid"],
+        "msv_f1_severe": msv_tier_f1["severe"],
         # Severity regression
         "sev_mae":      sev_mae,  "sev_mse":    sev_mse,
         "sev_rmse":     sev_rmse, "sev_mape":   sev_mape,
@@ -798,6 +899,7 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
     all_preds    = []
     all_targets  = []
     all_probs    = []   # softmax probabilities for ROC-AUC
+    all_grades   = []
 
     for batch in test_loader:
         if batch is None:
@@ -807,6 +909,7 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
         cls_tgt  = batch["cls"].to(device)
         sev_tgt  = batch["sev"].to(device)
         valid_sv = batch["valid_sev"].to(device)
+        grades   = batch["grade"]
 
         seg_logits, cls_out, sev_out = model(imgs)
 
@@ -832,6 +935,7 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
         all_probs.extend(probs.tolist())
         all_preds.extend(cls_out.argmax(1).cpu().numpy().tolist())
         all_targets.extend(cls_tgt.cpu().numpy().tolist())
+        all_grades.extend(grades.numpy().tolist())
 
     t_eval_end = time.time()
     eval_duration_s = round(t_eval_end - t_eval_start, 1)
@@ -864,8 +968,16 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
     msv_f1_test = report.get("MSV", {}).get("f1-score", 0.0)
     mln_f1_test = report.get("MLN", {}).get("f1-score", 0.0)
     norm_mae_test = sev_mae / STUDENT_MAX_SEVERITY
+
+    # CIMMYT grade-stratified MSV F1 (early/mid/severe)
+    msv_idx_t = CLASSES.index("MSV")
+    msv_tier_f1_test = compute_msv_f1_by_tier(
+        all_targets, all_preds, all_grades, msv_idx_t)
+
     composite = compute_composite_score(
-        seg0["iou"], msv_f1_test, mln_f1_test, norm_mae_test,
+        seg0["iou"],
+        msv_tier_f1_test["early"], msv_tier_f1_test["mid"], msv_tier_f1_test["severe"],
+        mln_f1_test, norm_mae_test,
     )
 
     # ROC-AUC: MSV-vs-rest, per-class, and macro OvR
@@ -937,6 +1049,10 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
         "msv_prec":         round(report.get("MSV",{}).get("precision",0),    4),
         "msv_rec":          round(report.get("MSV",{}).get("recall",0),       4),
         "msv_f1":           round(report.get("MSV",{}).get("f1-score",0),     4),
+        # MSV — CIMMYT grade-stratified F1 (early=grade1-3, mid=3-5, severe=5-9)
+        "msv_f1_early":     round(msv_tier_f1_test["early"],  4),
+        "msv_f1_mid":       round(msv_tier_f1_test["mid"],    4),
+        "msv_f1_severe":    round(msv_tier_f1_test["severe"], 4),
         "mln_prec":         round(report.get("MLN",{}).get("precision",0),    4),
         "mln_rec":          round(report.get("MLN",{}).get("recall",0),       4),
         "mln_f1":           round(report.get("MLN",{}).get("f1-score",0),     4),
@@ -989,6 +1105,8 @@ def evaluate_test_split(model, mode: str, variant: str, device) -> dict:
           f"MCC {results['mcc']:.4f}  Macro-F1 {results['macro_f1']:.4f}")
     print(f"  MSV (primary):   Prec {results['msv_prec']:.4f}  "
           f"Rec {results['msv_rec']:.4f}  F1 {results['msv_f1']:.4f}")
+    print(f"  MSV by grade:    Early {results['msv_f1_early']:.4f}  "
+          f"Mid {results['msv_f1_mid']:.4f}  Severe {results['msv_f1_severe']:.4f}")
     print(f"  Severity:        MAE {results['sev_mae_pct']:.2f}%  "
           f"RMSE {results['sev_rmse_pct']:.2f}%  R² {results['sev_r2']:.4f}")
     print(f"  Composite:       {results['composite']:.4f}")
@@ -1122,6 +1240,9 @@ def train_one(encoder_variant: str, factory_mode: str, stage: int = 1) -> dict:
             "sym_dice":    round(val_m["sym_dice"],        4),
             "cls_acc":     round(val_m["cls_acc"],         4),
             "msv_f1":      round(val_m["msv_f1"],          4),
+            "msv_f1_early": round(val_m.get("msv_f1_early", 0.0), 4),
+            "msv_f1_mid":   round(val_m.get("msv_f1_mid", 0.0),   4),
+            "msv_f1_severe":round(val_m.get("msv_f1_severe", 0.0),4),
             "mln_f1":      round(val_m.get("mln_f1", 0.0),   4),
             "macro_f1":    round(val_m["macro_f1"],        4),
             "mcc":         round(val_m["mcc"],             4),
@@ -1200,6 +1321,9 @@ def train_one(encoder_variant: str, factory_mode: str, stage: int = 1) -> dict:
             "sym_dice":    round(val_m["sym_dice"],        4),
             "cls_acc":     round(val_m["cls_acc"],         4),
             "msv_f1":      round(val_m["msv_f1"],          4),
+            "msv_f1_early": round(val_m.get("msv_f1_early", 0.0), 4),
+            "msv_f1_mid":   round(val_m.get("msv_f1_mid", 0.0),   4),
+            "msv_f1_severe":round(val_m.get("msv_f1_severe", 0.0),4),
             "mln_f1":      round(val_m.get("mln_f1", 0.0),   4),
             "macro_f1":    round(val_m["macro_f1"],        4),
             "mcc":         round(val_m["mcc"],             4),

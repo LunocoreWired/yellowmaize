@@ -137,6 +137,8 @@ from config import (
     BOUNCER_DEPLOYED_VARIANT,
     BOUNCER_IMG_SIZE,
     BOUNCER_THRESHOLD,
+    CIMMYT_MLN_BRACKETS,
+    CIMMYT_MSV_BRACKETS,
     CLAHE_A_CLIP_LIMIT,
     CLASSES,
     FACTORY_MIN_LEAF_COVERAGE,
@@ -634,6 +636,10 @@ def _margin_erosion_mask(silhouette: np.ndarray) -> np.ndarray:
 def _sev_to_cimmyt_grade(severity_pct: float, category: str) -> int:
     """Map continuous severity % to CIMMYT published agronomic grade.
 
+    Brackets are read from config.py (CIMMYT_MSV_BRACKETS / CIMMYT_MLN_BRACKETS)
+    so config remains the single source of truth — see config.py's
+    "CIMMYT SEVERITY GRADING" section for the published bracket definitions.
+
     MSV scale (CIMMYT, 1–9):
       1=<5%  3=5–25%  5=25–50%  7=50–75%  9=>75%
     MLN scale (CIMMYT, 1–5):
@@ -645,26 +651,14 @@ def _sev_to_cimmyt_grade(severity_pct: float, category: str) -> int:
         return -1
     if category == "HEALTHY":
         return 0
-    if category == "MSV":
-        if severity_pct < 5:
-            return 1
-        if severity_pct < 25:
-            return 3
-        if severity_pct < 50:
-            return 5
-        if severity_pct < 75:
-            return 7
-        return 9
-    # MLN
-    if severity_pct < 10:
-        return 1
-    if severity_pct < 25:
-        return 2
-    if severity_pct < 50:
-        return 3
-    if severity_pct < 75:
-        return 4
-    return 5
+    brackets = CIMMYT_MSV_BRACKETS if category == "MSV" else CIMMYT_MLN_BRACKETS
+    for lo, hi, grade in brackets:
+        if lo <= severity_pct < hi:
+            return grade
+    # Severity at or beyond the last bracket's upper bound (e.g. exactly 100
+    # with an exclusive 101 ceiling never hit due to float edge cases) —
+    # fall back to the highest defined grade.
+    return brackets[-1][2]
 
 
 def _compute_raw_vesselness(lab_raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
