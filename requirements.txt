@@ -40,6 +40,10 @@ onnxruntime>=1.16.0
 # onnx-tf>=1.10.0
 # tensorflow>=2.13.0
 
+# ── Label Studio brush-tool decoding (optional — only needed if symptom masks
+#    were annotated with the brush tool instead of polygon in train_symptom_model.py)
+# label-studio-converter>=0.0.55
+
 # ── Anomaly detection (optional — only for PatchCore Bouncer baseline) ────────
 anomalib>=1.0.0          # PatchCore Bouncer baseline (optional but recommended)
 

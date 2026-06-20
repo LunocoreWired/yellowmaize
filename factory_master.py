@@ -2,6 +2,28 @@
 factory_master.py — Phase 4: Pseudo-Label Generation (Optimized & Fixed)
 Hardware Target: Ryzen 5 3600X (12T) / RTX 5060 (8GB) / 16GB RAM / WSL2
 
+Change-log (v8 → v9):
+  REPL-1 — Symptom source replaced: LAB/HSV color thresholding (compute_lab_hard_mask
+            / compute_lab_soft_confidence) was structurally unable to separate
+            early chlorosis from healthy yellow-maize tissue, or tip-burn from
+            MLN necrosis, after eight rounds of threshold tuning (v1->v8) — each
+            fix traded one failure mode for another rather than converging.
+            A Symptom Teacher (EfficientNet-B2 UNet, train_symptom_model.py)
+            trained on ~400-500 human-verified polygon masks now supplies the
+            symptom probability map for ALL modes when SYMPTOM_TEACHER_DEPLOYED
+            is True (config.py) and checkpoints exist. LAB functions are kept
+            in this file UNCHANGED as automatic fallback (checkpoints missing)
+            and as an explicit comparison source (FACTORY_SYMPTOM_COMPARE_LAB).
+  REPL-2 — Symptom Teacher input is RGB + a HealthyAE reconstruction-error map
+            (4 channels) — the AE is trained on HEALTHY images only and supplies
+            a lighting-invariant anomaly prior the LAB pipeline never had.
+            Ground truth for the Symptom Teacher is always the human mask, so
+            it cannot inherit LAB's systematic biases the way a model trained
+            on LAB-derived pseudo-labels would.
+  REPL-3 — predict_symptom_mask() output is restricted to the leaf silhouette
+            (sil) before use, matching the spatial constraint LAB masks already
+            had implicitly (LAB functions take sil as an argument).
+
 Change-log (v4 → v5):
   Fix 1  — LAB-based symptom detection replaces HSV (compute_lab_hard_mask /
             compute_lab_soft_confidence). L* normalised per-image; a*/b*
@@ -168,6 +190,8 @@ from config import (
     REPORTS_DIR,
     SEED,
     STUDENT_IMG_SIZE,
+    SYMPTOM_TEACHER_DEPLOYED,
+    FACTORY_SYMPTOM_COMPARE_LAB,
     TEACHER_CKPT_DIR,
     TEACHER_DEPLOYED_VARIANT,
     TEACHER_IMG_SIZE,
@@ -177,6 +201,14 @@ from config import (
 )
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Module-level singletons for the Symptom Teacher (Phase 3b). Populated by
+# load_symptom_models() once in main() before the ThreadPoolExecutor starts;
+# read (never written) by process_single_image_cpu() across all worker
+# threads. None/None means "use the legacy LAB pipeline" — checked once per
+# call rather than per-pixel so the fallback costs nothing when disabled.
+_SYMPTOM_MODEL = None
+_AE_MODEL      = None
 
 # Transforms
 TEACHER_INFER_TF = A.Compose(
@@ -255,6 +287,50 @@ def load_teacher() -> nn.Module:
     model.load_state_dict(ckpt["model_state"])
     model.to(DEVICE).eval()
     return model
+
+
+def load_symptom_models() -> tuple[object | None, object | None]:
+    """
+    Load the Symptom Teacher + HealthyAE (Phase 3b, train_symptom_model.py)
+    if SYMPTOM_TEACHER_DEPLOYED is True and checkpoints exist.
+
+    Returns (symptom_model, ae_model), both None if unavailable — callers
+    must fall back to the legacy LAB pipeline in that case. Import is local
+    (not at module top) so factory_master.py and train_symptom_model.py can
+    import from each other without a circular-import error: the only thing
+    needed here is the loader + inference helper, both pure functions of
+    the checkpoint file.
+
+    NOTE: predict_symptom_mask() runs PyTorch GPU inference and is called
+    per-image from the CPU ThreadPoolExecutor workers in the main loop
+    below — this is correctness-safe (CUDA calls across Python threads
+    serialize automatically) but is NOT batched the way Bouncer/Teacher
+    inference is, so symptom inference is the per-image latency floor when
+    this is enabled. Acceptable for 150k images on the strength of the
+    accuracy gain over LAB; revisit with batched inference if throughput
+    becomes the bottleneck.
+    """
+    if not SYMPTOM_TEACHER_DEPLOYED:
+        return None, None
+    try:
+        from train_symptom_model import load_symptom_teacher, load_healthy_ae
+    except ImportError as e:
+        print(f"  [WARN] Could not import train_symptom_model.py: {e}")
+        print("         Falling back to legacy LAB symptom detection.")
+        return None, None
+
+    ae_model = load_healthy_ae()
+    symptom_model = load_symptom_teacher()
+
+    if symptom_model is None or ae_model is None:
+        print("  [INFO] Symptom Teacher / HealthyAE checkpoint(s) not found.")
+        print("         Run train_symptom_model.py first, or set")
+        print("         SYMPTOM_TEACHER_DEPLOYED = False in config.py to use")
+        print("         the legacy LAB pipeline intentionally.")
+        return None, None
+
+    print("  Symptom Teacher loaded — replacing LAB/HSV symptom detection.")
+    return symptom_model, ae_model
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1447,17 +1523,42 @@ def process_single_image_cpu(args):
         mode = mode.strip()  # Safeguard against OCR spaces in config
         sil = SIL_MAP[mode]
 
-        # Fix 1: use LAB-based detection for all modes (HSV kept as fallback).
-        # mode_d → soft confidence map; all others → hard binary mask.
-        symptom = (
-            compute_lab_soft_confidence(
-                img_rgb, sil, category, lab_raw=lab_raw, vein_cache=vein_cache
+        # Fix 1 (v8 LAB): use LAB-based detection for all modes (HSV kept as
+        # fallback). mode_d -> soft confidence map; all others -> hard mask.
+        #
+        # v9 (Phase 3b): when the Symptom Teacher is deployed (module-level
+        # _SYMPTOM_MODEL / _AE_MODEL populated by load_symptom_models() in
+        # main()), it REPLACES the LAB pipeline as the symptom source for
+        # ALL modes, not just mode_d — predict_symptom_mask() returns a
+        # float32 [0,1] probability map at original resolution, the exact
+        # same contract as compute_lab_soft_confidence(), so mode_d uses it
+        # directly and the hard-mask modes (a/b/c) threshold it at 0.5.
+        # This was the structural fix for the under/over-masking that eight
+        # rounds of LAB threshold tuning (v1->v8) could not resolve: a model
+        # trained on ~400-500 human-verified masks learns the chlorosis/
+        # necrosis decision boundary directly instead of approximating it
+        # with fixed color-space cutoffs. LAB remains as automatic fallback
+        # if checkpoints are missing, and as an explicit comparison source
+        # when FACTORY_SYMPTOM_COMPARE_LAB is True.
+        if _SYMPTOM_MODEL is not None and _AE_MODEL is not None:
+            from train_symptom_model import predict_symptom_mask
+            symptom_prob = predict_symptom_mask(_SYMPTOM_MODEL, _AE_MODEL, img_rgb)
+            symptom_prob = symptom_prob * sil.astype(np.float32)  # restrict to leaf silhouette
+            symptom = (
+                symptom_prob
+                if mode == "mode_d"
+                else (symptom_prob >= 0.5).astype(np.uint8) * 255
             )
-            if mode == "mode_d"
-            else compute_lab_hard_mask(
-                img_rgb, sil, category, lab_raw=lab_raw, vein_cache=vein_cache
+        else:
+            symptom = (
+                compute_lab_soft_confidence(
+                    img_rgb, sil, category, lab_raw=lab_raw, vein_cache=vein_cache
+                )
+                if mode == "mode_d"
+                else compute_lab_hard_mask(
+                    img_rgb, sil, category, lab_raw=lab_raw, vein_cache=vein_cache
+                )
             )
-        )
 
         # Fix 3 (conditional): zero symptom signal for HEALTHY images.
         # Rationale: confirmed-HEALTHY labels have no annotated disease by
@@ -1681,6 +1782,21 @@ def main() -> None:
     print("\n  Loading models to RTX 5060...")
     bouncer_model, bouncer_thresh = load_bouncer()
     teacher_model = load_teacher()
+
+    # v9 (Phase 3b): load Symptom Teacher + HealthyAE into module-level
+    # singletons so process_single_image_cpu() (run via ThreadPoolExecutor
+    # below) can read them without re-loading checkpoints per call. Threads
+    # share the parent process's memory, unlike ProcessPoolExecutor workers,
+    # so this is the cheapest correct way to make the models visible there.
+    global _SYMPTOM_MODEL, _AE_MODEL
+    _SYMPTOM_MODEL, _AE_MODEL = load_symptom_models()
+    if _SYMPTOM_MODEL is None:
+        print("  Symptom source: legacy LAB/HSV pipeline (v8)")
+    else:
+        print("  Symptom source: Symptom Teacher (v9, human-supervised)")
+        if FACTORY_SYMPTOM_COMPARE_LAB:
+            print("  FACTORY_SYMPTOM_COMPARE_LAB=True — LAB will also be computed "
+                  "for comparison logging (slower).")
 
     dataset = FactoryDataset(trainval, tier1_fnames, test_fnames)
     loader = DataLoader(
