@@ -234,6 +234,36 @@ HSV_MLN_RANGES = [
 ]
 
 # ══════════════════════════════════════════════════════════════════════════════
+# FACTORY — LAB SYMPTOM DETECTION (v8 additions: Frangi / morphology / Otsu / margin)
+# ══════════════════════════════════════════════════════════════════════════════
+# Consumed by factory_master.py's LAB-based symptom-detection helpers:
+# _compute_vein_suppression(), _multiscale_symptom_union(), _otsu_2d(),
+# _margin_erosion_mask(), compute_lab_hard_mask(), compute_lab_soft_confidence().
+# Per-class Frangi suppression thresholds (HEALTHY: 0.6, MSV: 0.5, MLN: 0.35)
+# remain hardcoded in factory_master.py — unchanged by v8.
+FRANGI_SIGMAS = (0.5, 1.5, 3.0, 6.0, 10.0)
+# Widened from (0.5, 1.5, 3.0): the midrib (~10-30px wide) under-responded at
+# the old range and is the primary source of false positives on yellow maize.
+# Reused for the a*-channel Frangi pass (Priority 7 — no separate constant).
+
+MORPH_OPEN_ANGLES = [0, 30, 60, 90, 120, 150]  # degrees; 0=horizontal, 90=vertical
+# MSV branch of _multiscale_symptom_union() only: unions rotated-kernel
+# opening responses across these angles instead of a single fixed vertical
+# kernel, so streaks survive regardless of leaf rotation in-frame.
+# Not used by the MLN branch (blob-like necrosis, not streak-like).
+
+OTSU_2D_BIN_COUNT = 64  # histogram bins per axis for 2D joint (a*, b*) Otsu
+# Falls back to the independent 1D Otsu per channel when leaf pixel count < 200
+# (too few pixels for a stable 2D histogram).
+
+MARGIN_EROSION_FRAC = 0.08  # erode leaf perimeter by 8% of sqrt(leaf_area) px
+# MLN branch only (compute_lab_hard_mask / compute_lab_soft_confidence) — leaf
+# tip burn (marginal chlorosis/necrosis) is phenotypically similar to MLN but
+# a distinct physiological response, and the #2 MLN false-positive source.
+# Erosion radius = int(MARGIN_EROSION_FRAC * sqrt(silhouette.sum())), applied
+# to the convex hull of the leaf silhouette. Not applied to MSV or HEALTHY.
+
+# ══════════════════════════════════════════════════════════════════════════════
 # STUDENT
 # ══════════════════════════════════════════════════════════════════════════════
 STUDENT_IMG_SIZE        = 224
@@ -267,6 +297,19 @@ STUDENT_CKPT_W_MSV_F1_MID    = 0.10  # CIMMYT grade 3-5 (25-50% area)
 STUDENT_CKPT_W_MSV_F1_SEVERE = 0.05  # CIMMYT grade 5-9 (>50% area)
 STUDENT_MAX_SEVERITY = 100.0
 STUDENT_LABEL_SMOOTHING = 0.10
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GABOR FILTER PARAMETERS
+# ══════════════════════════════════════════════════════════════════════════════
+GABOR_KERNEL_SIZE = 21
+GABOR_SIGMA      = 4.0
+GABOR_LAMBDA     = 10.0   # authoritative — used directly in factory_master.py
+GABOR_GAMMA      = 0.5
+GABOR_PSI        = 0
+GABOR_NORMS      = [0.1, 0.2, 0.3, 0.4]
+GABOR_THETAS     = [0, np.pi/4, np.pi/2, 3*np.pi/4]
+GABOR_THRESHOLD  = 0.3
+GABOR_A_CHANNEL_WEIGHT = 0.4  # v8 P3: weight of a*-channel Gabor in weighted sum with grayscale Gabor (GABOR_THRESHOLD unchanged)
 
 # Asymmetric label smoothing prior matrix
 # Rows = true class [HEALTHY, MSV, MLN]
@@ -464,6 +507,39 @@ SYMPTOM_TEACHER_DEPLOYED       = True
 FACTORY_SYMPTOM_COMPARE_LAB    = False   # if True, also computes legacy LAB
                                           # mask and logs IoU(LAB, SymptomTeacher)
                                           # per image for thesis comparison figures
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CIMMYT SEVERITY GRADING
+# ══════════════════════════════════════════════════════════════════════════════
+# Published agronomic severity scales (CIMMYT) mapping continuous severity %
+# (from factory_master.py's pixel-coverage calculation) to a discrete grade.
+# Consumed by factory_master._sev_to_cimmyt_grade(), which logs the grade
+# alongside continuous severity for every pseudo-labeled image, and by
+# train_student.py's grade-stratified MSV F1 (STUDENT_CKPT_W_MSV_F1_EARLY/
+# MID/SEVERE, see STUDENT section above) — the v8 P8 fix that surfaces
+# early-stage MSV detection instead of letting it average away into the
+# aggregate MSV F1. Brackets are (lower_inclusive, upper_exclusive, grade).
+#
+# MSV scale (CIMMYT, 1-9 — odd-numbered, 5 grades):
+#   1=<5%  3=5-25%  5=25-50%  7=50-75%  9=>75%
+CIMMYT_MSV_BRACKETS = [
+    (0,   5,   1),
+    (5,   25,  3),
+    (25,  50,  5),
+    (50,  75,  7),
+    (75,  101, 9),
+]
+# MLN scale (CIMMYT, 1-5 — 5 grades):
+#   1=<10%  2=10-25%  3=25-50%  4=50-75%  5=>75%
+CIMMYT_MLN_BRACKETS = [
+    (0,   10,  1),
+    (10,  25,  2),
+    (25,  50,  3),
+    (50,  75,  4),
+    (75,  101, 5),
+]
+# HEALTHY images are always grade 0 (no disease) — handled directly in
+# _sev_to_cimmyt_grade(), not via a bracket table.
 
 # ══════════════════════════════════════════════════════════════════════════════
 # EVALUATION

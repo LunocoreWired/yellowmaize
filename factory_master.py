@@ -23,6 +23,14 @@ Change-log (v8 → v9):
   REPL-3 — predict_symptom_mask() output is restricted to the leaf silhouette
             (sil) before use, matching the spatial constraint LAB masks already
             had implicitly (LAB functions take sil as an argument).
+  FIX-1  — compute_lab_soft_confidence() MLN branch: added Otsu-adaptive
+            thresholding (matching compute_lab_hard_mask()'s MLN branch).
+            Fixed threshold divergence between mode_d and modes b/c under
+            variable lighting — corrupted the cross-mode ablation study.
+  FIX-2  — compute_lab_soft_confidence() MLN branch: added dark necrosis soft
+            confidence channel `(L* < 110) & (a* >= 125)` to match the hard
+            mask's `dark_necrosis` gate. Dark necrotic patches now score
+            non-zero confidence in mode_d, consistent with modes b/c.
 
 Change-log (v4 → v5):
   Fix 1  — LAB-based symptom detection replaces HSV (compute_lab_hard_mask /
@@ -1286,6 +1294,21 @@ def compute_lab_soft_confidence(
                      enhance local chromatic contrast of early MSV streaks.
       P6 (MLN-3)   — Convex-hull margin erosion mask applied to MLN branch
                      only to suppress tip-burn false positives.
+
+    v8 -> v9 (bug fixes — mode_d / mode_b/c cross-mode parity):
+      FIX-1 (MLN)  — MLN branch now uses Otsu-adaptive thresholding (1D,
+                     clamped to floor LAB_MLN_A_MIN/B_MIN and ceiling 146/150)
+                     matching compute_lab_hard_mask()'s MLN branch exactly.
+                     Previously used fixed LAB_MLN_A_MIN/B_MIN — modes b/c
+                     and mode_d saw different adaptive thresholds on the same
+                     image under variable lighting, corrupting the cross-mode
+                     ablation study.
+      FIX-2 (MLN)  — Added dark necrosis soft confidence channel to match
+                     compute_lab_hard_mask()'s `(L_norm < 110) & (a >= 125)`
+                     gate. Dark necrotic patches scored near-zero confidence
+                     in mode_d but non-zero in modes b/c — same ablation
+                     corruption. Soft version ramps linearly: darker → higher
+                     confidence (capped at 1.0).
     """
     if lab_raw is None:
         lab_raw = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2LAB)
@@ -1327,7 +1350,27 @@ def compute_lab_soft_confidence(
             else:
                 b_min = float(LAB_MSV_B_MIN)
     elif category == "MLN":
-        a_min, b_min = float(LAB_MLN_A_MIN), float(LAB_MLN_B_MIN)
+        # BUG FIX (v8→v9): MLN branch now uses the same Otsu-adaptive thresholding
+        # as compute_lab_hard_mask() so mode_d soft confidence and modes b/c hard
+        # mask see the same adaptive threshold. Previously this was fixed at
+        # LAB_MLN_A_MIN / LAB_MLN_B_MIN, causing the soft and hard mask paths to
+        # diverge under variable lighting — the exact problem Otsu adaptation solves.
+        leaf_a_u8 = a[silhouette == 1].astype(np.uint8)
+        leaf_b_u8 = b[silhouette == 1].astype(np.uint8)
+        if len(leaf_a_u8) > 100:
+            otsu_a, _ = cv2.threshold(
+                leaf_a_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            a_min = float(min(max(otsu_a, LAB_MLN_A_MIN), 146))
+        else:
+            a_min = float(LAB_MLN_A_MIN)
+        if len(leaf_b_u8) > 100:
+            otsu_b, _ = cv2.threshold(
+                leaf_b_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+            )
+            b_min = float(min(max(otsu_b, LAB_MLN_B_MIN), 150))
+        else:
+            b_min = float(LAB_MLN_B_MIN)
     else:  # HEALTHY — stricter thresholds match compute_lab_hard_mask
         a_min, b_min = 140.0, 145.0
 
@@ -1335,6 +1378,21 @@ def compute_lab_soft_confidence(
     a_conf = np.clip((a - a_min) / max(255.0 - a_min, 1.0), 0.0, 1.0)
     b_conf = np.clip((b - b_min) / max(255.0 - b_min, 1.0), 0.0, 1.0)
     conf_map = np.maximum(a_conf, b_conf)
+
+    # BUG FIX (v8→v9): add dark necrosis soft confidence channel for MLN to
+    # match compute_lab_hard_mask()'s `dark_necrosis = (L_norm < 110) & (a >= 125)`
+    # gate. Without this, dark necrotic MLN patches (low L*, low a*, low b*) score
+    # near zero confidence in mode_d while getting a non-zero hard mask in modes
+    # b/c — corrupting the cross-mode ablation study.
+    if category == "MLN":
+        L_norm_f = lab[:, :, 0].astype(np.float32)
+        dark_necrosis_conf = np.where(
+            (L_norm_f < 110.0) & (a >= 125.0),
+            np.clip((110.0 - L_norm_f) / 110.0, 0.0, 1.0),  # ramp: darker = higher conf
+            0.0,
+        ).astype(np.float32)
+        conf_map = np.maximum(conf_map, dark_necrosis_conf)
+
     conf_map *= (~green_excl).astype(np.float32)
     conf_map *= silhouette.astype(np.float32)
 
