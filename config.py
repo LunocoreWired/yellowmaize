@@ -368,9 +368,9 @@ XAI_TARGET_LAYERS = {
 # YOLO LEAF DETECTOR  (Phase 1b — train before generate_tier1_masks.py v3)
 # ══════════════════════════════════════════════════════════════════════════════
 YOLO_DATASET_DIR       = DATA_DIR / "yolo_dataset"
-YOLO_IMAGES_DIR        = DATA_DIR / "yolo_annotations" / "images"
-YOLO_ANNOTATIONS_DIR   = DATA_DIR / "yolo_annotations" / "labels"
-YOLO_ANNOTATION_FILE   = YOLO_ANNOTATIONS_DIR / "annotations.json"
+YOLO_IMAGES_DIR        = GOLD_IMAGES_DIR                              # same 501 images used for YOLO training
+YOLO_ANNOTATIONS_DIR   = GOLD_ANNOTATIONS_DIR                         # same annotations.json
+YOLO_ANNOTATION_FILE   = GOLD_ANNOTATION_FILE                         # polygon → bbox conversion done in train_yolo_detector.py
 YOLO_WEIGHTS_DIR       = CHECKPOINTS_DIR / "yolo"
 YOLO_WEIGHTS_BEST      = CHECKPOINTS_DIR / "yolo" / "best.pt"
 YOLO_IMG_SIZE          = 640
@@ -389,7 +389,11 @@ YOLO_QA_CALIB_FILE     = LOGS_DIR / "yolo_qa_calibration.csv"
 # ══════════════════════════════════════════════════════════════════════════════
 # GOLD STANDARD HUMAN VALIDATION
 # ══════════════════════════════════════════════════════════════════════════════
-# 300 images manually annotated in Label Studio (100 per class: HEALTHY/MSV/MLN)
+# 501 images manually annotated in Label Studio (167 per class: HEALTHY/MSV/MLN)
+# This single export serves three downstream consumers:
+#   1. train_yolo_detector.py  — polygon → bbox conversion → YOLO leaf detector training
+#   2. validate_gold_standard.py — polygon → binary mask → SAM2/Teacher/Student IoU chain
+#   3. train_yolo_detector.py (calibrate_sam2_confidence) — SAM2 QA threshold calibration
 # Used for IoU validation of SAM2 masks, Teacher predictions, and Student
 # predictions against human-verified leaf silhouette ground truth.
 #

@@ -1,19 +1,24 @@
 """
 ================================================================================
- sample_gold_standard.py — Extract 300 Images for Human Validation
+ sample_gold_standard.py — Extract 501 Images for Human Validation
 ================================================================================
  PURPOSE:
    Pulls a mathematically reproducible, perfectly balanced stratified sample
-   (100 HEALTHY, 100 MSV, 100 MLN) from the Tier 1 dataset.
+   (167 HEALTHY, 167 MSV, 167 MLN = 501 total) from the Tier 1 dataset.
    Copies and RENAMES the raw images to include their ground-truth class,
    making manual annotation in Label Studio foolproof.
 
+   This single export serves THREE downstream consumers:
+     1. train_yolo_detector.py  — polygon → bbox conversion → YOLO training
+     2. validate_gold_standard.py — polygon → binary mask → IoU chain validation
+     3. train_yolo_detector.py (calibrate_sam2_confidence) — SAM2 QA calibration
+
  REPRODUCIBILITY:
    Given the same tier1_manifest.csv, this script always selects the same
-   300 images — pd.DataFrame.sample(random_state=SEED) is deterministic.
+   501 images — pd.DataFrame.sample(random_state=SEED) is deterministic.
 
    ⚠ WARNING: If sample_15000.py is re-run, tier1_manifest.csv changes and
-   this script will silently select a DIFFERENT 300 images. Any Label Studio
+   this script will silently select a DIFFERENT 501 images. Any Label Studio
    annotations already done would be invalidated.
 
    GUARD: On first run, a SHA-256 hash of tier1_manifest.csv is written to
@@ -23,13 +28,28 @@
 
  OUTPUT DIRECTORY:
    Images are written to GOLD_IMAGES_DIR (data/gold_standard/images/) so that
-   validate_gold_standard.py can find them directly — no manual file moving
-   required after Label Studio annotation.
+   validate_gold_standard.py and train_yolo_detector.py can find them directly.
+
+ ANNOTATION WORKFLOW (single Label Studio project, two passes):
+   Pass 1 — Leaf silhouette (polygonlabels):
+     Trace the full leaf outline for all 501 images.
+     Export JSON → data/gold_standard/annotations/annotations.json
+     Used by: validate_gold_standard.py (IoU chain) + train_yolo_detector.py
+              (polygon → bbox conversion for YOLO training + SAM2 QA calibration)
+
+   Pass 2 — Symptom regions (Phase 3b, same project):
+     Trace chlorotic streaks (MSV) / necrotic patches (MLN) with polygon or
+     brush tool, label = "symptom". HEALTHY images: skip.
+     Target ≥ 400 MSV+MLN images.
+     Export JSON → data/gold_standard/annotations/symptom_annotations.json
+     Used by: train_symptom_model.py
 
  WORKFLOW:
    1. Run this script right after sample_15000.py (no masks needed).
-   2. Import data/gold_standard/images/ into Label Studio and annotate.
-   3. Export annotations as JSON → data/gold_standard/annotations/annotations.json
+   2. Import data/gold_standard/images/ into Label Studio and annotate
+      leaf silhouettes (polygonlabels). Export JSON to:
+      data/gold_standard/annotations/annotations.json
+   3. Run train_yolo_detector.py (derives bounding boxes from polygons).
    4. Run validate_gold_standard.py (after Teacher + Student are trained).
 ================================================================================
 """
@@ -52,7 +72,7 @@ def _manifest_hash(path: Path) -> str:
 
 def main():
     print("=" * 72)
-    print("  Yellow MAIze | Generating 300-Image Gold Standard Validation Set")
+    print("  Yellow MAIze | Generating 501-Image Gold Standard Validation Set")
     print("=" * 72)
 
     # 1. Create the destination directory (data/gold_standard/images/)
@@ -78,7 +98,7 @@ def main():
             print("          set was last generated.")
             print()
             print("  This means sample_15000.py was re-run after annotation began.")
-            print("  Re-generating would produce a DIFFERENT 300 images, making any")
+            print("  Re-generating would produce a DIFFERENT 501 images, making any")
             print("  existing Label Studio annotations invalid.")
             print()
             print("  If you intend to start fresh (annotations not yet done):")
@@ -96,10 +116,10 @@ def main():
     df = pd.read_csv(TIER1_MANIFEST)
     print(f"  Loaded Tier 1 Manifest: {len(df):,} images available.")
 
-    # 3. Stratified sampling (100 per class)
+    # 3. Stratified sampling (167 per class = 501 total)
     # pd.DataFrame.sample(random_state=SEED) is fully deterministic —
     # same manifest + same SEED always produces the same rows.
-    samples_per_class = 100
+    samples_per_class = 167
     sampled_rows = []
 
     for cls in CLASSES:
@@ -158,7 +178,8 @@ def main():
     print("    1. Import images into Label Studio and annotate leaf silhouettes")
     print("       (polygonlabels). Export JSON to:")
     print(f"      {GOLD_IMAGES_DIR.parent / 'annotations' / 'annotations.json'}")
-    print("    2. Run validate_gold_standard.py after training is complete.")
+    print("    2. Run train_yolo_detector.py (derives bboxes from your polygons).")
+    print("    3. Run validate_gold_standard.py after training is complete.")
     print("=" * 72)
 
 
