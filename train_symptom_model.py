@@ -26,15 +26,21 @@
       label source, so it cannot inherit LAB's systematic biases.
 
  ANNOTATION REQUIREMENTS:
-   A SECOND Label Studio annotation pass on the SAME gold-standard images
-   used for leaf-silhouette validation (sample_gold_standard.py). Trace only
-   the symptom region (chlorotic streak / necrotic patch) with polygon or
-   brush tool, label name SYMPTOM_LABEL_NAME ("symptom"). HEALTHY images in
-   the gold set need no symptom annotation. Export JSON separately from the
-   leaf-silhouette annotations to:
-     data/gold_standard/annotations/symptom_annotations.json
+   A second annotation pass on the SAME 501 gold-standard images used for
+   leaf-silhouette validation (sample_gold_standard.py), done in CVAT.
+   Trace only the symptom region (chlorotic streaks for MSV, necrotic patches
+   for MLN) using CVAT's polygon or brush tool. Label name must match
+   SYMPTOM_LABEL_NAME ("symptom"). HEALTHY images need no annotation.
+
+   Export from CVAT:
+     Task menu → Export dataset → COCO 1.0 → extract zip
+     Place instances_default.json at:
+       data/gold_standard/annotations/symptom_annotations.json
+
    Target: SYMPTOM_MIN_ANNOTATIONS (400) MSV+MLN images, stratified across
    severity levels so early/faint symptoms are represented.
+   Install pycocotools for reliable RLE (brush mask) decoding:
+     pip install pycocotools
 
  WORKFLOW:
    1. Train HealthyAE on HEALTHY images from the global manifest (no
@@ -297,16 +303,32 @@ def load_healthy_ae(ckpt_path: Path | None = None) -> nn.Module | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PART 2 — LABEL STUDIO SYMPTOM ANNOTATION PARSER
+# PART 2 — CVAT COCO-FORMAT SYMPTOM ANNOTATION PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_symptom_annotations(json_path: Path, images_dir: Path) -> list[dict]:
     """
-    Parse a Label Studio JSON export containing symptom polygon/brush masks.
+    Parse a CVAT COCO 1.0 JSON export containing symptom polygon and/or
+    brush (RLE) masks.
 
-    Supports both polygonlabels (points, percentage coords) and brushlabels
-    (RLE-encoded mask) result types, matching whichever tool the annotator
-    used in Label Studio.
+    Export from CVAT:
+      Task menu → Export dataset → COCO 1.0
+      Extract the zip → place instances_default.json at SYMPTOM_ANNOTATION_FILE
+      (data/gold_standard/annotations/symptom_annotations.json)
+
+    COCO JSON structure:
+      {
+        "images":      [{"id": int, "file_name": str, "width": int, "height": int}],
+        "annotations": [{"image_id": int, "segmentation": ..., "category_id": int}],
+        "categories":  [{"id": int, "name": str}]
+      }
+
+    segmentation is either:
+      Polygon : [[x1, y1, x2, y2, ...]]  (flat list of absolute pixel coords)
+      RLE     : {"counts": list|str, "size": [H, W]}  (from brush tool)
+
+    All annotations whose category name matches SYMPTOM_LABEL_NAME ("symptom")
+    are merged into a single binary mask per image via logical OR.
 
     Returns a list of dicts: {"img_path": Path, "width": int, "height": int,
     "mask": np.uint8 H×W binary mask}.
@@ -314,78 +336,96 @@ def parse_symptom_annotations(json_path: Path, images_dir: Path) -> list[dict]:
     if not json_path.exists():
         raise FileNotFoundError(
             f"Symptom annotation file not found: {json_path}\n"
-            f"Export from Label Studio (polygon or brush tool, label name "
-            f"'{SYMPTOM_LABEL_NAME}') to that path."
+            f"Export from CVAT as 'COCO 1.0' and place instances_default.json "
+            f"at that path."
         )
 
     with open(json_path, encoding="utf-8") as f:
-        tasks = json.load(f)
+        data = json.load(f)
 
+    # ── Build lookup tables ───────────────────────────────────────────────────
+    id_to_image: dict[int, dict] = {
+        img["id"]: img for img in data.get("images", [])
+    }
+    id_to_cat: dict[int, str] = {
+        cat["id"]: cat["name"] for cat in data.get("categories", [])
+    }
+
+    # Find category IDs that match SYMPTOM_LABEL_NAME (case-insensitive)
+    symptom_cat_ids: set[int] = {
+        cid for cid, name in id_to_cat.items()
+        if name.lower() == SYMPTOM_LABEL_NAME.lower()
+    }
+    if not symptom_cat_ids:
+        print(f"  [WARN] No category named '{SYMPTOM_LABEL_NAME}' found in COCO JSON.")
+        print(f"         Available categories: {list(id_to_cat.values())}")
+        print(f"         Check SYMPTOM_LABEL_NAME in config.py matches your CVAT label.")
+
+    # Group symptom annotations by image_id
+    from collections import defaultdict
+    anns_by_image: dict[int, list] = defaultdict(list)
+    for ann in data.get("annotations", []):
+        if ann.get("category_id") in symptom_cat_ids:
+            anns_by_image[ann["image_id"]].append(ann)
+
+    # ── Build records ─────────────────────────────────────────────────────────
     records   = []
     n_skipped = 0
     n_empty   = 0
 
-    for task in tasks:
-        data_val  = task.get("data", {})
-        img_field = data_val.get("image", data_val.get("img", ""))
-        img_name  = Path(img_field.replace("\\", "/").split("/")[-1].split("?d=")[-1])
-        img_path  = images_dir / img_name
+    for img_id, img_info in id_to_image.items():
+        file_name = Path(img_info["file_name"]).name   # strip any path prefix CVAT adds
+        img_path  = images_dir / file_name
 
         if not img_path.exists():
-            candidates = list(images_dir.glob(f"*{img_name.suffix}"))
-            matches    = [c for c in candidates if c.name.endswith(img_name.name)]
-            if matches:
-                img_path = matches[0]
+            # Fuzzy match in case CVAT changed filename slightly
+            candidates = [c for c in images_dir.iterdir()
+                          if c.name.endswith(file_name)]
+            if candidates:
+                img_path = candidates[0]
             else:
                 n_skipped += 1
                 continue
 
-        annotations = task.get("annotations", [])
-        if not annotations:
+        anns = anns_by_image.get(img_id, [])
+        if not anns:
+            # Image has no symptom annotation — valid for HEALTHY images
             n_empty += 1
             continue
 
-        result_items = annotations[0].get("result", [])
-        mask = None
-        orig_w = orig_h = None
+        orig_w = img_info.get("width")
+        orig_h = img_info.get("height")
+        if not orig_w or not orig_h:
+            probe = load_image_rgb(img_path)
+            if probe is None:
+                n_skipped += 1
+                continue
+            orig_h, orig_w = probe.shape[:2]
 
-        for item in result_items:
-            item_type = item.get("type")
-            value     = item.get("value", {})
-            labels    = value.get("polygonlabels") or value.get("brushlabels") or []
-            if SYMPTOM_LABEL_NAME not in labels and labels:
-                continue   # different label on this annotation set — skip
+        mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
 
-            orig_w = item.get("original_width",  orig_w)
-            orig_h = item.get("original_height", orig_h)
-            if orig_w is None or orig_h is None:
+        for ann in anns:
+            seg = ann.get("segmentation")
+            if seg is None:
                 continue
 
-            if mask is None:
-                mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
+            if isinstance(seg, list):
+                # ── Polygon (drawn with polygon tool in CVAT) ────────────────
+                # COCO polygon: list of [x1,y1,x2,y2,...] flat float arrays
+                # Coordinates are absolute pixels (not percentages like Label Studio)
+                for poly_flat in seg:
+                    if len(poly_flat) < 6:   # need at least 3 xy pairs
+                        continue
+                    pts = np.array(poly_flat, dtype=np.float32).reshape(-1, 2)
+                    cv2.fillPoly(mask, [pts.astype(np.int32)], 1)
 
-            if item_type == "polygonlabels":
-                points = value.get("points", [])
-                if len(points) < 3:
-                    continue
-                pts_px = np.array(
-                    [[pt[0] / 100.0 * orig_w, pt[1] / 100.0 * orig_h] for pt in points],
-                    dtype=np.int32,
-                )
-                cv2.fillPoly(mask, [pts_px], 1)
-
-            elif item_type == "brushlabels":
-                # Label Studio brush RLE format — decode via its own helper
-                # if available; otherwise skip (polygon is the recommended
-                # tool for this task — finer boundary control for streaks).
-                rle = value.get("rle")
-                if rle is None:
-                    continue
-                decoded = _decode_label_studio_rle(rle, orig_w, orig_h)
+            elif isinstance(seg, dict):
+                # ── RLE (drawn with brush tool in CVAT) ─────────────────────
+                decoded = _decode_coco_rle(seg, orig_h, orig_w)
                 if decoded is not None:
                     mask = np.clip(mask + decoded, 0, 1).astype(np.uint8)
 
-        if mask is None or mask.sum() == 0:
+        if mask.sum() == 0:
             n_empty += 1
             continue
 
@@ -397,32 +437,49 @@ def parse_symptom_annotations(json_path: Path, images_dir: Path) -> list[dict]:
         })
 
     print(f"  Parsed {len(records):,} symptom-annotated images "
-          f"({n_skipped} missing files, {n_empty} empty/no symptom region)")
+          f"({n_skipped} missing files, {n_empty} unannotated/empty)")
     return records
 
 
-def _decode_label_studio_rle(rle: list, width: int, height: int) -> np.ndarray | None:
+def _decode_coco_rle(seg: dict, height: int, width: int) -> np.ndarray | None:
     """
-    Decode Label Studio's brush RLE format into a binary H×W mask.
-    Label Studio uses a custom byte-aligned RLE, not COCO RLE. This is a
-    minimal best-effort decoder; if it fails, the brush region is skipped
-    and a [WARN] is logged by the caller — annotators should prefer the
-    polygon tool for sharper streak boundaries in practice.
+    Decode a COCO RLE segmentation dict into a binary H×W uint8 mask.
+
+    CVAT exports brush masks as COCO uncompressed RLE:
+      {"counts": [n_zeros, n_ones, n_zeros, ...], "size": [H, W]}
+    or compressed RLE (pycocotools format):
+      {"counts": "<base64 string>", "size": [H, W]}
+
+    Tries pycocotools first (handles both variants), then falls back to a
+    manual uncompressed decoder for the plain-list case.
     """
     try:
-        from label_studio_converter.brush import decode_rle
-        mask_flat = decode_rle(rle)
-        mask = mask_flat.reshape((height, width, 4))[:, :, 3]  # alpha channel
-        return (mask > 0).astype(np.uint8)
-    except ImportError:
-        print("  [WARN] label_studio_converter not installed — cannot decode "
-              "brush-tool annotations. Install with: pip install label-studio-converter "
-              "or re-annotate with the polygon tool.")
-        return None
+        from pycocotools import mask as coco_mask
+        rle = {"counts": seg["counts"], "size": seg["size"]}
+        decoded = coco_mask.decode(rle)   # returns H×W uint8
+        return (decoded > 0).astype(np.uint8)
     except Exception:
-        return None
+        pass
 
+    # Manual fallback: plain list of run-length counts (uncompressed COCO RLE)
+    counts = seg.get("counts")
+    size   = seg.get("size", [height, width])
+    if isinstance(counts, list):
+        try:
+            flat = np.zeros(size[0] * size[1], dtype=np.uint8)
+            pos, val = 0, 0   # RLE alternates starting from zeros
+            for run in counts:
+                flat[pos: pos + run] = val
+                pos += run
+                val  = 1 - val
+            # COCO RLE uses column-major (Fortran) order
+            return flat.reshape(size[0], size[1], order="F").astype(np.uint8)
+        except Exception:
+            pass
 
+    print("  [WARN] Could not decode RLE mask — skipping one brush annotation. "
+          "Install pycocotools for reliable RLE decoding: pip install pycocotools")
+    return None
 # ══════════════════════════════════════════════════════════════════════════════
 # PART 3 — SYMPTOM TEACHER MODEL + DATASET
 # ══════════════════════════════════════════════════════════════════════════════
