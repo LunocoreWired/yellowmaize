@@ -475,8 +475,14 @@ GOLD_IOU_TARGET_MEAN     = 0.85
 #   reports/symptom_teacher_iou_report.csv       <- per-image IoU vs human masks
 #   logs/symptom_teacher_metrics.csv             <- per-epoch loss / Dice / IoU
 SYMPTOM_ANNOTATION_FILE   = GOLD_ANNOTATIONS_DIR / "symptom_annotations.json"
-SYMPTOM_LABEL_NAME        = "symptom"
-SYMPTOM_MIN_ANNOTATIONS   = 400          # MSV + MLN images combined
+#   Label names as defined in CVAT (must match exactly, case-insensitive):
+MAIZE_LEAF_LABEL_NAME     = "maize-leaf"     # leaf silhouette — all 3 classes
+MSV_SYMPTOM_LABEL_NAME    = "msv-symptom"    # chlorotic streak regions — MSV only
+MLN_SYMPTOM_LABEL_NAME    = "mln-symptom"    # necrotic patch regions — MLN only
+#   HEALTHY images are included in training with all-zero symptom masks so the
+#   model learns to output nothing on a healthy leaf (graceful degradation when
+#   the Student classification head misclassifies a HEALTHY image as MSV/MLN).
+SYMPTOM_MIN_ANNOTATIONS   = 400          # MSV + MLN images combined (HEALTHY excluded)
 SYMPTOM_IMG_SIZE          = 512          # matches typical leaf-crop resolution
 SYMPTOM_VAL_SPLIT         = 0.15
 SYMPTOM_BATCH_SIZE        = 4

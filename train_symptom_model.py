@@ -26,19 +26,22 @@
       label source, so it cannot inherit LAB's systematic biases.
 
  ANNOTATION REQUIREMENTS:
-   A second annotation pass on the SAME 501 gold-standard images used for
-   leaf-silhouette validation (sample_gold_standard.py), done in CVAT.
-   Trace only the symptom region (chlorotic streaks for MSV, necrotic patches
-   for MLN) using CVAT's polygon or brush tool. Label name must match
-   SYMPTOM_LABEL_NAME ("symptom"). HEALTHY images need no annotation.
+   All 501 gold-standard images annotated in CVAT using three labels:
+     maize-leaf   (MAIZE_LEAF_LABEL_NAME)  — leaf silhouette, all 3 classes
+     msv-symptom  (MSV_SYMPTOM_LABEL_NAME) — chlorotic streaks, MSV images only
+     mln-symptom  (MLN_SYMPTOM_LABEL_NAME) — necrotic patches, MLN images only
+
+   HEALTHY images need only a maize-leaf annotation (no symptom regions).
+   They are included in training with all-zero symptom masks for both channels,
+   teaching the model to output nothing on a healthy leaf.
 
    Export from CVAT:
      Task menu → Export dataset → COCO 1.0 → extract zip
      Place instances_default.json at:
        data/gold_standard/annotations/symptom_annotations.json
 
-   Target: SYMPTOM_MIN_ANNOTATIONS (400) MSV+MLN images, stratified across
-   severity levels so early/faint symptoms are represented.
+   Target: SYMPTOM_MIN_ANNOTATIONS (400) MSV+MLN images with symptom regions,
+   stratified across severity levels so early/faint symptoms are represented.
    Install pycocotools for reliable RLE (brush mask) decoding:
      pip install pycocotools
 
@@ -303,35 +306,35 @@ def load_healthy_ae(ckpt_path: Path | None = None) -> nn.Module | None:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PART 2 — CVAT COCO-FORMAT SYMPTOM ANNOTATION PARSER
+# PART 2 — CVAT COCO-FORMAT ANNOTATION PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def parse_symptom_annotations(json_path: Path, images_dir: Path) -> list[dict]:
     """
-    Parse a CVAT COCO 1.0 JSON export containing symptom polygon and/or
-    brush (RLE) masks.
+    Parse a CVAT COCO 1.0 JSON export containing all three annotation labels:
+      - MAIZE_LEAF_LABEL_NAME  ("maize-leaf")  — leaf silhouette, all 3 classes
+      - MSV_SYMPTOM_LABEL_NAME ("msv-symptom") — chlorotic streaks, MSV images only
+      - MLN_SYMPTOM_LABEL_NAME ("mln-symptom") — necrotic patches, MLN images only
+
+    Returns one record per image that has a maize-leaf annotation, including
+    HEALTHY images (which receive all-zero symptom masks for both channels).
+    This teaches the Symptom Teacher to output nothing on a healthy leaf,
+    ensuring graceful degradation when the Student classification head
+    misclassifies a HEALTHY image as MSV or MLN.
+
+    Each record: {
+        "img_path" : Path,
+        "width"    : int,
+        "height"   : int,
+        "msv_mask" : np.uint8 H×W  (zeros for HEALTHY and MLN images)
+        "mln_mask" : np.uint8 H×W  (zeros for HEALTHY and MSV images)
+        "category" : str           (inferred from filename prefix CLASS_*)
+    }
 
     Export from CVAT:
-      Task menu → Export dataset → COCO 1.0
-      Extract the zip → place instances_default.json at SYMPTOM_ANNOTATION_FILE
+      Task menu → Export dataset → COCO 1.0 → extract zip
+      Place instances_default.json at SYMPTOM_ANNOTATION_FILE
       (data/gold_standard/annotations/symptom_annotations.json)
-
-    COCO JSON structure:
-      {
-        "images":      [{"id": int, "file_name": str, "width": int, "height": int}],
-        "annotations": [{"image_id": int, "segmentation": ..., "category_id": int}],
-        "categories":  [{"id": int, "name": str}]
-      }
-
-    segmentation is either:
-      Polygon : [[x1, y1, x2, y2, ...]]  (flat list of absolute pixel coords)
-      RLE     : {"counts": list|str, "size": [H, W]}  (from brush tool)
-
-    All annotations whose category name matches SYMPTOM_LABEL_NAME ("symptom")
-    are merged into a single binary mask per image via logical OR.
-
-    Returns a list of dicts: {"img_path": Path, "width": int, "height": int,
-    "mask": np.uint8 H×W binary mask}.
     """
     if not json_path.exists():
         raise FileNotFoundError(
@@ -351,34 +354,50 @@ def parse_symptom_annotations(json_path: Path, images_dir: Path) -> list[dict]:
         cat["id"]: cat["name"] for cat in data.get("categories", [])
     }
 
-    # Find category IDs that match SYMPTOM_LABEL_NAME (case-insensitive)
-    symptom_cat_ids: set[int] = {
-        cid for cid, name in id_to_cat.items()
-        if name.lower() == SYMPTOM_LABEL_NAME.lower()
-    }
-    if not symptom_cat_ids:
-        print(f"  [WARN] No category named '{SYMPTOM_LABEL_NAME}' found in COCO JSON.")
-        print(f"         Available categories: {list(id_to_cat.values())}")
-        print(f"         Check SYMPTOM_LABEL_NAME in config.py matches your CVAT label.")
+    def _find_cat_ids(label_name: str) -> set[int]:
+        """Return category IDs whose name matches label_name (case-insensitive)."""
+        ids = {cid for cid, name in id_to_cat.items()
+               if name.lower() == label_name.lower()}
+        if not ids:
+            print(f"  [WARN] No category '{label_name}' in COCO JSON. "
+                  f"Available: {list(id_to_cat.values())}")
+        return ids
 
-    # Group symptom annotations by image_id
+    leaf_cat_ids = _find_cat_ids(MAIZE_LEAF_LABEL_NAME)
+    msv_cat_ids  = _find_cat_ids(MSV_SYMPTOM_LABEL_NAME)
+    mln_cat_ids  = _find_cat_ids(MLN_SYMPTOM_LABEL_NAME)
+
+    # Group annotations by image_id per label type
     from collections import defaultdict
-    anns_by_image: dict[int, list] = defaultdict(list)
+    leaf_anns: dict[int, list] = defaultdict(list)
+    msv_anns:  dict[int, list] = defaultdict(list)
+    mln_anns:  dict[int, list] = defaultdict(list)
+
     for ann in data.get("annotations", []):
-        if ann.get("category_id") in symptom_cat_ids:
-            anns_by_image[ann["image_id"]].append(ann)
+        cat_id = ann.get("category_id")
+        img_id = ann.get("image_id")
+        if cat_id in leaf_cat_ids:
+            leaf_anns[img_id].append(ann)
+        elif cat_id in msv_cat_ids:
+            msv_anns[img_id].append(ann)
+        elif cat_id in mln_cat_ids:
+            mln_anns[img_id].append(ann)
 
     # ── Build records ─────────────────────────────────────────────────────────
     records   = []
     n_skipped = 0
-    n_empty   = 0
+    n_no_leaf = 0
 
     for img_id, img_info in id_to_image.items():
-        file_name = Path(img_info["file_name"]).name   # strip any path prefix CVAT adds
+        # Skip images with no leaf annotation — cannot determine valid region
+        if img_id not in leaf_anns:
+            n_no_leaf += 1
+            continue
+
+        file_name = Path(img_info["file_name"]).name
         img_path  = images_dir / file_name
 
         if not img_path.exists():
-            # Fuzzy match in case CVAT changed filename slightly
             candidates = [c for c in images_dir.iterdir()
                           if c.name.endswith(file_name)]
             if candidates:
@@ -386,12 +405,6 @@ def parse_symptom_annotations(json_path: Path, images_dir: Path) -> list[dict]:
             else:
                 n_skipped += 1
                 continue
-
-        anns = anns_by_image.get(img_id, [])
-        if not anns:
-            # Image has no symptom annotation — valid for HEALTHY images
-            n_empty += 1
-            continue
 
         orig_w = img_info.get("width")
         orig_h = img_info.get("height")
@@ -402,83 +415,89 @@ def parse_symptom_annotations(json_path: Path, images_dir: Path) -> list[dict]:
                 continue
             orig_h, orig_w = probe.shape[:2]
 
-        mask = np.zeros((orig_h, orig_w), dtype=np.uint8)
+        # Infer category from filename prefix (e.g. "MSV_img001.jpg")
+        stem = img_path.stem.upper()
+        if stem.startswith("MSV"):
+            category = "MSV"
+        elif stem.startswith("MLN"):
+            category = "MLN"
+        else:
+            category = "HEALTHY"
 
-        for ann in anns:
-            seg = ann.get("segmentation")
-            if seg is None:
-                continue
-
-            if isinstance(seg, list):
-                # ── Polygon (drawn with polygon tool in CVAT) ────────────────
-                # COCO polygon: list of [x1,y1,x2,y2,...] flat float arrays
-                # Coordinates are absolute pixels (not percentages like Label Studio)
-                for poly_flat in seg:
-                    if len(poly_flat) < 6:   # need at least 3 xy pairs
-                        continue
-                    pts = np.array(poly_flat, dtype=np.float32).reshape(-1, 2)
-                    cv2.fillPoly(mask, [pts.astype(np.int32)], 1)
-
-            elif isinstance(seg, dict):
-                # ── RLE (drawn with brush tool in CVAT) ─────────────────────
-                decoded = _decode_coco_rle(seg, orig_h, orig_w)
-                if decoded is not None:
-                    mask = np.clip(mask + decoded, 0, 1).astype(np.uint8)
-
-        if mask.sum() == 0:
-            n_empty += 1
-            continue
+        # Build symptom masks — zeros for HEALTHY (intentional training signal)
+        msv_mask = _build_mask(msv_anns.get(img_id, []), orig_h, orig_w)
+        mln_mask = _build_mask(mln_anns.get(img_id, []), orig_h, orig_w)
 
         records.append({
             "img_path": img_path,
             "width":    orig_w,
             "height":   orig_h,
-            "mask":     mask,
+            "msv_mask": msv_mask,
+            "mln_mask": mln_mask,
+            "category": category,
         })
 
-    print(f"  Parsed {len(records):,} symptom-annotated images "
-          f"({n_skipped} missing files, {n_empty} unannotated/empty)")
+    n_msv     = sum(1 for r in records if r["category"] == "MSV" and r["msv_mask"].sum() > 0)
+    n_mln     = sum(1 for r in records if r["category"] == "MLN" and r["mln_mask"].sum() > 0)
+    n_healthy = sum(1 for r in records if r["category"] == "HEALTHY")
+    print(f"  Parsed {len(records):,} images "
+          f"({n_msv} MSV annotated, {n_mln} MLN annotated, "
+          f"{n_healthy} HEALTHY with zero masks, "
+          f"{n_skipped} missing files, {n_no_leaf} no leaf annotation)")
     return records
+
+
+def _build_mask(anns: list, height: int, width: int) -> np.ndarray:
+    """
+    Rasterize a list of COCO annotations (polygon or RLE) into a binary H×W mask.
+    Returns an all-zeros mask if anns is empty.
+    """
+    mask = np.zeros((height, width), dtype=np.uint8)
+    for ann in anns:
+        seg = ann.get("segmentation")
+        if seg is None:
+            continue
+        if isinstance(seg, list):
+            for poly_flat in seg:
+                if len(poly_flat) < 6:
+                    continue
+                pts = np.array(poly_flat, dtype=np.float32).reshape(-1, 2)
+                cv2.fillPoly(mask, [pts.astype(np.int32)], 1)
+        elif isinstance(seg, dict):
+            decoded = _decode_coco_rle(seg, height, width)
+            if decoded is not None:
+                mask = np.clip(mask + decoded, 0, 1).astype(np.uint8)
+    return mask
 
 
 def _decode_coco_rle(seg: dict, height: int, width: int) -> np.ndarray | None:
     """
     Decode a COCO RLE segmentation dict into a binary H×W uint8 mask.
-
-    CVAT exports brush masks as COCO uncompressed RLE:
-      {"counts": [n_zeros, n_ones, n_zeros, ...], "size": [H, W]}
-    or compressed RLE (pycocotools format):
-      {"counts": "<base64 string>", "size": [H, W]}
-
-    Tries pycocotools first (handles both variants), then falls back to a
-    manual uncompressed decoder for the plain-list case.
+    Tries pycocotools first, then falls back to manual uncompressed decode.
+    Install pycocotools for reliable brush mask decoding: pip install pycocotools
     """
     try:
         from pycocotools import mask as coco_mask
-        rle = {"counts": seg["counts"], "size": seg["size"]}
-        decoded = coco_mask.decode(rle)   # returns H×W uint8
+        decoded = coco_mask.decode({"counts": seg["counts"], "size": seg["size"]})
         return (decoded > 0).astype(np.uint8)
     except Exception:
         pass
 
-    # Manual fallback: plain list of run-length counts (uncompressed COCO RLE)
     counts = seg.get("counts")
     size   = seg.get("size", [height, width])
     if isinstance(counts, list):
         try:
             flat = np.zeros(size[0] * size[1], dtype=np.uint8)
-            pos, val = 0, 0   # RLE alternates starting from zeros
+            pos, val = 0, 0
             for run in counts:
                 flat[pos: pos + run] = val
                 pos += run
                 val  = 1 - val
-            # COCO RLE uses column-major (Fortran) order
             return flat.reshape(size[0], size[1], order="F").astype(np.uint8)
         except Exception:
             pass
 
-    print("  [WARN] Could not decode RLE mask — skipping one brush annotation. "
-          "Install pycocotools for reliable RLE decoding: pip install pycocotools")
+    print("  [WARN] Could not decode RLE mask — skipping one brush annotation.")
     return None
 # ══════════════════════════════════════════════════════════════════════════════
 # PART 3 — SYMPTOM TEACHER MODEL + DATASET
@@ -487,9 +506,16 @@ def _decode_coco_rle(seg: dict, height: int, width: int) -> np.ndarray | None:
 class SymptomTeacher(nn.Module):
     """
     EfficientNet-B2 UNet adapted to 4-channel input (RGB + AE error map).
-    Same backbone family as train_teacher.py's leaf-silhouette Teacher, so
-    the two models share infrastructure conventions (encoder pretrained on
-    ImageNet, first-conv weights handled via smp's in_channels= support).
+    Two-channel output:
+      Ch0 = MSV symptom probability (chlorotic streaks)
+      Ch1 = MLN symptom probability (necrotic patches)
+
+    HEALTHY images are included in training with all-zero targets for both
+    channels, teaching the model to output nothing on a healthy leaf.
+    This ensures graceful degradation when the Student classification head
+    misclassifies a HEALTHY image as MSV or MLN.
+
+    Same backbone family as train_teacher.py leaf-silhouette Teacher.
     """
 
     def __init__(self, encoder_name: str = SYMPTOM_ENCODER):
@@ -498,12 +524,12 @@ class SymptomTeacher(nn.Module):
             encoder_name=encoder_name,
             encoder_weights="imagenet",
             in_channels=4,          # RGB + AE error map
-            classes=1,
+            classes=2,              # Ch0=MSV symptom, Ch1=MLN symptom
             activation=None,
         )
 
     def forward(self, x):
-        return self.net(x)
+        return self.net(x)  # [B, 2, H, W] raw logits
 
 
 class SymptomDataset(Dataset):
@@ -546,21 +572,29 @@ class SymptomDataset(Dataset):
             return None
 
         err_map = compute_ae_error_map(self.ae_model, img_rgb)
-        err_3ch = np.stack([err_map] * 3, axis=-1)  # fake 3ch so albumentations
-                                                      # geometric transforms apply
-                                                      # identically to img + err
-        mask = rec["mask"]
-        if mask.shape != img_rgb.shape[:2]:
-            mask = cv2.resize(mask, (img_rgb.shape[1], img_rgb.shape[0]),
-                              interpolation=cv2.INTER_NEAREST)
+        err_3ch = np.stack([err_map] * 3, axis=-1)  # fake 3ch for albumentations
 
-        out = self.tf(image=img_rgb, err=err_3ch, mask=mask)
-        img_t  = torch.from_numpy(out["image"]).permute(2, 0, 1).float() / 255.0
-        err_t  = torch.from_numpy(out["err"][:, :, 0:1]).permute(2, 0, 1).float()
-        mask_t = torch.from_numpy(out["mask"]).float().unsqueeze(0)
+        # Resize masks to match image if needed
+        h, w = img_rgb.shape[:2]
+        msv_mask = rec["msv_mask"]
+        mln_mask = rec["mln_mask"]
+        if msv_mask.shape != (h, w):
+            msv_mask = cv2.resize(msv_mask, (w, h), interpolation=cv2.INTER_NEAREST)
+        if mln_mask.shape != (h, w):
+            mln_mask = cv2.resize(mln_mask, (w, h), interpolation=cv2.INTER_NEAREST)
 
-        x = torch.cat([img_t, err_t], dim=0)  # 4×H×W
-        return x, mask_t
+        # Stack masks as H×W×2 so albumentations applies identical
+        # geometric transforms to both channels simultaneously
+        mask_2ch = np.stack([msv_mask, mln_mask], axis=-1).astype(np.uint8)
+
+        out = self.tf(image=img_rgb, err=err_3ch, mask=mask_2ch)
+        img_t    = torch.from_numpy(out["image"]).permute(2, 0, 1).float() / 255.0
+        err_t    = torch.from_numpy(out["err"][:, :, 0:1]).permute(2, 0, 1).float()
+        # mask_2ch after transform: H×W×2 → 2×H×W
+        mask_t   = torch.from_numpy(out["mask"]).permute(2, 0, 1).float()  # [2, H, W]
+
+        x = torch.cat([img_t, err_t], dim=0)  # [4, H, W]
+        return x, mask_t                        # targets: [2, H, W] float32
 
 
 def _symptom_collate(batch):
@@ -573,11 +607,16 @@ def _symptom_collate(batch):
 
 def dice_bce_loss(logits: torch.Tensor, target: torch.Tensor,
                   dice_weight: float = SYMPTOM_DICE_BCE_WEIGHT) -> torch.Tensor:
+    """
+    Combined Dice + BCE loss applied independently to each output channel
+    (Ch0=MSV, Ch1=MLN) and averaged. Works for both 1-channel and 2-channel.
+    """
     bce = F.binary_cross_entropy_with_logits(logits, target)
     probs = torch.sigmoid(logits)
     smooth = 1.0
-    inter = (probs * target).sum(dim=(1, 2, 3))
-    union = probs.sum(dim=(1, 2, 3)) + target.sum(dim=(1, 2, 3))
+    # Sum over spatial dims only (H, W); average over batch and channels separately
+    inter = (probs * target).sum(dim=(-2, -1))       # [B, C]
+    union = (probs + target).sum(dim=(-2, -1))        # [B, C]
     dice  = 1.0 - ((2 * inter + smooth) / (union + smooth)).mean()
     return dice_weight * dice + (1 - dice_weight) * bce
 
@@ -651,9 +690,13 @@ def train_symptom_teacher(ae_model: nn.Module, records: list[dict]) -> Path:
                 probs  = torch.sigmoid(logits).cpu().numpy()
                 gt     = y.numpy()
                 for p, g in zip(probs, gt):
-                    pred_bin = (p[0] >= 0.5).astype(np.uint8)
-                    gt_bin   = (g[0] >= 0.5).astype(np.uint8)
-                    val_ious.append(compute_iou(pred_bin, gt_bin))
+                    # Average IoU across both channels (MSV + MLN)
+                    ch_ious = []
+                    for ch in range(p.shape[0]):
+                        pred_bin = (p[ch] >= 0.5).astype(np.uint8)
+                        gt_bin   = (g[ch] >= 0.5).astype(np.uint8)
+                        ch_ious.append(compute_iou(pred_bin, gt_bin))
+                    val_ious.append(float(np.mean(ch_ious)))
 
         val_iou = float(np.mean(val_ious)) if val_ious else 0.0
         sched.step(val_iou)
@@ -708,19 +751,30 @@ def load_symptom_teacher(ckpt_path: Path | None = None) -> nn.Module | None:
 @torch.no_grad()
 def predict_symptom_mask(symptom_model: nn.Module, ae_model: nn.Module,
                          img_rgb: np.ndarray,
+                         category: str = "MSV",
                          img_size: int = SYMPTOM_IMG_SIZE) -> np.ndarray:
     """
-    Run the Symptom Teacher on a single RGB image. Returns a float32
-    probability map at the ORIGINAL image resolution (sigmoid output,
-    not binarized) — mirrors the contract of compute_lab_soft_confidence()
-    so factory_master.py can swap it in with minimal changes.
+    Run the Symptom Teacher on a single RGB image.
+
+    Returns a float32 probability map at the ORIGINAL image resolution
+    (sigmoid output, not binarized) for the channel corresponding to
+    the image category:
+      category="MSV"     → Ch0 (chlorotic streak probability)
+      category="MLN"     → Ch1 (necrotic patch probability)
+      category="HEALTHY" → all-zeros (no symptom signal expected)
+
+    Mirrors the contract of compute_lab_soft_confidence() so factory_master.py
+    can swap it in with minimal changes — it still receives a single H×W float32
+    map per image.
     """
     orig_h, orig_w = img_rgb.shape[:2]
+
+    # HEALTHY: skip inference entirely — return zeros
+    if category == "HEALTHY":
+        return np.zeros((orig_h, orig_w), dtype=np.float32)
+
     err_map = compute_ae_error_map(ae_model, img_rgb)
 
-    # LongestMaxSize+PadIfNeeded are purely deterministic (no randomness),
-    # so the image and error map can be transformed independently and still
-    # stay pixel-aligned — no need for albumentations' additional_targets here.
     img_t = A.Compose([
         A.LongestMaxSize(max_size=img_size),
         A.PadIfNeeded(img_size, img_size, border_mode=cv2.BORDER_CONSTANT),
@@ -732,10 +786,15 @@ def predict_symptom_mask(symptom_model: nn.Module, ae_model: nn.Module,
     err_tensor = torch.from_numpy(err_resized).unsqueeze(0).unsqueeze(0).float()
     x = torch.cat([img_tensor, err_tensor], dim=1).to(DEVICE)
 
-    logits = symptom_model(x)
-    prob   = torch.sigmoid(logits).squeeze().cpu().numpy()
-    prob   = cv2.resize(prob.astype(np.float32), (orig_w, orig_h),
-                        interpolation=cv2.INTER_LINEAR)
+    logits = symptom_model(x)          # [1, 2, H, W]
+    probs  = torch.sigmoid(logits)     # [1, 2, H, W]
+
+    # Select channel by category
+    ch = 0 if category == "MSV" else 1   # Ch0=MSV, Ch1=MLN
+    prob = probs[0, ch].cpu().numpy()    # H×W
+
+    prob = cv2.resize(prob.astype(np.float32), (orig_w, orig_h),
+                      interpolation=cv2.INTER_LINEAR)
     return prob
 
 
@@ -772,20 +831,29 @@ def compare_against_lab(symptom_model: nn.Module, ae_model: nn.Module,
                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1] > 0).astype(np.uint8)
 
         # Infer category from filename prefix (CATEGORY_filename.jpg convention)
-        category = next((c for c in CLASSES if rec["img_path"].name.startswith(c)), "MSV")
+        category = rec.get("category", next((c for c in CLASSES if rec["img_path"].name.upper().startswith(c)), "MSV"))
 
         lab_mask = (compute_lab_hard_mask(img_rgb, otsu_sil, category) > 0).astype(np.uint8)
-        symptom_prob = predict_symptom_mask(symptom_model, ae_model, img_rgb)
+        symptom_prob = predict_symptom_mask(symptom_model, ae_model, img_rgb, category=category)
         symptom_mask = (symptom_prob >= 0.5).astype(np.uint8)
+
+        # Select the relevant ground-truth mask channel for this category
+        if category == "MSV":
+            gt_mask = rec["msv_mask"]
+        elif category == "MLN":
+            gt_mask = rec["mln_mask"]
+        else:
+            # HEALTHY: both channels should be zero — use MSV channel as reference
+            gt_mask = rec["msv_mask"]
 
         if gt_mask.shape != img_rgb.shape[:2]:
             gt_mask = cv2.resize(gt_mask, (img_rgb.shape[1], img_rgb.shape[0]),
                                  interpolation=cv2.INTER_NEAREST)
 
         rows.append({
-            "image":            rec["img_path"].name,
-            "category":         category,
-            "iou_lab":          round(compute_iou(lab_mask, gt_mask), 4),
+            "image":               rec["img_path"].name,
+            "category":            category,
+            "iou_lab":             round(compute_iou(lab_mask, gt_mask), 4),
             "iou_symptom_teacher": round(compute_iou(symptom_mask, gt_mask), 4),
         })
 
@@ -848,15 +916,23 @@ def main() -> None:
 
     if not SYMPTOM_ANNOTATION_FILE.exists():
         print(f"[FATAL] {SYMPTOM_ANNOTATION_FILE} not found.")
-        print("  Annotate symptom regions in Label Studio on the gold-standard")
-        print(f"  images ({GOLD_IMAGES_DIR}) and export JSON to that path.")
+        print("  Export from CVAT: Task menu → Export dataset → COCO 1.0")
+        print("  Extract zip → place instances_default.json at that path.")
+        print(f"  Annotate using labels: {MAIZE_LEAF_LABEL_NAME}, "
+              f"{MSV_SYMPTOM_LABEL_NAME}, {MLN_SYMPTOM_LABEL_NAME}")
         return
 
     records = parse_symptom_annotations(SYMPTOM_ANNOTATION_FILE, GOLD_IMAGES_DIR)
 
-    if len(records) < SYMPTOM_MIN_ANNOTATIONS:
-        print(f"\n  [WARN] Only {len(records)} symptom-annotated images found. "
-              f"Target is {SYMPTOM_MIN_ANNOTATIONS}.")
+    n_symptom_annotated = sum(
+        1 for r in records
+        if r["category"] in ("MSV", "MLN")
+        and (r["msv_mask"].sum() > 0 or r["mln_mask"].sum() > 0)
+    )
+    if n_symptom_annotated < SYMPTOM_MIN_ANNOTATIONS:
+        print(f"\n  [WARN] Only {n_symptom_annotated} symptom-annotated MSV/MLN images "
+              f"(target {SYMPTOM_MIN_ANNOTATIONS}). HEALTHY images with zero masks "
+              f"are included in training regardless.")
         answer = input("  Proceed with training anyway? [y/N]: ")
         if answer.strip().lower() != "y":
             print("  Aborted. Annotate more images and re-run.")
@@ -864,6 +940,8 @@ def main() -> None:
 
     if len(records) < 20:
         print(f"[FATAL] Only {len(records)} usable records. Check annotation export.")
+        print("  Ensure 'maize-leaf' annotations exist — images without a leaf")
+        print("  annotation are excluded entirely from training.")
         return
 
     # ── Step 3: Train Symptom Teacher ─────────────────────────────────────────
