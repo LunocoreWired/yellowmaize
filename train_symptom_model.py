@@ -84,6 +84,7 @@ from image_utils import load_image_rgb
 from config import (
     SEED, CLASSES, GLOBAL_MANIFEST,
     GOLD_IMAGES_DIR, SYMPTOM_ANNOTATION_FILE, SYMPTOM_LABEL_NAME,
+    MAIZE_LEAF_LABEL_NAME, MSV_SYMPTOM_LABEL_NAME, MLN_SYMPTOM_LABEL_NAME,
     SYMPTOM_MIN_ANNOTATIONS, SYMPTOM_IMG_SIZE, SYMPTOM_VAL_SPLIT,
     SYMPTOM_BATCH_SIZE, SYMPTOM_EPOCHS, SYMPTOM_LR, SYMPTOM_WEIGHT_DECAY,
     SYMPTOM_PATIENCE, SYMPTOM_ENCODER, SYMPTOM_DICE_BCE_WEIGHT,
@@ -641,9 +642,9 @@ def train_symptom_teacher(ae_model: nn.Module, records: list[dict]) -> Path:
     train_ds = SymptomDataset(train_records, ae_model, SYMPTOM_IMG_SIZE, augment=True)
     val_ds   = SymptomDataset(val_records, ae_model, SYMPTOM_IMG_SIZE, augment=False)
     train_loader = DataLoader(train_ds, batch_size=SYMPTOM_BATCH_SIZE,
-                              shuffle=True, num_workers=2, collate_fn=_symptom_collate)
+                              shuffle=True, num_workers=0, collate_fn=_symptom_collate)
     val_loader   = DataLoader(val_ds, batch_size=SYMPTOM_BATCH_SIZE,
-                              shuffle=False, num_workers=2, collate_fn=_symptom_collate)
+                              shuffle=False, num_workers=0, collate_fn=_symptom_collate)
 
     model = SymptomTeacher().to(DEVICE)
     opt   = torch.optim.AdamW(model.parameters(), lr=SYMPTOM_LR,
