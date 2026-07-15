@@ -606,20 +606,48 @@ def _symptom_collate(batch):
     return torch.stack(xs), torch.stack(ys)
 
 
+def dice_focal_loss(logits: torch.Tensor, target: torch.Tensor,
+                    dice_weight: float = 0.6,
+                    focal_weight: float = 0.4,
+                    gamma: float = 2.0,
+                    pos_weight_factor: float = 5.0) -> torch.Tensor:
+    """
+    Combined Dice + Focal loss for small-region segmentation.
+
+    Focal loss (Lin et al. 2017) down-weights easy background pixels by
+    (1 - p)^gamma, forcing the model to focus on hard symptom pixels.
+    This is the correct fix for the class imbalance problem in symptom
+    segmentation where symptom regions are a small fraction of the leaf area.
+
+    pos_weight_factor upweights foreground (symptom) pixels in the focal
+    term — further compensates for the foreground/background imbalance.
+
+    Applied independently to each output channel (Ch0=MSV, Ch1=MLN).
+    """
+    probs  = torch.sigmoid(logits)
+    smooth = 1.0
+
+    # ── Dice component ───────────────────────────────────────────────────────
+    inter = (probs * target).sum(dim=(-2, -1))        # [B, C]
+    union = (probs + target).sum(dim=(-2, -1))         # [B, C]
+    dice  = 1.0 - ((2 * inter + smooth) / (union + smooth)).mean()
+
+    # ── Focal component ──────────────────────────────────────────────────────
+    # pos_weight balances foreground vs background per-channel
+    pos_weight = torch.ones_like(logits) * pos_weight_factor
+    bce_per_pixel = F.binary_cross_entropy_with_logits(
+        logits, target, pos_weight=pos_weight, reduction="none"
+    )
+    p_t = probs * target + (1 - probs) * (1 - target)   # probability of true class
+    focal = ((1 - p_t) ** gamma * bce_per_pixel).mean()
+
+    return dice_weight * dice + focal_weight * focal
+
+
+# Keep old name as alias so any external callers don't break
 def dice_bce_loss(logits: torch.Tensor, target: torch.Tensor,
                   dice_weight: float = SYMPTOM_DICE_BCE_WEIGHT) -> torch.Tensor:
-    """
-    Combined Dice + BCE loss applied independently to each output channel
-    (Ch0=MSV, Ch1=MLN) and averaged. Works for both 1-channel and 2-channel.
-    """
-    bce = F.binary_cross_entropy_with_logits(logits, target)
-    probs = torch.sigmoid(logits)
-    smooth = 1.0
-    # Sum over spatial dims only (H, W); average over batch and channels separately
-    inter = (probs * target).sum(dim=(-2, -1))       # [B, C]
-    union = (probs + target).sum(dim=(-2, -1))        # [B, C]
-    dice  = 1.0 - ((2 * inter + smooth) / (union + smooth)).mean()
-    return dice_weight * dice + (1 - dice_weight) * bce
+    return dice_focal_loss(logits, target)
 
 
 def compute_iou(pred_binary: np.ndarray, gt_binary: np.ndarray) -> float:
@@ -641,8 +669,24 @@ def train_symptom_teacher(ae_model: nn.Module, records: list[dict]) -> Path:
 
     train_ds = SymptomDataset(train_records, ae_model, SYMPTOM_IMG_SIZE, augment=True)
     val_ds   = SymptomDataset(val_records, ae_model, SYMPTOM_IMG_SIZE, augment=False)
+
+    # WeightedRandomSampler: oversample MSV+MLN, undersample HEALTHY
+    # so the model sees proportionally more symptom examples per batch.
+    # HEALTHY images are still included (for the suppression signal) but at
+    # lower frequency — weight 1.0 for symptom images, 0.3 for HEALTHY.
+    from torch.utils.data import WeightedRandomSampler
+    sample_weights = [
+        1.0 if r["category"] in ("MSV", "MLN") else 0.3
+        for r in train_records
+    ]
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(train_records),
+        replacement=True,
+    )
     train_loader = DataLoader(train_ds, batch_size=SYMPTOM_BATCH_SIZE,
-                              shuffle=True, num_workers=0, collate_fn=_symptom_collate)
+                              sampler=sampler, num_workers=0,
+                              collate_fn=_symptom_collate)
     val_loader   = DataLoader(val_ds, batch_size=SYMPTOM_BATCH_SIZE,
                               shuffle=False, num_workers=0, collate_fn=_symptom_collate)
 
@@ -650,7 +694,8 @@ def train_symptom_teacher(ae_model: nn.Module, records: list[dict]) -> Path:
     opt   = torch.optim.AdamW(model.parameters(), lr=SYMPTOM_LR,
                               weight_decay=SYMPTOM_WEIGHT_DECAY)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max",
-                                                        factor=0.5, patience=4)
+                                                        factor=0.5, patience=6,
+                                                        min_lr=1e-6)
 
     SYMPTOM_CKPT_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -674,15 +719,18 @@ def train_symptom_teacher(ae_model: nn.Module, records: list[dict]) -> Path:
             logits = model(x)
             loss = dice_bce_loss(logits, y)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             opt.step()
             train_loss += loss.item()
             n_batches  += 1
         train_loss /= max(n_batches, 1)
 
         model.eval()
-        val_ious = []
+        val_ious_msv     = []   # Ch0 — MSV images only
+        val_ious_mln     = []   # Ch1 — MLN images only
+        val_ious_healthy = []   # suppression check — should stay near 0.0
         with torch.no_grad():
-            for batch in val_loader:
+            for batch_idx, batch in enumerate(val_loader):
                 if batch is None:
                     continue
                 x, y = batch
@@ -690,22 +738,44 @@ def train_symptom_teacher(ae_model: nn.Module, records: list[dict]) -> Path:
                 logits = model(x)
                 probs  = torch.sigmoid(logits).cpu().numpy()
                 gt     = y.numpy()
-                for p, g in zip(probs, gt):
-                    # Average IoU across both channels (MSV + MLN)
-                    ch_ious = []
-                    for ch in range(p.shape[0]):
-                        pred_bin = (p[ch] >= 0.5).astype(np.uint8)
-                        gt_bin   = (g[ch] >= 0.5).astype(np.uint8)
-                        ch_ious.append(compute_iou(pred_bin, gt_bin))
-                    val_ious.append(float(np.mean(ch_ious)))
+                # Recover categories for this batch from val_records
+                batch_start = batch_idx * SYMPTOM_BATCH_SIZE
+                batch_recs  = val_records[batch_start: batch_start + len(probs)]
+                for p, g, rec in zip(probs, gt, batch_recs):
+                    cat = rec.get("category", "MSV")
+                    if cat == "MSV":
+                        iou = compute_iou((p[0] >= 0.5).astype(np.uint8),
+                                          (g[0] >= 0.5).astype(np.uint8))
+                        val_ious_msv.append(iou)
+                    elif cat == "MLN":
+                        iou = compute_iou((p[1] >= 0.5).astype(np.uint8),
+                                          (g[1] >= 0.5).astype(np.uint8))
+                        val_ious_mln.append(iou)
+                    else:  # HEALTHY — check suppression (pred should be near zero)
+                        pred_any = float((p >= 0.5).mean())
+                        val_ious_healthy.append(pred_any)
 
-        val_iou = float(np.mean(val_ious)) if val_ious else 0.0
+        # Primary metric: mean IoU on symptom-annotated images only
+        all_symptom_ious = val_ious_msv + val_ious_mln
+        val_iou     = float(np.mean(all_symptom_ious)) if all_symptom_ious else 0.0
+        msv_iou     = float(np.mean(val_ious_msv))     if val_ious_msv     else 0.0
+        mln_iou     = float(np.mean(val_ious_mln))     if val_ious_mln     else 0.0
+        healthy_act = float(np.mean(val_ious_healthy))  if val_ious_healthy else 0.0
         sched.step(val_iou)
 
         print(f"  Epoch {epoch:>3}/{SYMPTOM_EPOCHS}  "
-              f"train_loss={train_loss:.4f}  val_IoU={val_iou:.4f}")
-        metric_rows.append({"epoch": epoch, "train_loss": round(train_loss, 5),
-                            "val_iou": round(val_iou, 5)})
+              f"train_loss={train_loss:.4f}  "
+              f"val_IoU={val_iou:.4f}  "
+              f"(MSV={msv_iou:.3f}  MLN={mln_iou:.3f}  "
+              f"HEALTHY_act={healthy_act:.3f})")
+        metric_rows.append({
+            "epoch":       epoch,
+            "train_loss":  round(train_loss, 5),
+            "val_iou":     round(val_iou, 5),
+            "msv_iou":     round(msv_iou, 5),
+            "mln_iou":     round(mln_iou, 5),
+            "healthy_act": round(healthy_act, 5),
+        })
 
         if val_iou > best_val_iou:
             best_val_iou = val_iou
