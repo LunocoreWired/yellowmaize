@@ -368,9 +368,7 @@ XAI_TARGET_LAYERS = {
 # YOLO LEAF DETECTOR  (Phase 1b — train before generate_tier1_masks.py v3)
 # ══════════════════════════════════════════════════════════════════════════════
 YOLO_DATASET_DIR       = DATA_DIR / "yolo_dataset"
-YOLO_IMAGES_DIR        = GOLD_IMAGES_DIR                              # same 501 images used for YOLO training
-YOLO_ANNOTATIONS_DIR   = GOLD_ANNOTATIONS_DIR                         # same annotations.json
-YOLO_ANNOTATION_FILE   = GOLD_ANNOTATION_FILE                         # polygon → bbox conversion done in train_yolo_detector.py
+# YOLO_IMAGES_DIR / YOLO_ANNOTATIONS_DIR / YOLO_ANNOTATION_FILE defined below after GOLD paths
 YOLO_WEIGHTS_DIR       = CHECKPOINTS_DIR / "yolo"
 YOLO_WEIGHTS_BEST      = CHECKPOINTS_DIR / "yolo" / "best.pt"
 YOLO_IMG_SIZE          = 640
@@ -417,6 +415,13 @@ GOLD_IMAGES_DIR      = GOLD_DIR / "images"
 GOLD_ANNOTATIONS_DIR = GOLD_DIR / "annotations"
 GOLD_ANNOTATION_FILE = GOLD_ANNOTATIONS_DIR / "annotations.json"
 GOLD_MANIFEST        = GOLD_DIR / "gold_manifest.csv"  # auto-generated on first run
+
+# YOLO paths alias to gold_standard/ — same 501 images and annotations.json
+# serve both YOLO bbox training and gold standard IoU validation.
+# Defined here (after GOLD paths) to avoid forward-reference errors.
+YOLO_IMAGES_DIR        = GOLD_IMAGES_DIR        # same 501 images used for YOLO training
+YOLO_ANNOTATIONS_DIR   = GOLD_ANNOTATIONS_DIR   # same annotations.json
+YOLO_ANNOTATION_FILE   = GOLD_ANNOTATION_FILE   # polygon → bbox conversion in train_yolo_detector.py
 
 # IoU threshold below which a mask is flagged as a poor match
 GOLD_IOU_WARN_THRESHOLD  = 0.75   # warn if per-image IoU drops below this
