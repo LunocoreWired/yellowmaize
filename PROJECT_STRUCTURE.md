@@ -111,6 +111,8 @@ yellowmaize/
 │   ├── preprocessing_summary.txt
 │   ├── factory_summary.csv
 │   ├── factory_filter_breakdown.csv
+│   ├── validate_factory_{mode}.html        ← Phase 4b QA — visual audit of pseudo-masks
+│   ├── validate_factory_all_modes.html     ← --all-modes: side-by-side mode_a/b/c/d
 │   ├── symptom_vs_lab_comparison.csv      ← Phase 3b --compare-lab only
 │   ├── gold_standard_iou_report.csv
 │   ├── gold_standard_iou_summary.csv
@@ -175,6 +177,7 @@ yellowmaize/
 ├── train_teacher.py                       ← Step 7
 ├── train_symptom_model.py                ← Step 7b  (HealthyAE + Symptom Teacher)
 ├── factory_master.py                      ← Step 8
+├── validate_factory.py                    ← Step 8b  (visual QA of pseudo-masks)
 ├── train_student.py                       ← Steps 9 + 10
 ├── generate_charts.py                     ← any time after training
 ├── select_best_pipeline.py               ← Step 11
@@ -242,6 +245,11 @@ python train_symptom_model.py
 # Step 8 — Factory pseudo-labels
 python factory_master.py
 
+# Step 8b — Visual QA of pseudo-masks (optional but recommended before training Student)
+python validate_factory.py --all-modes   # → reports/validate_factory_all_modes.html
+# python validate_factory.py --mode mode_b --n 20   # single-mode, more samples
+# python validate_factory.py --borderline           # flag borderline severity cases
+
 # Steps 9–10 — Student ablation
 python train_student.py --stage 1
 # → check logs/student_comparison_stage1.csv for best encoder
@@ -279,6 +287,7 @@ python generate_report.py
 | `train_teacher.py` | 3 | Train 4 leaf-silhouette segmentation variants on SAM2 soft targets |
 | `train_symptom_model.py` | 3b | Train HealthyAE + Symptom Teacher on human symptom masks |
 | `factory_master.py` | 4 | Generate pseudo-labels for ~215k Tier 2 images across 4 modes |
+| `validate_factory.py` | 4b | Visual HTML audit of pseudo-masks vs raw images, per class, with auto-flagged outliers |
 | `train_student.py` | 5a / 5b | Two-stage Student ablation (encoder × mode) |
 | `generate_charts.py` | any | Reads logs/ CSVs → reports/charts/ PNGs |
 | `select_best_pipeline.py` | 6 | Select best variants, promote to final/, auto-update config.py |
@@ -351,4 +360,5 @@ Test-split images are never included in Tier 1 sampling, Bouncer positives, Teac
 - **All DataLoaders must use `collate_fn=safe_collate`** — if `__getitem__` returns `None` (corrupt image), the batch is filtered gracefully instead of crashing the worker.
 - **`train_symptom_model.py` must run before `factory_master.py`** when `SYMPTOM_TEACHER_DEPLOYED = True` in `config.py`. If the checkpoints are missing, factory falls back to the legacy LAB pipeline automatically.
 - **Factory outputs include `_grade.txt`** (CIMMYT severity grade integer) alongside `_sev.txt` (continuous severity %) for every processed image.
-- **`sample_yolo_annotations.py` has been removed.** YOLO training uses the same `annotations.json` produced by `sample_gold_standard.py`. The `data/yolo_annotations/` directory is no longer used. `YOLO_IMAGES_DIR`, `YOLO_ANNOTATIONS_DIR`, and `YOLO_ANNOTATION_FILE` in `config.py` all point to `data/gold_standard/` paths.
+- **`sample_yolo_annotations.py` is deprecated/unused.** YOLO training now uses the same `annotations.json` produced by `sample_gold_standard.py`; the `data/yolo_annotations/` directory is no longer used, and `YOLO_IMAGES_DIR`, `YOLO_ANNOTATIONS_DIR`, and `YOLO_ANNOTATION_FILE` in `config.py` all point to `data/gold_standard/` paths. The file itself may still be present on disk as legacy cruft — it is safe to delete and is not part of the execution order above.
+- **Run `validate_factory.py` before `train_student.py`.** It is not strictly required by any downstream script, but catching a bad pseudo-mask pattern (e.g. MSV/MLN masks looking identical, or HEALTHY masks with high fill) here is far cheaper than discovering it after a full Student training run.

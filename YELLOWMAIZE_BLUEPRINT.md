@@ -119,7 +119,10 @@ One annotation export, two passes, three downstream consumers:
 2. `validate_gold_standard.py` — reads polygons → `cv2.fillPoly()` → binary IoU masks
 3. `train_yolo_detector.py` (calibration) — YOLO+SAM2 on gold images → calibrate QA threshold
 
-> `sample_yolo_annotations.py` has been removed. `YOLO_IMAGES_DIR`, `YOLO_ANNOTATIONS_DIR`, and `YOLO_ANNOTATION_FILE` in `config.py` all point to `data/gold_standard/` paths.
+> `sample_yolo_annotations.py` is deprecated and unused — it is not part of the execution
+> order. `YOLO_IMAGES_DIR`, `YOLO_ANNOTATIONS_DIR`, and `YOLO_ANNOTATION_FILE` in `config.py`
+> all point to `data/gold_standard/` paths, so any file still present on disk is legacy
+> cruft safe to delete.
 
 ---
 
@@ -317,7 +320,7 @@ tier1_manifest.csv   columns: dest_filename, source_path, category, split, tier
 ### 7.1 What It Does
 Exports **501 images (167 per class)** from Tier 1. Files renamed `{CLASS}_{original}.jpg`. SHA-256 of `tier1_manifest.csv` locked to `data/gold_standard/images/_manifest_hash.txt` on first run — aborts if manifest changes post-annotation.
 
-This is the **only annotation export script in the pipeline.** It replaced and consolidates what was previously two separate scripts (`sample_gold_standard.py` for 300 images and `sample_yolo_annotations.py` for 501 images). The `data/yolo_annotations/` directory no longer exists.
+This is the **only annotation export script that matters in the pipeline.** An older script, `sample_yolo_annotations.py`, once exported a separate 501-image set for YOLO bbox annotation only — it is now deprecated and unused. `train_yolo_detector.py` derives its bounding boxes directly from the same `annotations.json` produced here, so one annotation task now serves all three consumers and `data/yolo_annotations/` is not used.
 
 ### 7.2 Single annotations.json — Three Consumers
 
@@ -671,6 +674,35 @@ R5: H 0–18,   S 30–180, V 30–150    dark brown dead tissue
 Output resolution: all downscaled to 224×224 at write time
   Soft maps: INTER_LINEAR · Binary PNGs: INTER_NEAREST
 ```
+
+### 12.6 Factory QA (validate_factory.py) — Phase 4b
+
+Run after `factory_master.py` to visually audit whether pseudo-masks look correct before
+spending a full training run on them. Not a hard dependency of any later script, but the
+cheapest place to catch a broken masking pattern.
+
+```
+python validate_factory.py                        # 10 images/class, mode_b
+python validate_factory.py --n 20                  # 20 images/class
+python validate_factory.py --mode mode_c           # validate a specific mode
+python validate_factory.py --img path/to/img.jpg   # single image
+python validate_factory.py --all-modes             # mode_a/b/c/d side by side
+python validate_factory.py --borderline             # sample near-threshold severity cases
+```
+
+Output: a self-contained HTML report (`reports/validate_factory_{mode}.html`, or
+`_all_modes.html`) pairing each raw image with its pseudo-mask overlay, plus per-image
+symptom-coverage stats and an automatic pass/fail flag per class:
+
+| Class | Expected mask behavior | Red flag |
+|---|---|---|
+| HEALTHY | Mostly empty (near-black); yellow leaf color should not trip symptom thresholds | > ~4% mask fill |
+| MSV | Narrow, broken streaks parallel to veins, pale-green→yellow→white | Uniform full-leaf fill, or empty on visibly streaky leaves |
+| MLN | Wider, diffuse yellowing + necrotic brown patches from leaf margins inward | Only margins highlighted, or indistinguishable from MSV output |
+
+The docstring in `validate_factory.py` also doubles as a tuning guide: it maps each visual
+failure mode to the exact `factory_master.py` / `config.py` parameter to adjust
+(e.g. `LAB_MSV_B_MIN`, `GABOR_THRESHOLD`, `dark_necrosis` L*/a* bounds).
 
 ---
 
@@ -1113,6 +1145,10 @@ python validate_gold_standard.py                     # Step 6d
 python train_symptom_model.py                        # Step 7b
 
 python factory_master.py                             # Step 8
+
+python validate_factory.py --all-modes               # Step 8b — optional visual QA
+# → reports/validate_factory_all_modes.html — check before spending a full Student run
+# on pseudo-masks; tuning guide for LAB_*/GABOR_THRESHOLD is in the script docstring
 
 python train_student.py --stage 1                    # Step 9
 # check logs/student_comparison_stage1.csv for best encoder
