@@ -87,7 +87,9 @@ from config import (
     MAIZE_LEAF_LABEL_NAME, MSV_SYMPTOM_LABEL_NAME, MLN_SYMPTOM_LABEL_NAME,
     SYMPTOM_MIN_ANNOTATIONS, SYMPTOM_IMG_SIZE, SYMPTOM_VAL_SPLIT,
     SYMPTOM_BATCH_SIZE, SYMPTOM_EPOCHS, SYMPTOM_LR, SYMPTOM_WEIGHT_DECAY,
-    SYMPTOM_PATIENCE, SYMPTOM_ENCODER, SYMPTOM_DICE_BCE_WEIGHT,
+    SYMPTOM_PATIENCE, SYMPTOM_ENCODER,
+    SYMPTOM_DICE_WEIGHT, SYMPTOM_FOCAL_WEIGHT,
+    SYMPTOM_FOCAL_GAMMA, SYMPTOM_FOCAL_POS_WEIGHT,
     SYMPTOM_IOU_TARGET_MEAN,
     HEALTHY_AE_IMG_SIZE, HEALTHY_AE_LATENT_DIM, HEALTHY_AE_BATCH_SIZE,
     HEALTHY_AE_EPOCHS, HEALTHY_AE_LR, HEALTHY_AE_VAL_SPLIT, HEALTHY_AE_PATIENCE,
@@ -607,10 +609,10 @@ def _symptom_collate(batch):
 
 
 def dice_focal_loss(logits: torch.Tensor, target: torch.Tensor,
-                    dice_weight: float = 0.6,
-                    focal_weight: float = 0.4,
-                    gamma: float = 2.0,
-                    pos_weight_factor: float = 5.0) -> torch.Tensor:
+                    dice_weight: float = SYMPTOM_DICE_WEIGHT,
+                    focal_weight: float = SYMPTOM_FOCAL_WEIGHT,
+                    gamma: float = SYMPTOM_FOCAL_GAMMA,
+                    pos_weight_factor: float = SYMPTOM_FOCAL_POS_WEIGHT) -> torch.Tensor:
     """
     Combined Dice + Focal loss for small-region segmentation.
 
@@ -644,10 +646,34 @@ def dice_focal_loss(logits: torch.Tensor, target: torch.Tensor,
     return dice_weight * dice + focal_weight * focal
 
 
-# Keep old name as alias so any external callers don't break
-def dice_bce_loss(logits: torch.Tensor, target: torch.Tensor,
-                  dice_weight: float = SYMPTOM_DICE_BCE_WEIGHT) -> torch.Tensor:
-    return dice_focal_loss(logits, target)
+def symptom_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Combined Dice + Focal loss actually used to train the Symptom Teacher,
+    with weights read from config.py (SYMPTOM_DICE_WEIGHT / SYMPTOM_FOCAL_WEIGHT /
+    SYMPTOM_FOCAL_GAMMA / SYMPTOM_FOCAL_POS_WEIGHT) so they're tunable without
+    editing code, and so this function's config-driven behavior is transparent
+    rather than hardcoded.
+
+    FIX (previously dice_bce_loss): this used to accept a dice_weight argument
+    from SYMPTOM_DICE_BCE_WEIGHT and silently discard it, always calling
+    dice_focal_loss() with its hardcoded defaults regardless of config — the
+    "0.5 Dice + 0.5 BCE" the old name/config comment implied was never actually
+    running; the loss has always been Dice+Focal. That's kept (Focal is the
+    better fit for this task's foreground/background imbalance — see
+    dice_focal_loss()'s docstring), but the config weights now genuinely apply.
+    """
+    return dice_focal_loss(
+        logits, target,
+        dice_weight=SYMPTOM_DICE_WEIGHT,
+        focal_weight=SYMPTOM_FOCAL_WEIGHT,
+        gamma=SYMPTOM_FOCAL_GAMMA,
+        pos_weight_factor=SYMPTOM_FOCAL_POS_WEIGHT,
+    )
+
+
+# Old name kept as a working alias so any external callers don't break.
+def dice_bce_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    return symptom_loss(logits, target)
 
 
 def compute_iou(pred_binary: np.ndarray, gt_binary: np.ndarray) -> float:
@@ -717,7 +743,7 @@ def train_symptom_teacher(ae_model: nn.Module, records: list[dict]) -> Path:
             x, y = x.to(DEVICE), y.to(DEVICE)
             opt.zero_grad()
             logits = model(x)
-            loss = dice_bce_loss(logits, y)
+            loss = symptom_loss(logits, y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             opt.step()
