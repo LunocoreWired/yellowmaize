@@ -701,6 +701,8 @@ def train_one_epoch(model, loader, optimizer,
     n_samples = 0
 
     for batch in loader:
+        if batch is None:
+            continue   # entire batch was skipped by safe_collate (all samples missing/corrupt)
         imgs     = batch["image"].to(device)
         seg_tgt  = batch["seg"].to(device)
         cls_tgt  = batch["cls"].to(device)
