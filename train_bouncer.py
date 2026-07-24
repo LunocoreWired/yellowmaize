@@ -419,12 +419,31 @@ def evaluate_gabor_lbp(val_maize: list[Path], val_nonmaize: list[Path]) -> dict:
         output_dict=True,
         zero_division=0,
     )
+
+    # ── CPU inference latency ────────────────────────────────────────────────
+    # Full per-image pipeline cost: Gabor+LBP feature extraction + SVM predict.
+    # Not directly comparable to the neural variants' forward-pass-only latency
+    # (this includes feature engineering the neural models don't need), but
+    # reported in the same lat_cpu_ms column for a complete efficiency picture
+    # in the comparison table.
+    latencies = []
+    for p in (val_maize[:5] + val_nonmaize[:5]):
+        f = extract_features(p)
+        if f is None:
+            continue
+        t0 = time.perf_counter()
+        extract_features(p)
+        clf.predict(f.reshape(1, -1))
+        latencies.append((time.perf_counter() - t0) * 1000)
+    avg_lat = round(float(np.mean(latencies)), 2) if latencies else "N/A"
+
     return {
         "accuracy": report["accuracy"],
         "maize_prec": report["maize"]["precision"],
         "maize_rec": report["maize"]["recall"],
         "maize_f1": report["maize"]["f1-score"],
         "specificity": report["not_maize"]["recall"],
+        "lat_cpu_ms": avg_lat,
         "note": "Gabor+LBP+LinearSVC — traditional CV baseline",
     }
 
@@ -575,6 +594,30 @@ def train_variant(variant_name: str) -> dict:
     ckpt["threshold_metrics"] = thresh_info
     torch.save(ckpt, ckpt_path)
 
+    # ── CPU inference latency ────────────────────────────────────────────────
+    # Measured on CPU (not the training device) since the Bouncer's deployment
+    # target is mobile CPU, not a training GPU. Same protocol as train_teacher.py:
+    # 20 forward passes on a dummy input, first 5 discarded as warm-up, mean of
+    # the remaining 15 reported. This is what justifies choosing among
+    # classification-tied neural variants (see find_best_threshold's docstring
+    # and the deployment-selection discussion in Chapter 4) on efficiency rather
+    # than accuracy — without this, that reasoning was architectural but unmeasured.
+    model_cpu = VARIANT_BUILDERS[variant_name]().eval()
+    ckpt_cpu = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model_cpu.load_state_dict(ckpt_cpu["model_state"])
+
+    dummy = torch.zeros(1, 3, BOUNCER_IMG_SIZE, BOUNCER_IMG_SIZE)
+    latencies = []
+    with torch.no_grad():
+        for _ in range(20):
+            t0 = time.perf_counter()
+            model_cpu(dummy)
+            latencies.append((time.perf_counter() - t0) * 1000)
+    avg_lat = round(float(np.mean(latencies[5:])), 2)
+    print(f"  Inference latency (CPU, {BOUNCER_IMG_SIZE}px): {avg_lat} ms/image")
+
+    del model_cpu, ckpt_cpu
+
     return {
         "variant": variant_name,
         "best_f1": round(best_f1, 4),
@@ -586,6 +629,7 @@ def train_variant(variant_name: str) -> dict:
         "FP": thresh_info.get("FP", ""),
         "TN": thresh_info.get("TN", ""),
         "FN": thresh_info.get("FN", ""),
+        "lat_cpu_ms": avg_lat,
         "ckpt": str(ckpt_path),
     }
 
@@ -895,6 +939,7 @@ def main() -> None:
             "threshold": "N/A",
             "specificity": gabor_result.get("specificity", "N/A"),
             "maize_recall": gabor_result.get("maize_rec", "N/A"),
+            "lat_cpu_ms": gabor_result.get("lat_cpu_ms", "N/A"),
             "ckpt": "N/A",
         }
     )

@@ -33,6 +33,7 @@
  OUTPUT PNGs (all under reports/charts/):
    Bouncer:
      bouncer_comparison_bar.png           — F1 / Specificity / Recall / ROC-AUC
+     bouncer_latency_bar.png              — CPU inference latency per variant
      bouncer_training_curves_{variant}.png — per-epoch loss, F1, specificity
      bouncer_confusion_matrix_{variant}.png — TP/FP/TN/FN heatmap
 
@@ -217,6 +218,61 @@ def chart_bouncer_comparison():
                        facecolor=GRID_COLOR, edgecolor="#334155")
     fig.tight_layout()
     save_chart(fig, "bouncer_comparison_bar.png")
+
+
+def chart_bouncer_latency():
+    """
+    Bar chart: CPU inference latency (lat_cpu_ms) across all Bouncer variants,
+    from bouncer_comparison.csv. Mirrors chart_teacher_comparison()'s latency
+    panel. This is what backs the "MobileNetV3-Large chosen on efficiency, not
+    accuracy" deployment-selection claim with an actual measurement rather than
+    architectural reasoning alone.
+    """
+    csv_path = LOGS_DIR / "bouncer_comparison.csv"
+    if not csv_path.exists():
+        print(f"  [SKIP] {csv_path.name} not found.")
+        return
+
+    df = pd.read_csv(csv_path)
+    if "lat_cpu_ms" not in df.columns:
+        print("  [SKIP] bouncer_latency — lat_cpu_ms column missing "
+              "(re-run train_bouncer.py to generate it).")
+        return
+
+    variants = df["variant"].tolist()
+    lat_vals = [safe_float(v) for v in df["lat_cpu_ms"]]
+    n = len(variants)
+    colors = [get_color(v, i) for i, v in enumerate(variants)]
+
+    fig, ax = plt.subplots(figsize=(max(7, n * 1.8), 5))
+    apply_dark_style(fig, ax)
+
+    x = np.arange(n)
+    bars = ax.bar(x, lat_vals, color=colors, alpha=0.88,
+                  edgecolor=BG_COLOR, linewidth=0.8, zorder=3)
+    for bar, val in zip(bars, lat_vals):
+        if val > 0:
+            ax.text(bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + max(lat_vals) * 0.015,
+                    f"{val:.1f} ms", ha="center", va="bottom",
+                    fontsize=9, color=TEXT_COLOR)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([v.replace("_", "\n") for v in variants],
+                       color=TEXT_COLOR, fontsize=9)
+    ax.set_ylabel(f"CPU Latency (ms/image @ {224}px)", color=TEXT_COLOR)
+    ax.set_title("Bouncer — CPU Inference Latency\n(note: Gabor+LBP includes feature "
+                 "extraction, not directly comparable to a forward pass)",
+                 color=TEXT_COLOR, fontsize=11, pad=12)
+
+    if "mobilenet_v3_large" in variants:
+        idx = variants.index("mobilenet_v3_large")
+        ax.axvspan(idx - 0.42, idx + 0.42, alpha=0.07, color=ACCENT, zorder=1)
+        ax.text(idx, max(lat_vals) * 1.06, "▲ deployed", ha="center", va="bottom",
+                fontsize=8, color=ACCENT)
+
+    fig.tight_layout()
+    save_chart(fig, "bouncer_latency_bar.png")
 
 
 def chart_bouncer_training_curves():
@@ -909,6 +965,7 @@ def chart_student_metrics_heatmap():
 def run_bouncer():
     print("\n── Bouncer charts ──────────────────────────────────────────")
     chart_bouncer_comparison()
+    chart_bouncer_latency()
     chart_bouncer_training_curves()
     chart_bouncer_confusion()
 
