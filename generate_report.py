@@ -478,7 +478,7 @@ def build_bouncer() -> str:
 
     # Table
     display_cols = [c for c in ["variant","best_f1","threshold","specificity",
-                                  "maize_recall","roc_auc","TP","FP","TN","FN"]
+                                  "maize_recall","roc_auc","lat_cpu_ms","TP","FP","TN","FN"]
                     if c in df.columns]
     table = df_to_table(df[display_cols], highlight_col="specificity")
 

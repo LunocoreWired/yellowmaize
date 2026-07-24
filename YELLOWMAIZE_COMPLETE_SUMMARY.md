@@ -52,6 +52,7 @@ Core libraries: PyTorch ≥ 2.1.0, torchvision ≥ 0.16.0, segmentation-models-p
 | 2d | `validate_gold_standard.py` | SAM2 + Teacher IoU chain |
 | 3b | `train_symptom_model.py` | `checkpoints/healthy_ae/` + `checkpoints/symptom/` |
 | 4 | `factory_master.py` | `data/pseudo_masks/{mode}/` — pseudo-labels for ~215k Tier 2 images |
+| 4b | `validate_factory.py` | `reports/validate_factory_{mode}.html` — visual QA of pseudo-masks (optional, pre-training) |
 | 5a | `train_student.py --stage 1` | 5 encoder variants × Mode B → `checkpoints/student/stage1/` |
 | 5b | `train_student.py --stage 2` | Best encoder × 4 modes → `checkpoints/student/` |
 | 5c | `validate_gold_standard.py` | Full SAM2 → Teacher → Student chain (final thesis table) |
@@ -152,7 +153,7 @@ Pass 1 — Leaf silhouette: polygonlabels task, trace full leaf outline. Export 
 
 Pass 2 — Symptom regions (Phase 3b): return to same project, trace disease areas only (chlorotic streaks for MSV, necrotic patches for MLN), label = `"symptom"`. HEALTHY images: skip. Target ≥ 400 MSV+MLN images. Export JSON → `data/gold_standard/annotations/symptom_annotations.json`. Do this before running `train_symptom_model.py`.
 
-> **Note:** `sample_yolo_annotations.py` has been removed. There is no longer a separate YOLO annotation export step. `YOLO_IMAGES_DIR`, `YOLO_ANNOTATIONS_DIR`, and `YOLO_ANNOTATION_FILE` in `config.py` all now point to `data/gold_standard/` paths.
+> **Note:** `sample_yolo_annotations.py` is deprecated — there is no longer a separate YOLO annotation export step in the execution order, even if the file itself is still present on disk. `YOLO_IMAGES_DIR`, `YOLO_ANNOTATIONS_DIR`, and `YOLO_ANNOTATION_FILE` in `config.py` all now point to `data/gold_standard/` paths.
 
 ### 4.7 YOLO Leaf Detector — `train_yolo_detector.py` (Phase 1c)
 
@@ -198,6 +199,19 @@ Processes ~215k train+val Tier 2 images, writing pseudo-labels into 4 mode subfo
 | D | SAM2 soft float | Soft confidence | `mode_d/` |
 
 Per-image outputs per mode: `{stem}_silhouette.npy`, `{stem}_symptom.png` or `.npy`, `{stem}_sev.txt`, `{stem}_grade.txt`, `{stem}_weight.txt`. All downscaled to 224×224 at write time.
+
+### 4.11b Factory QA — `validate_factory.py` (Phase 4b)
+
+Optional but recommended visual audit, run right after `factory_master.py` and before
+committing to a full `train_student.py` run. Samples N images per class (default 10),
+pairs each raw image with its pseudo-mask overlay, and writes a self-contained HTML report
+(`reports/validate_factory_{mode}.html`, or `_all_modes.html` with `--all-modes`) with
+per-image symptom-coverage stats and an automatic per-class flag: HEALTHY masks should be
+near-empty (>~4% fill is suspect), MSV should show narrow vein-parallel streaks, MLN should
+show broader diffuse yellowing/necrosis from the leaf margins. The script's docstring also
+maps each visual failure pattern to the exact `factory_master.py`/`config.py` parameter to
+tune (e.g. `LAB_MSV_B_MIN`, `GABOR_THRESHOLD`). CLI: `--n`, `--mode`, `--all-modes`, `--img`,
+`--borderline` (sample near-threshold severity cases), `--out`.
 
 ### 4.12 Student — `train_student.py` (Phase 5)
 
@@ -282,7 +296,7 @@ Path: PyTorch → ONNX (opset 12) → TF SavedModel → TFLite FP16. Student I/O
 | "Pseudo-label semi-supervised learning" not "knowledge distillation" | Teacher generates hard mask targets + severity floats. True KD requires soft logit outputs. Wrong term must not appear in the thesis. |
 | SAM2 soft probability maps as Teacher targets | Preserves boundary uncertainty at edge pixels (0.3–0.7). Acts as segmentation label smoothing. |
 | BoundaryAwareLoss for Teacher | Sharpens soft SAM2 targets (1.3×) and up-weights boundary pixels (5.0×) — forces precise edge learning over interior blob accuracy. |
-| Single gold standard export (501 images) for both YOLO and IoU validation | `train_yolo_detector.py` derives bounding boxes from polygons automatically. One annotation task, one `annotations.json`, three consumers. `sample_yolo_annotations.py` removed. |
+| Single gold standard export (501 images) for both YOLO and IoU validation | `train_yolo_detector.py` derives bounding boxes from polygons automatically. One annotation task, one `annotations.json`, three consumers. `sample_yolo_annotations.py` is deprecated/unused. |
 | Symptom Teacher replaces LAB/HSV | Eight rounds of tuning (v1→v8) confirmed a structural ceiling. Human-supervised model learns the decision boundary directly. |
 | HealthyAE as 4th input channel | Lighting-invariant anomaly prior. AE is an input feature, not a label source. |
 | Asymmetric label smoothing | Early MSV visually identical to HEALTHY (Cruz et al. 2024). Pathology-informed prior prevents overconfidence. |
@@ -306,7 +320,7 @@ Path: PyTorch → ONNX (opset 12) → TF SavedModel → TFLite FP16. Student I/O
 
 ---
 
-## 8. File Inventory (24 scripts + 2 shared utilities)
+## 8. File Inventory (22 pipeline scripts + config/utils + 2 shared utilities)
 
 ```
 yellowmaize/
@@ -325,6 +339,7 @@ yellowmaize/
 ├── train_teacher.py
 ├── train_symptom_model.py
 ├── factory_master.py
+├── validate_factory.py         Visual HTML QA of pseudo-masks (Phase 4b, optional)
 ├── train_student.py
 ├── generate_charts.py
 ├── select_best_pipeline.py
@@ -340,7 +355,11 @@ yellowmaize/
     └── safe_collate.py
 ```
 
-> `sample_yolo_annotations.py` has been removed. The `data/yolo_annotations/` directory no longer exists. `YOLO_IMAGES_DIR`, `YOLO_ANNOTATIONS_DIR`, and `YOLO_ANNOTATION_FILE` in `config.py` all point to `data/gold_standard/` paths.
+> `sample_yolo_annotations.py` is deprecated and unused — not part of the execution order.
+> A copy may still be present on disk as legacy cruft (safe to delete). YOLO training reads
+> bounding boxes from the same `annotations.json` produced by `sample_gold_standard.py`, and
+> the `data/yolo_annotations/` directory is not used. `YOLO_IMAGES_DIR`, `YOLO_ANNOTATIONS_DIR`,
+> and `YOLO_ANNOTATION_FILE` in `config.py` all point to `data/gold_standard/` paths.
 
 ---
 

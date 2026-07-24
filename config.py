@@ -496,7 +496,14 @@ SYMPTOM_LR                = 1e-4
 SYMPTOM_WEIGHT_DECAY      = 1e-4
 SYMPTOM_PATIENCE          = 10
 SYMPTOM_ENCODER           = "efficientnet-b2"   # matches TEACHER_DEPLOYED_VARIANT family
-SYMPTOM_DICE_BCE_WEIGHT   = 0.5          # 0.5 Dice + 0.5 BCE combined loss
+# Combined Dice + Focal loss (see dice_focal_loss() in train_symptom_model.py).
+# Focal loss (not BCE) is used deliberately: symptom pixels are a small fraction
+# of leaf area, and focal down-weighting of easy background pixels handles that
+# imbalance better than BCE alone. pos_weight further upweights foreground pixels.
+SYMPTOM_DICE_WEIGHT       = 0.6           # Dice component weight
+SYMPTOM_FOCAL_WEIGHT      = 0.4           # Focal component weight
+SYMPTOM_FOCAL_GAMMA       = 2.0           # focal focusing parameter (Lin et al. 2017)
+SYMPTOM_FOCAL_POS_WEIGHT  = 5.0           # foreground (symptom) pixel upweighting
 SYMPTOM_IOU_TARGET_MEAN   = 0.70         # lower bar than leaf silhouette — symptom
                                           # boundaries are inherently fuzzier than
                                           # leaf outlines, even for human annotators
