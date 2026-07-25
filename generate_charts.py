@@ -13,15 +13,17 @@
    python generate_charts.py --teacher    # teacher charts only
    python generate_charts.py --student    # student charts only
 
- INPUT CSVs (all under logs/):
+ INPUT CSVs (all under logs/, except gold-standard which is under reports/):
    Bouncer:
      logs/bouncer_comparison.csv
      logs/bouncer_{variant}_metrics.csv   (per-epoch training curves)
+     logs/bouncer_admission_rate_{variant}.csv  (test-split admission rate)
 
    Teacher:
      logs/teacher_comparison.csv
      logs/teacher_{variant}_metrics.csv   (per-epoch training curves)
      logs/teacher_test_metrics.csv        (held-out test evaluation)
+     reports/gold_standard_iou_summary.csv (human-annotated IoU chain)
 
    Student:
      logs/student_comparison_stage1.csv   (encoder ablation)
@@ -34,11 +36,13 @@
    Bouncer:
      bouncer_comparison_bar.png           — F1 / Specificity / Recall / ROC-AUC
      bouncer_latency_bar.png              — CPU inference latency per variant
+     bouncer_admission_rate_bar.png       — admitted / rejected breakdown (test-split)
      bouncer_training_curves_{variant}.png — per-epoch loss, F1, specificity
      bouncer_confusion_matrix_{variant}.png — TP/FP/TN/FN heatmap
 
    Teacher:
      teacher_comparison_bar.png           — Best Dice / CPU latency bar chart
+     teacher_gold_iou_bar.png             — SAM2 vs. Teacher vs. Student IoU vs. human ground truth
      teacher_training_curves_{variant}.png — per-epoch loss, Dice, IoU, Recall
 
    Student:
@@ -71,6 +75,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 ROOT      = Path(__file__).parent
 LOGS_DIR  = ROOT / "logs"
+REPORTS_DIR = ROOT / "reports"
 CHART_DIR = ROOT / "reports" / "charts"
 CHART_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -275,6 +280,65 @@ def chart_bouncer_latency():
     save_chart(fig, "bouncer_latency_bar.png")
 
 
+def chart_bouncer_admission_rate():
+    """
+    Horizontal stacked bar showing what happened to every test-split maize
+    image when run through the deployed Bouncer: admitted, rejected by the
+    heuristic pre-filter, or rejected by the neural classifier. Backs
+    Table 4.5 with an actual figure rather than leaving admission rate as a
+    text-only metric.
+    """
+    files = sorted(LOGS_DIR.glob("bouncer_admission_rate_*.csv"))
+    if not files:
+        print("  [SKIP] bouncer_admission_rate — no bouncer_admission_rate_*.csv "
+              "found (run evaluate_admission_rate() first).")
+        return
+
+    df = pd.read_csv(files[0])
+    if df.empty:
+        print(f"  [SKIP] {files[0].name} is empty.")
+        return
+    row = df.iloc[0]
+
+    n_total = float(row.get("n_test_maize", 0)) or 1.0
+    n_heuristic_rej = float(row.get("n_heuristic_reject", 0))
+    n_passed = float(row.get("n_passed", 0))
+    n_neural_rej = max(n_total - n_heuristic_rej - n_passed, 0.0)
+    variant = row.get("variant", "deployed")
+
+    segments = [
+        ("Admitted", n_passed, "#2ecc71"),
+        ("Rejected — neural Bouncer", n_neural_rej, "#e67e22"),
+        ("Rejected — heuristic pre-filter", n_heuristic_rej, "#e74c3c"),
+    ]
+
+    fig, ax = plt.subplots(figsize=(9, 2.6))
+    apply_dark_style(fig, ax)
+
+    left = 0.0
+    for label, val, color in segments:
+        pct = 100 * val / n_total
+        if val > 0:
+            ax.barh(0, val, left=left, color=color, height=0.5,
+                    label=f"{label} ({pct:.1f}%)", zorder=3)
+            if pct >= 4:
+                ax.text(left + val / 2, 0, f"{pct:.1f}%", ha="center", va="center",
+                        fontsize=9, color="#0F172A", fontweight="bold")
+        left += val
+
+    ax.set_xlim(0, n_total)
+    ax.set_yticks([])
+    ax.set_xlabel(f"Test-split maize images (n = {int(n_total)})", color=TEXT_COLOR)
+    ax.set_title(f"Bouncer Admission Breakdown — {variant} "
+                 f"(test-split maize images)",
+                 color=TEXT_COLOR, fontsize=11, pad=12)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.45), ncol=1,
+             fontsize=8, frameon=False, labelcolor=TEXT_COLOR)
+
+    fig.tight_layout()
+    save_chart(fig, "bouncer_admission_rate_bar.png")
+
+
 def chart_bouncer_training_curves():
     """Per-epoch training curves (loss, F1, specificity) for each neural variant."""
     for variant in BOUNCER_VARIANTS:
@@ -469,6 +533,71 @@ def chart_teacher_comparison():
     fig.suptitle("Teacher Model Comparison", color=TEXT_COLOR, fontsize=13, y=1.02)
     fig.tight_layout()
     save_chart(fig, "teacher_comparison_bar.png")
+
+
+def chart_teacher_gold_iou():
+    """
+    Grouped bar chart: mean IoU per class (HEALTHY/MSV/MLN/Overall), one
+    series per artifact in the IoU chain (SAM2 pseudo-mask / Teacher / Student
+    — whichever are present), all scored against the same 501 human-annotated
+    gold-standard masks. Backs Table 4.11 with an actual figure, and — because
+    all three artifacts are plotted together — makes it possible to see at a
+    glance whether Teacher improves on SAM2 and whether Student holds onto
+    that improvement, not just what Teacher's number is in isolation.
+    """
+    csv_path = REPORTS_DIR / "gold_standard_iou_summary.csv"
+    if not csv_path.exists():
+        print(f"  [SKIP] {csv_path.name} not found "
+              "(run validate_gold_standard.py first).")
+        return
+
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        print(f"  [SKIP] {csv_path.name} is empty.")
+        return
+
+    artifacts = df["artifact"].tolist()
+    classes = ["HEALTHY", "MSV", "MLN", "overall"]
+    class_labels = ["HEALTHY", "MSV", "MLN", "Overall"]
+
+    n_classes = len(classes)
+    n_artifacts = len(artifacts)
+    x = np.arange(n_classes)
+    width = 0.8 / max(n_artifacts, 1)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    apply_dark_style(fig, ax)
+
+    for i, art in enumerate(artifacts):
+        row = df[df["artifact"] == art].iloc[0]
+        vals = [safe_float(row.get(f"{c}_mean_iou" if c != "overall"
+                                    else "overall_mean_iou", 0))
+                for c in classes]
+        offset = i * width - (n_artifacts - 1) * width / 2
+        bars = ax.bar(x + offset, vals, width * 0.9,
+                      label=art, color=get_color(art, i), zorder=3)
+        for bar, val in zip(bars, vals):
+            if val > 0:
+                ax.text(bar.get_x() + bar.get_width() / 2, val + 0.01,
+                        f"{val:.3f}", ha="center", va="bottom",
+                        fontsize=8, color=TEXT_COLOR)
+
+    ax.axhline(0.75, color="#e67e22", linestyle="--", linewidth=1,
+              label="Warn threshold (0.75)", zorder=2)
+    ax.axhline(0.85, color="#2ecc71", linestyle="--", linewidth=1,
+              label="Target (0.85)", zorder=2)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(class_labels, color=TEXT_COLOR)
+    ax.set_ylabel("Mean IoU vs. human ground truth", color=TEXT_COLOR)
+    ax.set_ylim(0, 1.05)
+    ax.set_title("Gold-Standard IoU Chain — SAM2 vs. Teacher vs. Student\n"
+                 "(all scored against the same 501 human-annotated masks)",
+                 color=TEXT_COLOR, fontsize=11, pad=12)
+    ax.legend(fontsize=8, labelcolor=TEXT_COLOR, ncol=2)
+
+    fig.tight_layout()
+    save_chart(fig, "teacher_gold_iou_bar.png")
 
 
 def chart_teacher_training_curves():
@@ -966,6 +1095,7 @@ def run_bouncer():
     print("\n── Bouncer charts ──────────────────────────────────────────")
     chart_bouncer_comparison()
     chart_bouncer_latency()
+    chart_bouncer_admission_rate()
     chart_bouncer_training_curves()
     chart_bouncer_confusion()
 
@@ -973,6 +1103,7 @@ def run_bouncer():
 def run_teacher():
     print("\n── Teacher charts ──────────────────────────────────────────")
     chart_teacher_comparison()
+    chart_teacher_gold_iou()
     chart_teacher_training_curves()
 
 

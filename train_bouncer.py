@@ -979,6 +979,18 @@ def main() -> None:
         print(f"  {r['variant']:<22} {f1:>6} {sp:>6} {rec:>6}")
 
     print(f"\n  Comparison CSV: {comp_path}")
+
+    # ── Admission rate on held-out test-split maize images ────────────────────
+    # FIX: this function existed but was never called from main() — it was
+    # dead code. Running it here, against the deployed variant, is what
+    # actually produces the false-rejection-rate figure that Chapter 4's
+    # admission-rate table depends on; nothing upstream of this call could
+    # have produced it, no matter how many times the comparison above ran.
+    print(f"\n{'─' * 72}")
+    print(f"  Admission rate — deployed variant ({BOUNCER_DEPLOYED_VARIANT})")
+    print(f"{'─' * 72}")
+    evaluate_admission_rate(BOUNCER_DEPLOYED_VARIANT)
+
     print(f"\n  NEXT STEP: python sample_15000.py")
     print("=" * 72)
 

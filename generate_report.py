@@ -469,6 +469,51 @@ def build_overview() -> str:
     return cards + note + rej_table
 
 
+def chart_admission_breakdown(row: pd.Series) -> str:
+    """
+    Horizontal stacked bar: what happened to every test-split maize image —
+    admitted, rejected by the heuristic pre-filter, or rejected by the neural
+    Bouncer. A visual complement to the admission-rate metric cards, so the
+    breakdown isn't only ever seen as three separate numbers.
+    """
+    plt = _get_mpl()
+    import matplotlib.pyplot as _plt
+
+    n_total = float(row.get("n_test_maize", 0)) or 1.0
+    n_heuristic_rej = float(row.get("n_heuristic_reject", 0))
+    n_passed = float(row.get("n_passed", 0))
+    n_neural_rej = max(n_total - n_heuristic_rej - n_passed, 0.0)
+
+    segments = [
+        ("Admitted", n_passed, "#2ecc71"),
+        ("Rejected — neural Bouncer", n_neural_rej, "#e67e22"),
+        ("Rejected — heuristic pre-filter", n_heuristic_rej, "#e74c3c"),
+    ]
+
+    fig, ax = _plt.subplots(figsize=(8, 2.2))
+    left = 0.0
+    for label, val, color in segments:
+        pct = 100 * val / n_total
+        if val > 0:
+            ax.barh(0, val, left=left, color=color, height=0.55, label=label)
+            if pct >= 4:
+                ax.text(left + val / 2, 0, f"{pct:.1f}%", ha="center", va="center",
+                        fontsize=9, color="#1a1a2e", fontweight="bold")
+        left += val
+
+    ax.set_xlim(0, n_total)
+    ax.set_yticks([])
+    ax.set_xlabel(f"Test-split maize images (n={int(n_total)})")
+    ax.set_title("Bouncer Admission Breakdown — Test-Split Maize Images",
+                 fontsize=11, pad=10)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.35), ncol=3, fontsize=8,
+             frameon=False)
+    fig.tight_layout()
+    b64 = _fig_to_b64(fig)
+    _plt.close(fig)
+    return b64
+
+
 def build_bouncer() -> str:
     comp_csv = LOGS_DIR / "bouncer_comparison.csv"
     if not comp_csv.exists():
@@ -509,6 +554,7 @@ def build_bouncer() -> str:
 {metric_card(str(row.get('n_test_maize','N/A')), "Test-split maize images evaluated")}
 </div>
 <div class="note">Admission rate directly adjusts the Student model\'s effective end-to-end recall. A false rejection rate below 5% is acceptable.</div>"""
+            adm_html += safe_chart(chart_admission_breakdown, row)
 
     return f"<h3>Variant comparison</h3>{table}{chart}{adm_html}"
 
@@ -553,12 +599,58 @@ def build_teacher() -> str:
                                         "val_specificity","train_loss"],
             f"Teacher Training — {best_teacher}")
 
+    # ── Gold-standard IoU (human ground truth) ──────────────────────────────
+    # Previously missing entirely from this report — validate_gold_standard.py
+    # already produces this data, it just wasn't being read here.
+    gold_csv = REPORTS_DIR / "gold_standard_iou_summary.csv"
+    if gold_csv.exists():
+        gdf = pd.read_csv(gold_csv)
+        if not gdf.empty:
+            html += "<h3>Gold-standard validation (501 human-annotated images)</h3>"
+
+            teacher_row = gdf[gdf["artifact"] == "teacher"]
+            if not teacher_row.empty:
+                r = teacher_row.iloc[0]
+                target_met = str(r.get("target_met", "")).lower() in ("true", "1")
+                html += f"""<div class="grid3">
+{metric_card(f"{r.get('overall_mean_iou','N/A')}", "Overall Mean IoU (vs. human masks)", "good" if target_met else "bad")}
+{metric_card(f"{r.get('n_below_warn','N/A')} / {r.get('n_total','N/A')}", "Images below 0.75 warn threshold", "")}
+{metric_card("Target met" if target_met else "Below target", "Target: mean IoU ≥ 0.85", "good" if target_met else "bad")}
+</div>"""
+
+            # Grouped bar: mean IoU per class, one series per artifact
+            # (sam2 / teacher / student — whichever are present)
+            classes = ["HEALTHY", "MSV", "MLN", "overall"]
+            artifacts_present = gdf["artifact"].tolist()
+            chart_rows = []
+            for cls in classes:
+                row = {"class": cls}
+                for art in artifacts_present:
+                    art_row = gdf[gdf["artifact"] == art].iloc[0]
+                    key = f"{cls}_mean_iou" if cls != "overall" else "overall_mean_iou"
+                    row[art] = art_row.get(key, None)
+                chart_rows.append(row)
+            chart_df = pd.DataFrame(chart_rows)
+            if len(artifacts_present) > 0:
+                html += safe_chart(
+                    chart_bar_comparison, chart_df, "class", artifacts_present,
+                    "Gold-Standard IoU by Class (vs. human ground truth)",
+                    ylabel="Mean IoU")
+        else:
+            html += "<p style='color:#666;font-size:0.85rem'>gold_standard_iou_summary.csv is empty.</p>"
+    else:
+        html += "<p style='color:#666;font-size:0.85rem'>Gold-standard validation not yet run — run validate_gold_standard.py.</p>"
+
     # Overlays
-    overlay_dir = REPORTS_DIR / "teacher_overlays"
+    # FIX: validate_gold_standard.py saves overlays to REPORTS_DIR /
+    # "gold_standard_overlays" (confirmed against that script), not
+    # "teacher_overlays" — this directory never existed under the old name,
+    # so this section always silently rendered nothing.
+    overlay_dir = REPORTS_DIR / "gold_standard_overlays"
     if overlay_dir.exists():
-        imgs = sorted(overlay_dir.glob("*.jpg"))[:6]
+        imgs = sorted(overlay_dir.glob("*_teacher_overlay.jpg"))[:6]
         if imgs:
-            html += "<h3>Qualitative leaf silhouette overlays</h3><div class='overlay-grid'>"
+            html += "<h3>Qualitative leaf silhouette overlays (vs. human ground truth)</h3><div class='overlay-grid'>"
             for p in imgs:
                 b64 = _img_to_b64(p)
                 if b64:
