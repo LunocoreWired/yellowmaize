@@ -333,8 +333,7 @@ def select_best_student() -> dict | None:
             print(f"  Mobile ranking → {MOBILE_RANKED_CSV}")
 
         # Print comparison table
-        print(f"
-  {'Encoder':<22} {'Mode':<8} {'MSV_F1':>7} "
+        print(f"\n  {'Encoder':<22} {'Mode':<8} {'MSV_F1':>7} "
               f"{'mIoU':>6} {'CPU ms':>7} {'MB':>5} {'Mobile':>8} {'Deploy':>7}")
         print(f"  {'─'*22} {'─'*8} {'─'*7} {'─'*6} {'─'*7} {'─'*5} {'─'*8} {'─'*7}")
         for r in sorted_runs:

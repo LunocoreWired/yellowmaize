@@ -349,7 +349,7 @@ def main() -> None:
     # ── Load model ─────────────────────────────────────────────────────────────
     use_cbam = "cbam" in best_variant
     model    = StudentModel(best_variant, use_cbam=use_cbam).to(DEVICE)
-    ckpt     = torch.load(ckpt_path, map_location=DEVICE)
+    ckpt     = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
@@ -587,7 +587,7 @@ def main() -> None:
                     cfg_text)
                 if new_cfg != cfg_text:
                     config_path.write_text(new_cfg, encoding="utf-8")
-                    print(f"    config.py updated: XAI_DEPLOYED_METHOD = "{best_method}"")
+                    print(f'    config.py updated: XAI_DEPLOYED_METHOD = "{best_method}"')
                 else:
                     print(f"    config.py unchanged (already {best_method})")
         else:

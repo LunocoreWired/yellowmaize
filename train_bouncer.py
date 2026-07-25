@@ -577,7 +577,7 @@ def train_variant(variant_name: str) -> dict:
 
     # ── Empirical threshold selection ──────────────────────────────────────────
     print(f"  Loading best checkpoint for threshold tuning ...")
-    ckpt = torch.load(ckpt_path, map_location=DEVICE)
+    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     val_m = evaluate(model, val_loader, DEVICE, threshold=0.50)
 
@@ -672,7 +672,7 @@ def evaluate_admission_rate(variant: str) -> dict:
         return {}
 
     model = VARIANT_BUILDERS[variant]().to(DEVICE)
-    ckpt = torch.load(ckpt_path, map_location=DEVICE)
+    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     threshold = ckpt.get("threshold", BOUNCER_THRESHOLD)
     model.eval()

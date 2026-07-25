@@ -1370,7 +1370,7 @@ def train_one(encoder_variant: str, factory_mode: str, stage: int = 1) -> dict:
         writer.writerows(log_rows)
 
     # ── Test evaluation ───────────────────────────────────────────────────────
-    ckpt = torch.load(ckpt_path, map_location=DEVICE)
+    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     test_results = evaluate_test_split(model, factory_mode,
                                        encoder_variant, DEVICE)

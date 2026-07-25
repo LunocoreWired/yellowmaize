@@ -74,7 +74,7 @@ def find_best_checkpoint() -> tuple[Path, str, str]:
     final_ckpt = CHECKPOINTS_DIR / "final" / "student_best.pth"
     if final_ckpt.exists():
         # Load metadata from checkpoint
-        ckpt = torch.load(final_ckpt, map_location="cpu")
+        ckpt = torch.load(final_ckpt, map_location="cpu", weights_only=False)
         variant = ckpt.get("encoder", STUDENT_BEST_VARIANT)
         mode    = ckpt.get("mode",    "mode_b")
         print(f"  Using canonical best checkpoint: {final_ckpt.name}")
@@ -349,7 +349,7 @@ def main() -> None:
     # ── Load model ─────────────────────────────────────────────────────────────
     use_cbam = "cbam" in variant
     model    = StudentModel(variant, use_cbam=use_cbam)
-    ckpt     = torch.load(ckpt_path, map_location="cpu")
+    ckpt     = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 

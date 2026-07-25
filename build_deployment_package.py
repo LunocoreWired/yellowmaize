@@ -94,7 +94,7 @@ def export_bouncer_tflite() -> tuple[bool, float]:
     in_f  = model.classifier[-1].in_features
     model.classifier[-1] = nn.Linear(in_f, 1)
 
-    ckpt = torch.load(ckpt_path, map_location="cpu")
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     model.eval()
 
@@ -492,8 +492,8 @@ val severityPct = sevOutput[0][0] * 100f
 
 // Segmentation — NHWC layout: segOutput[0][y][x][channel]
 // channel 0 = leaf silhouette, channel 1 = symptom mask
-val silhouette = Array(224) { y -> FloatArray(224) { x -> segOutput[0][y][x][0] } }
-val symptoms   = Array(224) { y -> FloatArray(224) { x -> segOutput[0][y][x][1] } }
+val silhouette = Array(224) {{ y -> FloatArray(224) {{ x -> segOutput[0][y][x][0] }} }}
+val symptoms   = Array(224) {{ y -> FloatArray(224) {{ x -> segOutput[0][y][x][1] }} }}
 // Apply sigmoid and threshold at 0.5 to get binary masks
 // Draw green contour overlay from silhouette mask
 // Draw symptom region overlay from symptoms mask
@@ -574,7 +574,7 @@ def main() -> None:
     for bp in [final_bouncer, fb_ckpt]:
         if bp.exists():
             try:
-                ckpt = torch.load(bp, map_location="cpu")
+                ckpt = torch.load(bp, map_location="cpu", weights_only=False)
                 bouncer_thresh = float(ckpt.get("threshold", bouncer_thresh))
             except Exception:
                 pass
