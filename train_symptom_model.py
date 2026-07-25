@@ -920,7 +920,12 @@ def compare_against_lab(symptom_model: nn.Module, ae_model: nn.Module,
         img_rgb = load_image_rgb(rec["img_path"])
         if img_rgb is None:
             continue
-        gt_mask = rec["mask"]
+        # FIX: rec["mask"] doesn't exist in this record's schema (only
+        # "msv_mask" / "mln_mask" do — see parse_symptom_annotations()'s
+        # docstring) — this line raised a KeyError on the first iteration,
+        # every time, which is why symptom_vs_lab_comparison.csv never got
+        # produced. The correct gt_mask is selected by category a few lines
+        # below anyway, so this line was both wrong and redundant.
 
         # Simple Otsu silhouette as a stand-in leaf mask for this comparison
         gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)

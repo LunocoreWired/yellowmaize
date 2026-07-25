@@ -559,6 +559,92 @@ def build_bouncer() -> str:
     return f"<h3>Variant comparison</h3>{table}{chart}{adm_html}"
 
 
+def build_symptom() -> str:
+    """
+    Symptom Teacher section — previously entirely absent from this report.
+    Mirrors build_teacher()'s pattern: training curve, then a LAB-comparison
+    table+chart (Table 4.13), then qualitative overlay galleries for
+    Figures 4.16-4.18, all produced by validate_symptom.py.
+    """
+    html = ""
+
+    # Training curve
+    curve_csv = LOGS_DIR / "symptom_teacher_metrics.csv"
+    if curve_csv.exists():
+        df = pd.read_csv(curve_csv)
+        if not df.empty:
+            html += "<h3>Training curves</h3>"
+            html += safe_chart(
+                chart_training_curve, df,
+                ["train_loss", "val_iou", "msv_iou", "mln_iou", "healthy_act"],
+                "Symptom Teacher Training")
+    else:
+        html += "<p style='color:#666;font-size:0.85rem'>symptom_teacher_metrics.csv not found — run train_symptom_model.py first.</p>"
+
+    # LAB comparison (Table 4.13)
+    lab_csv = REPORTS_DIR / "symptom_vs_lab_comparison.csv"
+    if lab_csv.exists():
+        ldf = pd.read_csv(lab_csv)
+        if not ldf.empty:
+            html += "<h3>Symptom Teacher vs. legacy LAB/HSV (vs. human ground truth)</h3>"
+
+            overall_lab = ldf["iou_lab"].mean()
+            overall_teacher = ldf["iou_symptom_teacher"].mean()
+            improved = overall_teacher > overall_lab
+            html += f"""<div class="grid3">
+{metric_card(f"{overall_lab:.3f}", "Mean IoU — Legacy LAB", "")}
+{metric_card(f"{overall_teacher:.3f}", "Mean IoU — Symptom Teacher", "good" if improved else "bad")}
+{metric_card(f"{'+' if improved else ''}{(overall_teacher - overall_lab):.3f}", "Improvement over LAB", "good" if improved else "bad")}
+</div>"""
+
+            classes = sorted(ldf["category"].unique().tolist())
+            chart_rows = []
+            for cls in classes:
+                cdf = ldf[ldf["category"] == cls]
+                chart_rows.append({
+                    "class": cls,
+                    "Legacy LAB": cdf["iou_lab"].mean(),
+                    "Symptom Teacher": cdf["iou_symptom_teacher"].mean(),
+                })
+            chart_rows.append({
+                "class": "Overall",
+                "Legacy LAB": overall_lab,
+                "Symptom Teacher": overall_teacher,
+            })
+            chart_df = pd.DataFrame(chart_rows)
+            html += safe_chart(
+                chart_bar_comparison, chart_df, "class",
+                ["Legacy LAB", "Symptom Teacher"],
+                "Symptom Teacher vs. Legacy LAB — Mean IoU by Class", ylabel="Mean IoU")
+        else:
+            html += "<p style='color:#666;font-size:0.85rem'>symptom_vs_lab_comparison.csv is empty.</p>"
+    else:
+        html += "<p style='color:#666;font-size:0.85rem'>LAB comparison not yet run — run validate_symptom.py.</p>"
+
+    # Qualitative overlays — Figures 4.16, 4.17, 4.18
+    overlay_dir = REPORTS_DIR / "symptom_overlays"
+    if overlay_dir.exists():
+        overlay_specs = [
+            ("*_ae_anomaly.jpg", "HealthyAE reconstruction and anomaly map (Figure 4.16)"),
+            ("*_human_vs_pred.jpg", "Human symptom mask vs. predicted mask (Figure 4.17)"),
+            ("*_lab_vs_teacher.jpg", "Symptom Teacher vs. LAB/HSV comparison (Figure 4.18)"),
+        ]
+        for pattern, heading in overlay_specs:
+            imgs = sorted(overlay_dir.glob(pattern))[:6]
+            if not imgs:
+                continue
+            html += f"<h3>{heading}</h3><div class='overlay-grid'>"
+            for p in imgs:
+                b64 = _img_to_b64(p)
+                if b64:
+                    html += f'<div class="overlay-card"><img src="data:image/jpeg;base64,{b64}"><div class="overlay-lbl">{p.stem}</div></div>'
+            html += "</div>"
+    else:
+        html += "<p style='color:#666;font-size:0.85rem'>No overlay figures found — run validate_symptom.py.</p>"
+
+    return html
+
+
 def build_teacher() -> str:
     comp_csv = LOGS_DIR / "teacher_comparison.csv"
     test_csv = LOGS_DIR / "teacher_test_metrics.csv"
@@ -1013,6 +1099,7 @@ def main() -> None:
 <li><a href="#preproc">Preprocessing Summary</a></li>
 <li><a href="#bouncer">Bouncer Gate Comparison</a></li>
 <li><a href="#teacher">Teacher Model Comparison</a></li>
+<li><a href="#symptom">Symptom Teacher Comparison</a></li>
 <li><a href="#enc-abl">Student Encoder Ablation (Stage 1)</a></li>
 <li><a href="#mode-abl">Student Mode Ablation (Stage 2)</a></li>
 <li><a href="#best">Best Student — Full Test Results</a></li>
@@ -1026,12 +1113,13 @@ def main() -> None:
         ("1. Preprocessing Summary",            "preproc",   build_overview),
         ("2. Bouncer Gate Comparison",           "bouncer",   build_bouncer),
         ("3. Teacher Model Comparison",          "teacher",   build_teacher),
-        ("4. Student Encoder Ablation",          "enc-abl",   build_student_encoder),
-        ("5. Student Pseudo-Label Mode Ablation","mode-abl",  build_student_mode),
-        ("6. Best Student — Full Test Results",  "best",      build_student_best),
-        ("7. XAI Method Comparison",             "xai",       build_xai),
-        ("8. Severity Reliability Analysis",     "severity",  build_severity),
-        ("9. Deployment Summary",                "deploy",    build_deployment),
+        ("4. Symptom Teacher Comparison",        "symptom",   build_symptom),
+        ("5. Student Encoder Ablation",          "enc-abl",   build_student_encoder),
+        ("6. Student Pseudo-Label Mode Ablation","mode-abl",  build_student_mode),
+        ("7. Best Student — Full Test Results",  "best",      build_student_best),
+        ("8. XAI Method Comparison",             "xai",       build_xai),
+        ("9. Severity Reliability Analysis",     "severity",  build_severity),
+        ("10. Deployment Summary",               "deploy",    build_deployment),
     ]
     sections = []
     for title, anchor, builder in section_defs:

@@ -25,6 +25,10 @@
      logs/teacher_test_metrics.csv        (held-out test evaluation)
      reports/gold_standard_iou_summary.csv (human-annotated IoU chain)
 
+   Symptom Teacher:
+     logs/symptom_teacher_metrics.csv     (per-epoch loss/IoU/suppression)
+     reports/symptom_vs_lab_comparison.csv (LAB vs. Symptom Teacher IoU)
+
    Student:
      logs/student_comparison_stage1.csv   (encoder ablation)
      logs/student_comparison_stage2.csv   (mode ablation)
@@ -44,6 +48,12 @@
      teacher_comparison_bar.png           — Best Dice / CPU latency bar chart
      teacher_gold_iou_bar.png             — SAM2 vs. Teacher vs. Student IoU vs. human ground truth
      teacher_training_curves_{variant}.png — per-epoch loss, Dice, IoU, Recall
+
+   Symptom Teacher:
+     symptom_training_curves.png          — loss, val/MSV/MLN IoU, HEALTHY suppression
+     symptom_vs_lab_bar.png                — LAB vs. Symptom Teacher IoU per class
+     (qualitative overlays are saved separately by validate_symptom.py to
+      reports/symptom_overlays/ — Figures 4.16-4.18, not generate_charts.py output)
 
    Student:
      student_stage1_comparison_bar.png    — encoder ablation multi-metric bar
@@ -659,8 +669,131 @@ def chart_teacher_training_curves():
         save_chart(fig, f"teacher_training_curves_{variant.replace('-', '_')}.png")
 
 
+def chart_symptom_training_curves():
+    """
+    Per-epoch training curves for the Symptom Teacher, from
+    logs/symptom_teacher_metrics.csv. Columns available are narrower than
+    the leaf Teacher's (train_loss, val_iou, msv_iou, mln_iou, healthy_act —
+    no val_loss/precision/specificity), so this is a 2-panel chart rather
+    than mirroring chart_teacher_training_curves()'s 3-panel layout exactly.
+    """
+    csv_path = LOGS_DIR / "symptom_teacher_metrics.csv"
+    if not csv_path.exists():
+        print(f"  [SKIP] {csv_path.name} not found.")
+        return
+
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        print(f"  [SKIP] {csv_path.name} is empty.")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    apply_dark_style(fig, axes)
+
+    # Panel 1: training loss
+    ax = axes[0]
+    ax.plot(df["epoch"], df["train_loss"], color="#F59E0B", linewidth=2.0,
+            label="train loss (Dice+Focal)")
+    ax.set_title("Training Loss", color=TEXT_COLOR)
+    ax.set_xlabel("Epoch", color=TEXT_COLOR)
+    ax.legend(labelcolor=TEXT_COLOR, fontsize=8,
+             facecolor=GRID_COLOR, edgecolor="#334155", framealpha=0.3)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    # Panel 2: val IoU (MSV / MLN / overall) + HEALTHY suppression on a
+    # secondary axis, since it operates on a very different scale (near 0)
+    ax = axes[1]
+    ax.plot(df["epoch"], df["val_iou"], color="#3B82F6", linewidth=2.2,
+            label="val IoU (overall)")
+    ax.plot(df["epoch"], df["msv_iou"], color="#10B981", linewidth=1.6,
+            linestyle="-.", label="MSV IoU")
+    ax.plot(df["epoch"], df["mln_iou"], color="#EF4444", linewidth=1.6,
+            linestyle=":", label="MLN IoU")
+    ax.set_ylim(0, 1.05)
+    ax.set_ylabel("IoU", color=TEXT_COLOR)
+    ax.set_xlabel("Epoch", color=TEXT_COLOR)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    if "healthy_act" in df.columns:
+        ax2 = ax.twinx()
+        ax2.plot(df["epoch"], df["healthy_act"], color="#94A3B8", linewidth=1.4,
+                linestyle="--", alpha=0.8, label="HEALTHY suppression activation")
+        ax2.set_ylabel("HEALTHY activation (lower = better)", color="#94A3B8", fontsize=8.5)
+        ax2.tick_params(axis="y", colors="#94A3B8")
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2, labelcolor=TEXT_COLOR,
+                 fontsize=7.5, facecolor=GRID_COLOR, edgecolor="#334155", framealpha=0.3)
+    else:
+        ax.legend(labelcolor=TEXT_COLOR, fontsize=8,
+                 facecolor=GRID_COLOR, edgecolor="#334155", framealpha=0.3)
+
+    ax.set_title("Validation IoU + HEALTHY Suppression", color=TEXT_COLOR)
+
+    fig.suptitle("Symptom Teacher Training Curves", color=TEXT_COLOR, fontsize=13, y=1.02)
+    fig.tight_layout()
+    save_chart(fig, "symptom_training_curves.png")
+
+
+def chart_symptom_vs_lab():
+    """
+    Grouped bar chart: mean IoU per class, LAB pipeline vs. Symptom Teacher,
+    from reports/symptom_vs_lab_comparison.csv (produced by validate_symptom.py
+    or train_symptom_model.py --compare-lab). Backs Table 4.13 with a figure.
+    """
+    csv_path = REPORTS_DIR / "symptom_vs_lab_comparison.csv"
+    if not csv_path.exists():
+        print(f"  [SKIP] {csv_path.name} not found "
+              "(run validate_symptom.py first).")
+        return
+
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        print(f"  [SKIP] {csv_path.name} is empty.")
+        return
+
+    classes = sorted(df["category"].unique().tolist())
+    lab_means = [df[df["category"] == c]["iou_lab"].mean() for c in classes]
+    teacher_means = [df[df["category"] == c]["iou_symptom_teacher"].mean() for c in classes]
+    overall_lab = df["iou_lab"].mean()
+    overall_teacher = df["iou_symptom_teacher"].mean()
+    classes = classes + ["Overall"]
+    lab_means = lab_means + [overall_lab]
+    teacher_means = teacher_means + [overall_teacher]
+
+    x = np.arange(len(classes))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    apply_dark_style(fig, ax)
+
+    bars1 = ax.bar(x - width / 2, lab_means, width, label="Legacy LAB",
+                   color="#EF4444", alpha=0.85, zorder=3)
+    bars2 = ax.bar(x + width / 2, teacher_means, width, label="Symptom Teacher",
+                   color="#10B981", alpha=0.9, zorder=3)
+
+    for bars in (bars1, bars2):
+        for bar in bars:
+            h = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width() / 2, h + 0.015, f"{h:.3f}",
+                    ha="center", va="bottom", fontsize=8, color=TEXT_COLOR)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(classes, color=TEXT_COLOR)
+    ax.set_ylabel("Mean IoU vs. human ground truth", color=TEXT_COLOR)
+    ax.set_ylim(0, max(max(lab_means), max(teacher_means)) * 1.25)
+    ax.set_title("Symptom Teacher vs. Legacy LAB/HSV\n(mean IoU against the same human-annotated masks)",
+                color=TEXT_COLOR, fontsize=11, pad=12)
+    ax.legend(labelcolor=TEXT_COLOR, fontsize=9,
+             facecolor=GRID_COLOR, edgecolor="#334155", framealpha=0.3)
+
+    fig.tight_layout()
+    save_chart(fig, "symptom_vs_lab_bar.png")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STUDENT CHARTS
+
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _student_comparison_bar(csv_path: Path, stage: int):
@@ -1107,6 +1240,12 @@ def run_teacher():
     chart_teacher_training_curves()
 
 
+def run_symptom():
+    print("\n── Symptom Teacher charts ──────────────────────────────────")
+    chart_symptom_training_curves()
+    chart_symptom_vs_lab()
+
+
 def run_student():
     print("\n── Student charts ──────────────────────────────────────────")
     chart_student_comparison_stage1()
@@ -1122,10 +1261,11 @@ def main():
         description="Yellow MAIze — generate comparison charts from training CSV logs.")
     parser.add_argument("--bouncer",  action="store_true", help="Bouncer charts only")
     parser.add_argument("--teacher",  action="store_true", help="Teacher charts only")
+    parser.add_argument("--symptom",  action="store_true", help="Symptom Teacher charts only")
     parser.add_argument("--student",  action="store_true", help="Student charts only")
     args = parser.parse_args()
 
-    all_flags = not any([args.bouncer, args.teacher, args.student])
+    all_flags = not any([args.bouncer, args.teacher, args.symptom, args.student])
 
     print("=" * 64)
     print("  Yellow MAIze — Chart Generator")
@@ -1136,6 +1276,8 @@ def main():
         run_bouncer()
     if all_flags or args.teacher:
         run_teacher()
+    if all_flags or args.symptom:
+        run_symptom()
     if all_flags or args.student:
         run_student()
 
