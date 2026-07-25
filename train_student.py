@@ -37,8 +37,15 @@
    - Per-class classification report + confusion matrix
 
  USAGE:
-   python train_student.py --stage 1
-   python train_student.py --stage 2 --encoder mobilenet_v2_cbam
+   python train_student.py --stage 1                                   # all 5 variants
+   python train_student.py --stage 1 --variant mobilenet_v3_small      # just one
+   python train_student.py --stage 2 --encoder mobilenet_v2_cbam       # all 4 modes
+   python train_student.py --stage 2 --encoder mobilenet_v2_cbam --mode mode_c  # just one
+
+   Per-variant/per-mode runs merge into the same
+   logs/student_comparison_stage{N}.csv instead of overwriting it, so you
+   can run each one separately (e.g. across sessions) and the comparison
+   table fills in incrementally.
 ================================================================================
 """
 
@@ -110,6 +117,30 @@ def set_seeds(seed: int) -> None:
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENCODER NAME MAPPING (internal variant name → smp `encoder_name`)
+# ══════════════════════════════════════════════════════════════════════════════
+# smp's classic encoder dict only knows a handful of literal names — it does
+# NOT include "mobilenet_v3_small" at all (torchvision-style MobileNetV3 was
+# never ported into smp's classic encoders), and efficientnet uses a hyphen
+# ("efficientnet-b0"), not the underscore used in STUDENT_VARIANTS/config.py.
+# Passing our internal names straight through raises the KeyError you hit.
+#
+# Fix: mobilenet_v3_small routes through smp's TimmUniversalEncoder via the
+# "tu-" prefix (smp.encoders.get_encoder checks `name.startswith("tu-")`
+# before it ever looks the name up in the classic dict, so this works even
+# though "tu-*" names don't appear in that KeyError's "supported encoders"
+# list — that list is only the classic dict, not the timm-universal path).
+# "tu-mobilenetv3_small_100" is timm's name for MobileNetV3-Small 1.0.
+_SMP_ENCODER_NAMES = {
+    "mobilenet_v2":         "mobilenet_v2",
+    "mobilenet_v2_cbam":    "mobilenet_v2",
+    "mobilenet_v3_small":   "tu-mobilenetv3_small_100",
+    "efficientnet_b0":      "efficientnet-b0",
+    "efficientnet_b0_cbam": "efficientnet-b0",
+}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -185,8 +216,11 @@ class StudentModel(nn.Module):
         self.use_cbam    = use_cbam
         self.encoder_name = encoder_name
 
-        # Clean encoder name for smp
-        smp_encoder = encoder_name.replace("_cbam", "")
+        # Translate internal variant name → smp's expected encoder_name
+        # (handles the tu- prefix and the efficientnet hyphen; falls back to
+        # the old strip-_cbam behavior for any variant not in the map)
+        smp_encoder = _SMP_ENCODER_NAMES.get(
+            encoder_name, encoder_name.replace("_cbam", ""))
 
         self.unet = smp.Unet(
             encoder_name=smp_encoder,
@@ -448,7 +482,7 @@ def make_student_transforms(img_size: int, is_train: bool):
     if is_train:
         return A.Compose([
             A.LongestMaxSize(max_size=img_size),
-            A.PadIfNeeded(img_size, img_size, border_mode=0, value=0),
+            A.PadIfNeeded(img_size, img_size, border_mode=0, fill=0),
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.RandomRotate90(p=0.5),
@@ -467,7 +501,7 @@ def make_student_transforms(img_size: int, is_train: bool):
     else:
         return A.Compose([
             A.LongestMaxSize(max_size=img_size),
-            A.PadIfNeeded(img_size, img_size, border_mode=0, value=0),
+            A.PadIfNeeded(img_size, img_size, border_mode=0, fill=0),
             A.Normalize(mean=[0.485, 0.456, 0.406],
                         std=[0.229, 0.224, 0.225]),
             ToTensorV2(),
@@ -667,6 +701,8 @@ def train_one_epoch(model, loader, optimizer,
     n_samples = 0
 
     for batch in loader:
+        if batch is None:
+            continue   # entire batch was skipped by safe_collate (all samples missing/corrupt)
         imgs     = batch["image"].to(device)
         seg_tgt  = batch["seg"].to(device)
         cls_tgt  = batch["cls"].to(device)
@@ -1395,6 +1431,16 @@ def main() -> None:
                         help="1=encoder ablation on mode_b  |  2=mode ablation on best encoder")
     parser.add_argument("--encoder", type=str, default=STUDENT_BEST_VARIANT,
                         help="Best encoder variant for stage 2")
+    parser.add_argument("--variant", type=str, default=None,
+                        choices=STUDENT_VARIANTS,
+                        help="Stage 1 only: train just this one encoder variant "
+                             "instead of looping through all of STUDENT_VARIANTS. "
+                             "e.g. --stage 1 --variant mobilenet_v3_small")
+    parser.add_argument("--mode", type=str, default=None,
+                        choices=FACTORY_MODES,
+                        help="Stage 2 only: train --encoder on just this one "
+                             "factory mode instead of looping through all of "
+                             "FACTORY_MODES. e.g. --stage 2 --mode mode_c")
     args = parser.parse_args()
 
     set_seeds(SEED)
@@ -1408,48 +1454,70 @@ def main() -> None:
     all_results = []
 
     if args.stage == 1:
-        # ── Stage 1: All 5 encoder variants on Mode B ─────────────────────────
+        # ── Stage 1: encoder variant(s) on Mode B ─────────────────────────────
         # V1: mobilenet_v2 | V2: mobilenet_v2_cbam | V3: mobilenet_v3_small
         # V4: efficientnet_b0 | V6: efficientnet_b0_cbam
-        print(f"  Variants  : {STUDENT_VARIANTS}")
+        variants_to_run = [args.variant] if args.variant else STUDENT_VARIANTS
+        print(f"  Variants  : {variants_to_run}")
         print(f"  Mode      : mode_b (fixed for encoder ablation)")
-        for variant in STUDENT_VARIANTS:
+        for variant in variants_to_run:
             result = train_one(variant, "mode_b", stage=1)
             if result:
                 all_results.append(result)
 
-        # Find best encoder
-        if all_results:
-            best = max(all_results,
-                       key=lambda r: r.get("test_composite", 0))
-            print(f"\n  Best encoder: {best['encoder']}")
-            print(f"  Update STUDENT_BEST_VARIANT in config.py to: "
-                  f"'{best['encoder']}'")
-
     elif args.stage == 2:
-        # ── Stage 2: Best encoder on all 4 modes ──────────────────────────────
+        # ── Stage 2: best encoder on factory mode(s) ──────────────────────────
+        modes_to_run = [args.mode] if args.mode else FACTORY_MODES
         print(f"  Encoder   : {args.encoder}")
-        print(f"  Modes     : {FACTORY_MODES}")
-        for mode in FACTORY_MODES:
+        print(f"  Modes     : {modes_to_run}")
+        for mode in modes_to_run:
             result = train_one(args.encoder, mode, stage=2)
             if result:
                 all_results.append(result)
 
-        if all_results:
-            best = max(all_results,
-                       key=lambda r: r.get("test_composite", 0))
-            print(f"\n  Best mode: {best['mode']}")
-            print(f"  Best composite: {best.get('best_composite','N/A')}")
-
-    # ── Save comparison CSV ───────────────────────────────────────────────────
+    # ── Merge into comparison CSV (don't clobber earlier per-variant/mode runs) ─
+    comp_path = LOGS_DIR / f"student_comparison_stage{args.stage}.csv"
     if all_results:
-        comp_path = LOGS_DIR / f"student_comparison_stage{args.stage}.csv"
-        keys      = list(all_results[0].keys())
+        merge_key = (lambda r: r["encoder"]) if args.stage == 1 else (lambda r: r["mode"])
+        merged = {}
+        if comp_path.exists():
+            with open(comp_path, newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    merged[merge_key(row)] = row
+        for row in all_results:
+            merged[merge_key(row)] = row
+        all_rows = list(merged.values())
+        keys     = list(all_rows[0].keys())
         with open(comp_path, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
             writer.writeheader()
-            writer.writerows(all_results)
-        print(f"\n  Comparison: {comp_path}")
+            writer.writerows(all_rows)
+        print(f"\n  Comparison: {comp_path}  ({len(all_rows)} row(s) total)")
+    else:
+        all_rows = []
+
+    # ── Find best, only once every variant/mode has a row in the CSV ───────────
+    if args.stage == 1:
+        have = {r["encoder"] for r in all_rows}
+        if set(STUDENT_VARIANTS) <= have:
+            best = max(all_rows, key=lambda r: float(r.get("test_composite", 0) or 0))
+            print(f"\n  Best encoder: {best['encoder']}")
+            print(f"  Update STUDENT_BEST_VARIANT in config.py to: "
+                  f"'{best['encoder']}'")
+        elif all_rows:
+            missing = set(STUDENT_VARIANTS) - have
+            print(f"\n  {len(have)}/{len(STUDENT_VARIANTS)} variants done so far "
+                  f"— still missing: {sorted(missing)}")
+    elif args.stage == 2:
+        have = {r["mode"] for r in all_rows}
+        if set(FACTORY_MODES) <= have:
+            best = max(all_rows, key=lambda r: float(r.get("test_composite", 0) or 0))
+            print(f"\n  Best mode: {best['mode']}")
+            print(f"  Best composite: {best.get('best_composite','N/A')}")
+        elif all_rows:
+            missing = set(FACTORY_MODES) - have
+            print(f"\n  {len(have)}/{len(FACTORY_MODES)} modes done so far "
+                  f"— still missing: {sorted(missing)}")
 
     _duration = round(time.time() - _t_start, 1)
     print(f"\n  Total Student training duration: {_duration}s ({_duration/3600:.2f}h)")
