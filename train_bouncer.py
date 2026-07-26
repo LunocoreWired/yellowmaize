@@ -31,6 +31,7 @@
 import csv
 import math
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -94,6 +95,7 @@ def set_seeds(seed: int) -> None:
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CONFIG_PATH = Path(__file__).parent / "config.py"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -896,6 +898,115 @@ def evaluate_patchcore() -> dict:
         return {"variant": "patchcore", "note": f"error:{str(e)[:60]}"}
 
 
+def select_deployed_variant(comparison_rows: list[dict]) -> str | None:
+    """
+    Automatic deployment selection for the Bouncer, replacing what was
+    previously a hand-typed BOUNCER_DEPLOYED_VARIANT constant with no
+    selection logic behind it at all.
+
+    Weighting is purpose-driven: the Bouncer runs on-device, once per user
+    image, so its criteria differ from the Teacher's (see the equivalent
+    function in train_teacher.py):
+
+      - A HARD GATE first: only variants meeting BOUNCER_MIN_MAIZE_RECALL
+        are eligible at all. A model that fails this floor is not a
+        candidate regardless of how fast or how good its F1 score is.
+      - Accuracy (F1) weight 0.6 — correctness matters most for a gate that
+        must not silently drop real maize images or admit obvious junk.
+      - Speed weight 0.4 — measured RELATIVE to the fastest eligible
+        candidate, not against a fixed target. All three neural variants
+        already comfortably clear any reasonable mobile latency budget
+        (see TARGET_BOUNCER_LATENCY_MS below), so a fixed-target score
+        would saturate at 1.0 for all of them and fail to differentiate —
+        relative scoring keeps speed meaningful as a tiebreaker even when
+        every candidate is already "fast enough" in absolute terms.
+
+    Gabor+LBP is excluded from this selection entirely — it was evaluated
+    as a non-neural baseline for comparison, not as a deployment candidate
+    (see Chapter 3), and has no comparable lat_cpu_ms measurement.
+
+    IMPORTANT — what this function does NOT verify: TFLite export
+    compatibility. The earlier `mobilevit_xxs` candidate was excluded from
+    the whole comparison specifically because its attention operations do
+    not export to TFLite. EdgeViT-XXS is also a hybrid attention
+    architecture, and this function has no way to confirm it does not have
+    the same problem — that requires an actual export attempt via
+    export_tflite.py, which this comparison loop does not run (it would
+    require tensorflow/onnx-tf, both optional dependencies not needed
+    anywhere else in this script). If this function selects EdgeViT-XXS,
+    treat that as a recommendation pending export verification, not a
+    ready-to-ship decision.
+    """
+    TARGET_BOUNCER_LATENCY_MS = 150.0  # matches Student's on-device UX target
+                                        # (same device, same latency budget)
+
+    eligible = []
+    for row in comparison_rows:
+        variant = row.get("variant")
+        if variant == "gabor_lbp":
+            continue
+        try:
+            recall = float(row.get("maize_recall", 0))
+            f1 = float(row.get("best_f1", 0))
+            lat = float(row.get("lat_cpu_ms", 0))
+        except (TypeError, ValueError):
+            continue
+        if lat <= 0:
+            print(f"  [WARN] {variant}: no valid lat_cpu_ms, excluding from selection.")
+            continue
+        if recall < BOUNCER_MIN_MAIZE_RECALL:
+            print(f"  [WARN] {variant}: maize_recall {recall:.4f} below "
+                  f"BOUNCER_MIN_MAIZE_RECALL {BOUNCER_MIN_MAIZE_RECALL}, excluding.")
+            continue
+        eligible.append({"variant": variant, "f1": f1, "lat": lat})
+
+    if not eligible:
+        print("  [WARN] No eligible Bouncer variant met the recall floor. "
+              "Deployment selection skipped — resolve manually.")
+        return None
+
+    fastest_lat = min(e["lat"] for e in eligible)
+
+    print(f"\n  {'Variant':<20} {'F1':>7} {'Latency(ms)':>12} "
+          f"{'SpeedScore':>11} {'Composite':>10}")
+    print(f"  {'-'*20} {'-'*7} {'-'*12} {'-'*11} {'-'*10}")
+
+    best = None
+    for e in eligible:
+        speed_score = fastest_lat / e["lat"]  # 1.0 = fastest eligible candidate
+        composite = 0.6 * e["f1"] + 0.4 * speed_score
+        e["composite"] = composite
+        print(f"  {e['variant']:<20} {e['f1']:>7.4f} {e['lat']:>12.2f} "
+              f"{speed_score:>11.4f} {composite:>10.4f}")
+        if best is None or composite > best["composite"]:
+            best = e
+
+    print(f"\n  Selected: {best['variant']}  (composite score {best['composite']:.4f})")
+    if best["variant"] != "mobilenet_v3_large":
+        print(f"  [ACTION REQUIRED] Selection changed from the previous "
+              f"deployed variant. Before updating config.py, verify that "
+              f"{best['variant']} exports to TFLite successfully "
+              f"(python export_tflite.py --bouncer) — this criterion is "
+              f"NOT checked above. mobilevit_xxs was excluded from this "
+              f"pipeline for exactly this failure mode; do not assume "
+              f"{best['variant']} is exempt without testing it.")
+
+    return best["variant"]
+
+
+def update_config(key: str, value: str) -> None:
+    """Update a string config value in config.py in place."""
+    content = CONFIG_PATH.read_text()
+    pattern = rf'^({re.escape(key)}\s*=\s*)["\']([^"\']*)["\']'
+    replacement = rf'\g<1>"{value}"'
+    new_content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
+    if new_content == content:
+        print(f"  [WARN] Could not update {key} in config.py — update manually")
+    else:
+        CONFIG_PATH.write_text(new_content)
+        print(f"  config.py updated: {key} = \"{value}\"")
+
+
 def main() -> None:
     _t_start = time.time()
     set_seeds(SEED)
@@ -980,16 +1091,40 @@ def main() -> None:
 
     print(f"\n  Comparison CSV: {comp_path}")
 
+    # ── Automatic deployment selection ─────────────────────────────────────────
+    # FIX: BOUNCER_DEPLOYED_VARIANT was previously a hand-typed config.py
+    # constant with no selection logic behind it at all — unlike Student
+    # (select_best_pipeline.py) and XAI (evaluate_xai.py), which already
+    # compute their deployed choice from measured criteria and write it back.
+    # This brings the Bouncer in line with that pattern. See
+    # select_deployed_variant()'s docstring for the exact criteria used and
+    # what it does NOT verify (TFLite export compatibility).
+    print(f"\n{'─' * 72}")
+    print(f"  Automatic deployment selection")
+    print(f"{'─' * 72}")
+    selected_variant = select_deployed_variant(comparison_rows)
+    if selected_variant is not None and selected_variant != BOUNCER_DEPLOYED_VARIANT:
+        update_config("BOUNCER_DEPLOYED_VARIANT", selected_variant)
+    elif selected_variant is not None:
+        print(f"  No change — {selected_variant} was already the deployed variant.")
+    deployed_for_admission = selected_variant or BOUNCER_DEPLOYED_VARIANT
+
     # ── Admission rate on held-out test-split maize images ────────────────────
     # FIX: this function existed but was never called from main() — it was
     # dead code. Running it here, against the deployed variant, is what
     # actually produces the false-rejection-rate figure that Chapter 4's
     # admission-rate table depends on; nothing upstream of this call could
     # have produced it, no matter how many times the comparison above ran.
+    #
+    # NOTE: uses deployed_for_admission (this run's freshly selected variant),
+    # not the module-level BOUNCER_DEPLOYED_VARIANT import — config.py may
+    # have just been rewritten above, but Python does not hot-reload an
+    # already-imported constant, so the stale import would silently evaluate
+    # the WRONG checkpoint if the selection changed this run.
     print(f"\n{'─' * 72}")
-    print(f"  Admission rate — deployed variant ({BOUNCER_DEPLOYED_VARIANT})")
+    print(f"  Admission rate — deployed variant ({deployed_for_admission})")
     print(f"{'─' * 72}")
-    evaluate_admission_rate(BOUNCER_DEPLOYED_VARIANT)
+    evaluate_admission_rate(deployed_for_admission)
 
     print(f"\n  NEXT STEP: python sample_15000.py")
     print("=" * 72)

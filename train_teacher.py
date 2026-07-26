@@ -7,6 +7,7 @@ leaf silhouette pseudo-masks for the ~215k Tier 2 images via factory_master.py.
 """
 import csv
 import random
+import re
 import shutil
 import sys
 import time
@@ -50,6 +51,7 @@ def set_seeds(seed: int) -> None:
     torch.backends.cudnn.benchmark     = False
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CONFIG_PATH = Path(__file__).parent / "config.py"
 
 import os as _os
 if "PYTORCH_CUDA_ALLOC_CONF" not in _os.environ:
@@ -674,6 +676,86 @@ def evaluate_teacher_test(variant: str, all_samples: list[dict]) -> dict:
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
+def select_deployed_variant(comparison_rows: list[dict]) -> dict | None:
+    """
+    Automatic deployment selection for the Teacher, replacing the previous
+    pure-Dice `max(comparison_rows, key=lambda r: r["best_dice"])` selection.
+
+    That pure-Dice approach had two problems. First, it ignored latency
+    entirely, so it would have selected MiT-B2 despite it costing over 3.5x
+    the inference time of EfficientNet-B2 for a Dice improvement of about
+    0.001, a difference within normal run-to-run noise. Second, and more
+    importantly, it never actually wrote its choice back to
+    TEACHER_DEPLOYED_VARIANT in config.py — every other script in the
+    pipeline (factory_master.py, validate_gold_standard.py) looks up the
+    Teacher checkpoint by that config constant, not by the generic
+    teacher_model_best.pth file this function used to copy to. The two were
+    silently disconnected: this function could select one variant while the
+    rest of the pipeline deployed a different, manually-typed one.
+
+    Weighting here is purpose-driven, and deliberately different from the
+    Bouncer's (see select_deployed_variant() in train_bouncer.py):
+
+      - Dice weight 0.75 — this is the dominant criterion. The Teacher's
+        output quality is inherited by every downstream pseudo-label, so
+        segmentation quality matters far more here than for a binary gate.
+      - Speed weight 0.25 — scored against a FIXED target
+        (TARGET_TEACHER_LATENCY_MS), not relative to the fastest candidate
+        as the Bouncer does. This is intentional: the Teacher's latency is
+        an offline batch-processing cost paid once per Factory run across
+        roughly 215,000 images, not a per-user experience cost, so what
+        matters is whether a candidate keeps total Factory runtime
+        reasonable, not shaving further time off an already-fast option.
+
+      No TFLite export check or warning is needed here, unlike the
+      Bouncer's selector — the Teacher is never deployed to mobile at all,
+      it only ever runs offline during Factory pseudo-labeling.
+    """
+    TARGET_TEACHER_LATENCY_MS = 600.0  # offline throughput target across
+                                        # ~215k Factory images, not a UX target
+
+    print(f"\n  {'Variant':<32} {'Dice':>8} {'Latency(ms)':>12} "
+          f"{'SpeedScore':>11} {'Composite':>10}")
+    print(f"  {'-'*32} {'-'*8} {'-'*12} {'-'*11} {'-'*10}")
+
+    best = None
+    for row in comparison_rows:
+        try:
+            dice = float(row.get("best_dice", 0))
+            lat = float(row.get("lat_cpu_ms", 0))
+        except (TypeError, ValueError):
+            continue
+        if lat <= 0:
+            print(f"  [WARN] {row.get('variant')}: no valid lat_cpu_ms, excluding.")
+            continue
+        speed_score = min(TARGET_TEACHER_LATENCY_MS / lat, 1.0)
+        composite = 0.75 * dice + 0.25 * speed_score
+        print(f"  {row['variant']:<32} {dice:>8.4f} {lat:>12.1f} "
+              f"{speed_score:>11.4f} {composite:>10.4f}")
+        if best is None or composite > best["composite"]:
+            best = {**row, "composite": composite}
+
+    if best is None:
+        print("  [WARN] No eligible Teacher variant. Deployment selection skipped.")
+        return None
+
+    print(f"\n  Selected: {best['variant']}  (composite score {best['composite']:.4f})")
+    return best
+
+
+def update_config(key: str, value: str) -> None:
+    """Update a string config value in config.py in place."""
+    content = CONFIG_PATH.read_text()
+    pattern = rf'^({re.escape(key)}\s*=\s*)["\']([^"\']*)["\']'
+    replacement = rf'\g<1>"{value}"'
+    new_content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
+    if new_content == content:
+        print(f"  [WARN] Could not update {key} in config.py — update manually")
+    else:
+        CONFIG_PATH.write_text(new_content)
+        print(f"  config.py updated: {key} = \"{value}\"")
+
+
 def main() -> None:
     t_start = time.time()
     set_seeds(SEED)
@@ -722,11 +804,22 @@ def main() -> None:
         result = train_variant(variant, all_samples)
         comparison_rows.append(result)
 
-    best = max(comparison_rows, key=lambda r: r["best_dice"])
+    print(f"\n{'─' * 72}")
+    print(f"  Automatic deployment selection")
+    print(f"{'─' * 72}")
+    best = select_deployed_variant(comparison_rows)
+    if best is None:
+        print("[FATAL] Could not select a deployed Teacher variant.")
+        return
 
     best_src  = Path(best["ckpt"])
     best_dest = TEACHER_CKPT_DIR / "teacher_model_best.pth"
     shutil.copy2(best_src, best_dest)
+
+    if best["variant"] != TEACHER_DEPLOYED_VARIANT:
+        update_config("TEACHER_DEPLOYED_VARIANT", best["variant"])
+    else:
+        print(f"  No change — {best['variant']} was already the deployed variant.")
 
     comp_path = LOGS_DIR / "teacher_comparison.csv"
     with open(comp_path, "w", newline="", encoding="utf-8") as f:
