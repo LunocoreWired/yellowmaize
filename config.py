@@ -495,11 +495,27 @@ SYMPTOM_EPOCHS            = 60
 SYMPTOM_LR                = 1e-4
 SYMPTOM_WEIGHT_DECAY      = 1e-4
 SYMPTOM_PATIENCE          = 10
-SYMPTOM_ENCODER           = "efficientnet-b2"   # matches TEACHER_DEPLOYED_VARIANT family
-# Combined Dice + Focal loss (see dice_focal_loss() in train_symptom_model.py).
-# Focal loss (not BCE) is used deliberately: symptom pixels are a small fraction
-# of leaf area, and focal down-weighting of easy background pixels handles that
-# imbalance better than BCE alone. pos_weight further upweights foreground pixels.
+# FIX: SYMPTOM_ENCODER used to be a separately hardcoded string, kept in
+# sync with TEACHER_DEPLOYED_VARIANT only by a comment, not by code. Now
+# that train_teacher.py's select_deployed_variant() picks
+# TEACHER_DEPLOYED_VARIANT programmatically and writes it back here, a
+# hardcoded SYMPTOM_ENCODER would silently drift out of sync the moment
+# that selection changes. This derives it instead, so the Symptom Teacher
+# always uses the same encoder family as whichever Teacher variant is
+# actually deployed.
+#
+# Only "deeplabv3plus-eb2" needs special-casing: it pairs an
+# EfficientNet-B2 encoder with a DeepLabV3+ decoder rather than being an
+# encoder name itself (see the unet_encoders mapping in train_teacher.py).
+# The other three TEACHER_VARIANTS names are already valid smp encoder
+# identifiers directly.
+_TEACHER_VARIANT_TO_ENCODER = {
+    "resnet50":          "resnet50",
+    "efficientnet-b2":   "efficientnet-b2",
+    "mit_b2":            "mit_b2",
+    "deeplabv3plus-eb2": "efficientnet-b2",
+}
+SYMPTOM_ENCODER = _TEACHER_VARIANT_TO_ENCODER.get(TEACHER_DEPLOYED_VARIANT, "efficientnet-b2")
 SYMPTOM_DICE_WEIGHT       = 0.6           # Dice component weight
 SYMPTOM_FOCAL_WEIGHT      = 0.4           # Focal component weight
 SYMPTOM_FOCAL_GAMMA       = 2.0           # focal focusing parameter (Lin et al. 2017)
