@@ -941,6 +941,27 @@ def build_student_best() -> str:
             cdf, ["sil_mIoU","sym_mIoU","msv_f1","mln_f1","composite","train_loss"],
             f"Student Training — {enc} / {mode}")
 
+    # Qualitative mask-output predictions — previously the one component in
+    # the pipeline with numeric test metrics but no visual output shown
+    # anywhere. Produced by validate_student.py on the deployed checkpoint.
+    overlay_dir = REPORTS_DIR / "student_overlays"
+    if overlay_dir.exists():
+        imgs = sorted(overlay_dir.glob("*_student_pred.jpg"))[:9]
+        if imgs:
+            html += ("<h3>Predicted mask output on sample images "
+                     "(silhouette + symptom, deployed model)</h3>"
+                     "<div class='overlay-grid'>")
+            for p in imgs:
+                b64 = _img_to_b64(p)
+                if b64:
+                    html += (f'<div class="overlay-card">'
+                            f'<img src="data:image/jpeg;base64,{b64}">'
+                            f'<div class="overlay-lbl">{p.stem}</div></div>')
+            html += "</div>"
+    else:
+        html += ("<p style='color:#666;font-size:0.85rem'>No qualitative "
+                 "prediction panels found — run validate_student.py.</p>")
+
     return html
 
 
