@@ -1,0 +1,2 @@
+variant,n_test_maize,n_passed,n_rejected,n_heuristic_reject,admission_rate,false_rejection_rate,heuristic_rej_rate
+mobilenet_v3_large,27228,27213,15,0,0.9994,0.0006,0.0

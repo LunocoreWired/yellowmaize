@@ -1,0 +1,23 @@
+Yellow MAIze — Best Pipeline Summary
+Generated: 2026-07-30 20:41:16
+=================================================================
+
+BEST MODELS PER COMPONENT
+─────────────────────────────────────────────────────────────────
+  Bouncer : mobilenet_v3_large
+    Specificity  : 1.0
+    Maize Recall : 1.0
+    ROC-AUC      : 1.0
+    Checkpoint   : /home/luno/yellowmaize/checkpoints/final/bouncer_best.pth
+
+  Teacher : mit_b2
+    Val Dice     : 0.9701
+    CPU Latency  : 1575.8 ms/image
+    Checkpoint   : /home/luno/yellowmaize/checkpoints/final/teacher_best.pth
+
+=================================================================
+FILES
+  Summary CSV  : /home/luno/yellowmaize/reports/best_pipeline_summary.csv
+  Ranked table : /home/luno/yellowmaize/reports/all_variants_ranked.csv
+  Final ckpts  : /home/luno/yellowmaize/checkpoints/final
+=================================================================
