@@ -1224,6 +1224,58 @@ def chart_student_metrics_heatmap():
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════════
 
+def chart_severity_scatter():
+    """
+    Scatter plot: human-rated severity (averaged across two raters) versus
+    HSV-derived severity, one point per rated image, colored by class, with
+    a diagonal reference line (perfect agreement). Previously this section
+    only showed aggregate Cohen's kappa and Spearman rho as numbers —
+    the per-image relationship those numbers summarize was never actually
+    shown as a figure.
+    """
+    csv_path = REPORTS_DIR / "severity_analysis.csv"
+    if not csv_path.exists():
+        print(f"  [SKIP] {csv_path.name} not found "
+              "(run evaluate_severity.py --analyze first).")
+        return
+
+    df = pd.read_csv(csv_path)
+    if df.empty or "human_norm" not in df.columns or "hsv_norm" not in df.columns:
+        print(f"  [SKIP] {csv_path.name} missing expected columns.")
+        return
+
+    fig, ax = plt.subplots(figsize=(6.5, 6.5))
+    apply_dark_style(fig, ax)
+
+    classes_present = sorted(df["category"].unique().tolist()) if "category" in df.columns else ["all"]
+    for i, cls in enumerate(classes_present):
+        cdf = df[df["category"] == cls] if "category" in df.columns else df
+        ax.scatter(cdf["human_norm"], cdf["hsv_norm"], s=35, alpha=0.75,
+                  color=get_color(cls, i), label=cls, zorder=3,
+                  edgecolors=BG_COLOR, linewidths=0.4)
+
+    ax.plot([0, 1], [0, 1], color="#94A3B8", linestyle="--", linewidth=1.2,
+           label="Perfect agreement", zorder=2)
+
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel("Human-rated severity (normalized, avg of 2 raters)", color=TEXT_COLOR)
+    ax.set_ylabel("HSV-derived severity (normalized)", color=TEXT_COLOR)
+    ax.set_title("Severity Reliability — Human vs. HSV-Derived",
+                color=TEXT_COLOR, fontsize=11, pad=12)
+    ax.legend(fontsize=8, labelcolor=TEXT_COLOR, facecolor=GRID_COLOR,
+             edgecolor="#334155", framealpha=0.3)
+    ax.set_aspect("equal")
+
+    fig.tight_layout()
+    save_chart(fig, "severity_scatter.png")
+
+
+def run_severity():
+    print("\n── Severity charts ─────────────────────────────────────────")
+    chart_severity_scatter()
+
+
 def run_bouncer():
     print("\n── Bouncer charts ──────────────────────────────────────────")
     chart_bouncer_comparison()
@@ -1263,9 +1315,10 @@ def main():
     parser.add_argument("--teacher",  action="store_true", help="Teacher charts only")
     parser.add_argument("--symptom",  action="store_true", help="Symptom Teacher charts only")
     parser.add_argument("--student",  action="store_true", help="Student charts only")
+    parser.add_argument("--severity", action="store_true", help="Severity reliability charts only")
     args = parser.parse_args()
 
-    all_flags = not any([args.bouncer, args.teacher, args.symptom, args.student])
+    all_flags = not any([args.bouncer, args.teacher, args.symptom, args.student, args.severity])
 
     print("=" * 64)
     print("  Yellow MAIze — Chart Generator")
@@ -1280,6 +1333,8 @@ def main():
         run_symptom()
     if all_flags or args.student:
         run_student()
+    if all_flags or args.severity:
+        run_severity()
 
     print("\n  Done.")
     print("=" * 64)

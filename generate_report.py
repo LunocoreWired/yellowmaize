@@ -514,6 +514,41 @@ def chart_admission_breakdown(row: pd.Series) -> str:
     return b64
 
 
+def chart_severity_scatter_inline(df: pd.DataFrame) -> str:
+    """
+    Same content as generate_charts.py's chart_severity_scatter(), reimplemented
+    in this file's own lightweight inline-chart style (plain matplotlib, no
+    dark theme helpers) since this report embeds charts directly as base64
+    rather than referencing generate_charts.py's saved PNG files — the two
+    chart systems are intentionally separate (see the note in
+    chart_admission_breakdown() above).
+    """
+    plt = _get_mpl()
+    import matplotlib.pyplot as _plt
+
+    fig, ax = _plt.subplots(figsize=(6, 6))
+    classes_present = sorted(df["category"].unique().tolist()) if "category" in df.columns else ["all"]
+    colors = {"HEALTHY": "#2ecc71", "MSV": "#3498db", "MLN": "#e74c3c"}
+    for cls in classes_present:
+        cdf = df[df["category"] == cls] if "category" in df.columns else df
+        ax.scatter(cdf["human_norm"], cdf["hsv_norm"], s=30, alpha=0.7,
+                  color=colors.get(cls, "#95a5a6"), label=cls,
+                  edgecolors="white", linewidths=0.3)
+    ax.plot([0, 1], [0, 1], color="#888888", linestyle="--", linewidth=1,
+           label="Perfect agreement")
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel("Human-rated severity (normalized)")
+    ax.set_ylabel("HSV-derived severity (normalized)")
+    ax.set_title("Severity Reliability — Human vs. HSV-Derived")
+    ax.legend(fontsize=8)
+    ax.set_aspect("equal")
+    fig.tight_layout()
+    b64 = _fig_to_b64(fig)
+    _plt.close(fig)
+    return b64
+
+
 def build_bouncer() -> str:
     comp_csv = LOGS_DIR / "bouncer_comparison.csv"
     if not comp_csv.exists():
@@ -645,6 +680,77 @@ def build_symptom() -> str:
     return html
 
 
+def build_factory() -> str:
+    """
+    Factory pseudo-labeling QA section — previously had zero standalone
+    representation anywhere in this report. factory_filter_breakdown.csv
+    (pass/reject counts) was not referenced at all before this function
+    existed, and factory_summary.csv was only ever used inside
+    build_student_mode() for a mode-ablation severity chart, never to show
+    what the Factory pass rate actually was.
+    """
+    html = ""
+
+    breakdown_csv = REPORTS_DIR / "factory_filter_breakdown.csv"
+    if breakdown_csv.exists():
+        bdf = pd.read_csv(breakdown_csv)
+        if not bdf.empty:
+            total = bdf["count"].sum()
+            processed_row = bdf[bdf["status"] == "processed"]
+            processed_pct = float(processed_row["pct"].iloc[0]) if not processed_row.empty else 0.0
+            quality = "good" if processed_pct >= 90 else "warn" if processed_pct >= 75 else "bad"
+
+            html += f"""<div class="grid3">
+{metric_card(f"{processed_pct:.1f}%", "Images successfully pseudo-labeled", quality)}
+{metric_card(f"{int(total):,}", "Total Tier 2 images evaluated")}
+{metric_card(f"{int(total - (processed_row['count'].iloc[0] if not processed_row.empty else 0)):,}", "Rejected (all reasons combined)")}
+</div>"""
+            html += "<h3>Rejection breakdown by reason</h3>"
+            html += df_to_table(bdf, highlight_col="count")
+
+            # Small horizontal bar chart of the breakdown
+            plt = _get_mpl()
+            import matplotlib.pyplot as _plt
+            fig, ax = _plt.subplots(figsize=(7, max(2.5, 0.4 * len(bdf))))
+            bars_df = bdf.sort_values("count", ascending=True)
+            colors = ["#2ecc71" if s == "processed" else "#e74c3c"
+                     for s in bars_df["status"]]
+            ax.barh(bars_df["status"], bars_df["count"], color=colors, alpha=0.85)
+            for i, (v, p) in enumerate(zip(bars_df["count"], bars_df["pct"])):
+                ax.text(v, i, f"  {v:,} ({p}%)", va="center", fontsize=8)
+            ax.set_xlabel("Image count")
+            ax.set_title("Factory Pseudo-Labeling — Status Breakdown")
+            fig.tight_layout()
+            b64 = _fig_to_b64(fig)
+            _plt.close(fig)
+            html += chart_img(b64, "factory status breakdown")
+    else:
+        html += ("<p style='color:#666;font-size:0.85rem'>"
+                 "factory_filter_breakdown.csv not found — run factory_master.py first.</p>")
+
+    # Per-class snapshot for the deployed reference mode (mode_b), distinct
+    # from build_student_mode()'s cross-mode ablation chart, which uses this
+    # same CSV for a different comparison (mode impact on Student performance,
+    # not Factory's own pass-rate health).
+    summary_csv = REPORTS_DIR / "factory_summary.csv"
+    if summary_csv.exists():
+        sdf = pd.read_csv(summary_csv)
+        mode_b = sdf[sdf["mode"] == "mode_b"] if "mode" in sdf.columns else pd.DataFrame()
+        if not mode_b.empty:
+            display_cols = [c for c in ["class", "n_total", "pct_processed",
+                                          "mean_severity", "pct_symptomatic",
+                                          "pct_excluded"]
+                            if c in mode_b.columns]
+            html += "<h3>Per-class snapshot (mode_b, the deployed reference mode)</h3>"
+            html += df_to_table(mode_b[display_cols])
+            html += ('<div class="note">Full cross-mode comparison (mode_a through '
+                    'mode_d) and its effect on downstream Student performance is '
+                    'shown in the Student Mode Ablation section below, not repeated '
+                    'here.</div>')
+
+    return html
+
+
 def build_teacher() -> str:
     comp_csv = LOGS_DIR / "teacher_comparison.csv"
     test_csv = LOGS_DIR / "teacher_test_metrics.csv"
@@ -738,6 +844,19 @@ def build_teacher() -> str:
         if imgs:
             html += "<h3>Qualitative leaf silhouette overlays (vs. human ground truth)</h3><div class='overlay-grid'>"
             for p in imgs:
+                b64 = _img_to_b64(p)
+                if b64:
+                    html += f'<div class="overlay-card"><img src="data:image/jpeg;base64,{b64}"><div class="overlay-lbl">{p.stem}</div></div>'
+            html += "</div>"
+
+        # SAM2 raw pseudo-mask overlays, saved by the same validate_gold_standard.py
+        # run but previously never displayed anywhere — shown here alongside the
+        # Teacher overlays above so the improvement discussed numerically in
+        # Table 4.11 can also be seen directly, image by image.
+        sam2_imgs = sorted(overlay_dir.glob("*_sam2_overlay.jpg"))[:6]
+        if sam2_imgs:
+            html += "<h3>SAM2 raw pseudo-mask overlays (for direct comparison with the Teacher overlays above)</h3><div class='overlay-grid'>"
+            for p in sam2_imgs:
                 b64 = _img_to_b64(p)
                 if b64:
                     html += f'<div class="overlay-card"><img src="data:image/jpeg;base64,{b64}"><div class="overlay-lbl">{p.stem}</div></div>'
@@ -962,10 +1081,34 @@ def build_student_best() -> str:
         html += ("<p style='color:#666;font-size:0.85rem'>No qualitative "
                  "prediction panels found — run validate_student.py.</p>")
 
+    # Second, different overlay type: silhouette-only, from the SAM2 vs
+    # Teacher vs Student IoU chain in validate_gold_standard.py (same source
+    # as the Teacher and SAM2 overlays in build_teacher()). This shows only
+    # the leaf silhouette against human ground truth, not the symptom mask
+    # or classification — complementary to the fuller prediction panel
+    # above, not a duplicate of it. Existed on disk already but was never
+    # displayed anywhere in this report before now.
+    iou_chain_dir = REPORTS_DIR / "gold_standard_overlays"
+    if iou_chain_dir.exists():
+        sil_imgs = sorted(iou_chain_dir.glob("*_student_overlay.jpg"))[:6]
+        if sil_imgs:
+            html += ("<h3>Predicted silhouette only, vs. human ground truth "
+                     "(IoU chain comparison — see Table 4.11 / build_teacher "
+                     "for the SAM2 and Teacher equivalents)</h3>"
+                     "<div class='overlay-grid'>")
+            for p in sil_imgs:
+                b64 = _img_to_b64(p)
+                if b64:
+                    html += (f'<div class="overlay-card">'
+                            f'<img src="data:image/jpeg;base64,{b64}">'
+                            f'<div class="overlay-lbl">{p.stem}</div></div>')
+            html += "</div>"
+
     return html
 
 
 def build_xai() -> str:
+    html = ""
     xai_sel_csv = LOGS_DIR / "xai_method_selection.csv"
     if xai_sel_csv.exists():
         sel_df = pd.read_csv(xai_sel_csv)
@@ -985,10 +1128,9 @@ def build_xai() -> str:
 
     xai_csv = LOGS_DIR / "xai_comparison.csv"
     if not xai_csv.exists():
-        return "<p>XAI comparison not found. Run evaluate_xai.py first.</p>"
+        return html + "<p>XAI comparison not found. Run evaluate_xai.py first.</p>"
 
     df  = pd.read_csv(xai_csv)
-    html = ""
 
     # Summary table (mean per method)
     methods = df["method"].unique().tolist() if "method" in df.columns else []
@@ -1060,6 +1202,17 @@ def build_severity() -> str:
 
     tbl_df = pd.DataFrame([{k: v for k, v in row.items()}])
     html += df_to_table(tbl_df)
+
+    # Per-image scatter — previously this section only showed the aggregate
+    # kappa/rho numbers above; the actual point-by-point relationship those
+    # numbers summarize was never shown as a figure.
+    analysis_csv = REPORTS_DIR / "severity_analysis.csv"
+    if analysis_csv.exists():
+        adf = pd.read_csv(analysis_csv)
+        if not adf.empty and "human_norm" in adf.columns and "hsv_norm" in adf.columns:
+            html += "<h3>Human vs. HSV-derived severity (per image)</h3>"
+            html += safe_chart(chart_severity_scatter_inline, adf)
+
     return html
 
 
@@ -1121,6 +1274,7 @@ def main() -> None:
 <li><a href="#bouncer">Bouncer Gate Comparison</a></li>
 <li><a href="#teacher">Teacher Model Comparison</a></li>
 <li><a href="#symptom">Symptom Teacher Comparison</a></li>
+<li><a href="#factory">Factory Pseudo-Labeling QA</a></li>
 <li><a href="#enc-abl">Student Encoder Ablation (Stage 1)</a></li>
 <li><a href="#mode-abl">Student Mode Ablation (Stage 2)</a></li>
 <li><a href="#best">Best Student — Full Test Results</a></li>
@@ -1135,12 +1289,13 @@ def main() -> None:
         ("2. Bouncer Gate Comparison",           "bouncer",   build_bouncer),
         ("3. Teacher Model Comparison",          "teacher",   build_teacher),
         ("4. Symptom Teacher Comparison",        "symptom",   build_symptom),
-        ("5. Student Encoder Ablation",          "enc-abl",   build_student_encoder),
-        ("6. Student Pseudo-Label Mode Ablation","mode-abl",  build_student_mode),
-        ("7. Best Student — Full Test Results",  "best",      build_student_best),
-        ("8. XAI Method Comparison",             "xai",       build_xai),
-        ("9. Severity Reliability Analysis",     "severity",  build_severity),
-        ("10. Deployment Summary",               "deploy",    build_deployment),
+        ("5. Factory Pseudo-Labeling QA",        "factory",   build_factory),
+        ("6. Student Encoder Ablation",          "enc-abl",   build_student_encoder),
+        ("7. Student Pseudo-Label Mode Ablation","mode-abl",  build_student_mode),
+        ("8. Best Student — Full Test Results",  "best",      build_student_best),
+        ("9. XAI Method Comparison",             "xai",       build_xai),
+        ("10. Severity Reliability Analysis",    "severity",  build_severity),
+        ("11. Deployment Summary",               "deploy",    build_deployment),
     ]
     sections = []
     for title, anchor, builder in section_defs:
