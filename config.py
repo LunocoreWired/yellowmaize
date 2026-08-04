@@ -292,9 +292,9 @@ STUDENT_CKPT_W_MAE    = 0.10
 # the per-tier F1 inputs are populated from _sev_to_cimmyt_grade() in
 # factory_master.py. train_student.py must compute/log grade-stratified MSV
 # F1 using CIMMYT_MSV_BRACKETS to consume these (out of scope here).
-STUDENT_CKPT_W_MSV_F1_EARLY  = 0.20  # CIMMYT grade 1-3 (<25% area): early detection
-STUDENT_CKPT_W_MSV_F1_MID    = 0.10  # CIMMYT grade 3-5 (25-50% area)
-STUDENT_CKPT_W_MSV_F1_SEVERE = 0.05  # CIMMYT grade 5-9 (>50% area)
+STUDENT_CKPT_W_MSV_F1_EARLY  = 0.20  # Soto/IITA grade 1-2 (≤25% chlorotic area): early detection
+STUDENT_CKPT_W_MSV_F1_MID    = 0.10  # Soto/IITA grade 3   (26-50% chlorotic area)
+STUDENT_CKPT_W_MSV_F1_SEVERE = 0.05  # Soto/IITA grade 4-5 (>50% chlorotic area)
 STUDENT_MAX_SEVERITY = 100.0
 STUDENT_LABEL_SMOOTHING = 0.10
 
@@ -547,9 +547,9 @@ FACTORY_SYMPTOM_COMPARE_LAB    = False   # if True, also computes legacy LAB
                                           # per image for thesis comparison figures
 
 # ══════════════════════════════════════════════════════════════════════════════
-# CIMMYT SEVERITY GRADING
+# SEVERITY GRADING SCALES
 # ══════════════════════════════════════════════════════════════════════════════
-# Published agronomic severity scales (CIMMYT) mapping continuous severity %
+# Published agronomic severity scales mapping continuous severity %
 # (from factory_master.py's pixel-coverage calculation) to a discrete grade.
 # Consumed by factory_master._sev_to_cimmyt_grade(), which logs the grade
 # alongside continuous severity for every pseudo-labeled image, and by
@@ -557,24 +557,66 @@ FACTORY_SYMPTOM_COMPARE_LAB    = False   # if True, also computes legacy LAB
 # MID/SEVERE, see STUDENT section above) — the v8 P8 fix that surfaces
 # early-stage MSV detection instead of letting it average away into the
 # aggregate MSV F1. Brackets are (lower_inclusive, upper_exclusive, grade).
+# Grades are assigned automatically by _sev_to_cimmyt_grade() — no manual
+# labelling is required at any stage of the pipeline.
 #
-# MSV scale (CIMMYT, 1-9 — odd-numbered, 5 grades):
-#   1=<5%  3=5-25%  5=25-50%  7=50-75%  9=>75%
+# ── MSV SCALE ────────────────────────────────────────────────────────────────
+# Source: Soto et al. (1982), as validated by:
+#   Sime et al. (2021). "Validation of Diagnostic Markers for Streak Virus
+#   Disease Resistance in Maize." Agriculture 11(2):130.
+#   https://doi.org/10.3390/agriculture11020130
+#
+# Chlorotic leaf area measurements by image analysis have been shown to
+# correlate with this five-point scale, which is widely used by breeders for
+# visually rating MSV symptom severity in the field
+# (Bosque-Pérez 2000; Martin et al. 1999).
+#
+# 0-5 leaf-area-based scale operationalized from pixel coverage %:
+#   0 = no symptoms (HEALTHY class, handled separately — grade 0)
+#   1 = ≤10%   chlorotic leaf area (trace streaks)
+#   2 = 11-25% chlorotic leaf area (light streaking on older leaves)
+#   3 = 26-50% chlorotic leaf area (moderate streaking, slight stunting)
+#   4 = 51-75% chlorotic leaf area (severe streaking, ~75% leaf area)
+#   5 = ≥75%   chlorotic leaf area (highly susceptible, severe stunting)
+#
+# NOTE: The CIMMYT 1-9 odd-numbered scale also exists but is used for
+# whole-plant visual resistance scoring by breeders, NOT for leaf-area
+# percentage mapping. The 0-5 Soto/IITA scale is the correct match for
+# a pixel-coverage-based automated system.
 CIMMYT_MSV_BRACKETS = [
-    (0,   5,   1),
-    (5,   25,  3),
-    (25,  50,  5),
-    (50,  75,  7),
-    (75,  101, 9),
+    (0,   10,  1),   # trace — ≤10% chlorotic area
+    (10,  25,  2),   # light streaking on older leaves
+    (25,  50,  3),   # moderate streaking, slight stunting
+    (50,  75,  4),   # severe streaking, ~75% leaf area affected
+    (75,  101, 5),   # highly susceptible, severely stunted
 ]
-# MLN scale (CIMMYT, 1-5 — 5 grades):
-#   1=<10%  2=10-25%  3=25-50%  4=50-75%  5=>75%
+
+# ── MLN SCALE ────────────────────────────────────────────────────────────────
+# Source: Beyene et al. (2017). "Genetic analysis of tropical maize inbred
+#   lines for resistance to maize lethal necrosis disease."
+#   Euphytica 213:224. https://doi.org/10.1007/s10681-017-2012-3
+# Also cited in: Gowda et al. (2015); Eunice et al. (2021).
+#   "Status of maize lethal necrosis disease in seed production system
+#   in Kenya." Cogent Food & Agriculture 7(1).
+#   https://doi.org/10.1080/23311932.2021.1918406
+#
+# 1-5 symptom-progression scale operationalized as pixel coverage %:
+#   1 = no disease symptoms                          (<10% necrotic area)
+#   2 = fine chlorotic streaks/mottling, lower leaves (10-25%)
+#   3 = chlorotic mottling and mosaic throughout plant (25-50%)
+#   4 = excessive mottling, mosaic, necrosis, dead heart (50-75%)
+#   5 = dead plant, complete plant necrosis            (>75%)
+#
+# NOTE: The published scale uses symptom-progression descriptions; percentage
+# brackets are the operationalization for automated pixel-coverage mapping.
+# Severity scores from this scale are conventionally converted to a Percentage
+# Severity Index (PSI) for quantitative analysis (Eunice et al. 2021).
 CIMMYT_MLN_BRACKETS = [
-    (0,   10,  1),
-    (10,  25,  2),
-    (25,  50,  3),
-    (50,  75,  4),
-    (75,  101, 5),
+    (0,   10,  1),   # no/trace symptoms
+    (10,  25,  2),   # fine chlorotic streaks/mottling on lower leaves
+    (25,  50,  3),   # chlorotic mottling and mosaic throughout plant
+    (50,  75,  4),   # excessive mottling, necrosis, dead heart
+    (75,  101, 5),   # dead plant, complete plant necrosis
 ]
 # HEALTHY images are always grade 0 (no disease) — handled directly in
 # _sev_to_cimmyt_grade(), not via a bracket table.

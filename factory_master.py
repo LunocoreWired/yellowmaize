@@ -718,16 +718,31 @@ def _margin_erosion_mask(silhouette: np.ndarray) -> np.ndarray:
 
 
 def _sev_to_cimmyt_grade(severity_pct: float, category: str) -> int:
-    """Map continuous severity % to CIMMYT published agronomic grade.
+    """Map continuous severity % to published agronomic grade.
 
     Brackets are read from config.py (CIMMYT_MSV_BRACKETS / CIMMYT_MLN_BRACKETS)
     so config remains the single source of truth — see config.py's
-    "CIMMYT SEVERITY GRADING" section for the published bracket definitions.
+    "SEVERITY GRADING SCALES" section for full bracket definitions and citations.
 
-    MSV scale (CIMMYT, 1–9):
-      1=<5%  3=5–25%  5=25–50%  7=50–75%  9=>75%
-    MLN scale (CIMMYT, 1–5):
-      1=<10%  2=10–25%  3=25–50%  4=50–75%  5=>75%
+    Grades are assigned automatically from pixel-coverage % — no manual
+    labelling is required at any stage of the pipeline.
+
+    MSV scale — Soto et al. (1982), validated by Sime et al. (2021,
+      Agriculture 11(2):130). 0–5 leaf-area-based scale:
+        1 = ≤10%   chlorotic leaf area
+        2 = 11–25% chlorotic leaf area
+        3 = 26–50% chlorotic leaf area
+        4 = 51–75% chlorotic leaf area
+        5 = ≥75%   chlorotic leaf area
+
+    MLN scale — Beyene et al. (2017, Euphytica 213:224);
+      Gowda et al. (2015). 1–5 symptom-progression scale:
+        1 = no/trace symptoms                        (<10%)
+        2 = fine chlorotic streaks/mottling           (10–25%)
+        3 = chlorotic mottling and mosaic throughout  (25–50%)
+        4 = excessive mottling, necrosis, dead heart  (50–75%)
+        5 = dead plant, complete necrosis             (>75%)
+
     HEALTHY: always grade 0 (no disease).
     Returns -1 for excluded images (severity_pct < 0).
     """
