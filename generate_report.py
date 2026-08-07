@@ -6,24 +6,56 @@
    Reads all CSV logs, metrics, and image outputs produced by the pipeline
    and generates a single self-contained HTML report with:
 
-     Section 1  — Pipeline overview and dataset statistics
-     Section 2  — Preprocessing summary (rejection reasons, class distribution)
-     Section 3  — Bouncer comparison (bar charts, ROC-AUC table, confusion matrix)
-     Section 4  — Teacher comparison (Dice/IoU/Recall bar charts, training curves)
-     Section 5  — Student encoder ablation (multi-metric comparison table + chart)
-     Section 6  — Student mode ablation (pseudo-label strategy comparison)
-     Section 7  — Best Student test results (all metrics, confusion matrix heatmap,
-                   per-class breakdown, severity regression scatter)
-     Section 8  — XAI comparison (pointing game / insertion / deletion charts,
-                   embedded overlay images)
-     Section 9  — Severity reliability (inter-rater analysis)
-     Section 10 — Deployment summary (model sizes, latency, TFLite readiness)
-     Section 11 — Training curves (loss + metrics over epochs for best Student)
+     Section 1  — Preprocessing summary (rejection reasons, class distribution)
+     Section 2  — Bouncer gate comparison (bar charts, ROC-AUC table,
+                   confusion matrix, admission-rate breakdown)
+     Section 3  — Teacher model comparison (Dice/latency bar chart, training
+                   curves, SAM2 vs. Teacher gold-standard overlay galleries)
+     Section 4  — Symptom Teacher comparison (training curve, Legacy LAB vs.
+                   Symptom Teacher IoU table + chart, HealthyAE anomaly-map,
+                   human-vs-predicted, and LAB-vs-Teacher overlay galleries —
+                   produced by validate_symptom.py)
+     Section 5  — Factory pseudo-labeling QA (pass/reject breakdown table +
+                   chart, per-class snapshot for the deployed reference mode)
+     Section 6  — Student encoder ablation, Stage 1 (multi-metric comparison
+                   table + chart)
+     Section 7  — Student mode ablation, Stage 2 (pseudo-label strategy
+                   comparison)
+     Section 8  — Best Student, full test results (all metrics, confusion
+                   matrix heatmap, per-class breakdown, training curve,
+                   qualitative mask-output prediction gallery from
+                   validate_student.py, plus the silhouette-only IoU-chain
+                   overlay gallery from validate_gold_standard.py)
+     Section 9  — XAI method comparison (pointing game / insertion / deletion
+                   charts, embedded overlay images)
+     Section 10 — Severity reliability (inter-rater kappa/rho, plus a
+                   human-vs-HSV-derived scatter plot per image)
+     Section 11 — Deployment summary (model sizes, latency, TFLite readiness)
 
-   The report is 100% self-contained — all charts are inline base64 SVG/PNG,
+   The report is 100% self-contained — all charts are inline base64 PNG,
    all images are embedded. Single file, no external dependencies to view.
 
- RUN AFTER: python select_best_pipeline.py
+   Every section degrades gracefully: if its underlying CSV or image
+   directory does not exist yet (e.g. a validation script has not been run
+   yet), that section prints a short "not found — run X first" note instead
+   of failing, so a partial pipeline run still produces a viewable report.
+
+ RUN AFTER (each is independent — the report reflects whichever of these
+ have actually been run; none are required for the others' sections to
+ render):
+   python train_bouncer.py            → Section 2 data (including admission
+                                          rate — evaluate_admission_rate() now
+                                          runs automatically from main())
+   python train_teacher.py             → Section 3 data
+   python validate_gold_standard.py    → Section 3 overlays, Section 8's silhouette overlay gallery
+   python train_symptom_model.py       → Section 4 training-curve data
+   python validate_symptom.py          → Section 4 LAB comparison + all three overlay galleries
+   python factory_master.py            → Section 5 data
+   python select_best_pipeline.py      → Sections 6-8 data, writes STUDENT_BEST_VARIANT/STUDENT_FACTORY_MODE
+   python validate_student.py          → Section 8's prediction-panel gallery
+   python evaluate_xai.py              → Section 9 data
+   python evaluate_severity.py --analyze → Section 10 data
+   python build_deployment_package.py  → Section 11 data
 
  OUTPUT:
    reports/evaluation_report.html   ← send to supervisor, include in appendix

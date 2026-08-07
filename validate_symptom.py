@@ -34,6 +34,11 @@
    python validate_symptom.py                # 5 qualitative samples/class + full numeric table
    python validate_symptom.py --n 10          # more qualitative samples per class
    python validate_symptom.py --skip-lab      # Figure 4.16/4.17 only, no LAB comparison
+
+ CONSUMED BY (once the outputs above exist):
+   generate_charts.py --symptom  → symptom_vs_lab_bar.png (from the CSV above)
+   generate_report.py            → Section 4, overlay galleries read directly
+                                    from reports/symptom_overlays/
 ================================================================================
 """
 

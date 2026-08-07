@@ -53,13 +53,31 @@
    4. Validate on held-out split; report mean IoU.
    5. [Optional] --compare-lab: run the legacy LAB pipeline on the same
       held-out images and report IoU(LAB, human) vs IoU(SymptomTeacher,
-      human) side by side for the thesis comparison figure.
+      human) side by side, saved to reports/symptom_vs_lab_comparison.csv.
+      This produces NUMBERS ONLY. For the qualitative comparison figures
+      (Figures 4.16-4.18 — HealthyAE reconstruction/anomaly map, human vs.
+      predicted mask overlay, and LAB vs. Symptom Teacher vs. human mask
+      panels), run validate_symptom.py separately after this script
+      finishes — it reuses the checkpoints and functions defined here
+      (load_healthy_ae, load_symptom_teacher, predict_symptom_mask,
+      compute_iou) rather than duplicating them, and produces the same
+      symptom_vs_lab_comparison.csv plus the three overlay image sets.
 
- OUTPUTS:
+ OUTPUTS (this script):
    checkpoints/healthy_ae/healthy_ae_best.pth
    checkpoints/symptom/symptom_teacher_best.pth   <- read by factory_master.py
    logs/symptom_teacher_metrics.csv               <- per-epoch loss/Dice/IoU
    reports/symptom_vs_lab_comparison.csv          <- only with --compare-lab
+
+ OUTPUTS (validate_symptom.py — run separately, see WORKFLOW step 5):
+   reports/symptom_vs_lab_comparison.csv          <- same file, full validation set
+   reports/symptom_overlays/*_ae_anomaly.jpg      <- Figure 4.16
+   reports/symptom_overlays/*_human_vs_pred.jpg   <- Figure 4.17
+   reports/symptom_overlays/*_lab_vs_teacher.jpg  <- Figure 4.18
+
+ CONSUMED BY (once the above outputs exist):
+   generate_charts.py --symptom  → symptom_training_curves.png, symptom_vs_lab_bar.png
+   generate_report.py            → Section 4, including all overlay galleries
 ================================================================================
 """
 

@@ -4,14 +4,17 @@
 ================================================================================
  PURPOSE:
    Reads all training CSV logs produced by train_bouncer.py, train_teacher.py,
-   and train_student.py and generates publication-quality PNG comparison charts.
-   Run this any time after training without re-running the training scripts.
+   train_symptom_model.py, train_student.py, and evaluate_severity.py, and
+   generates publication-quality PNG comparison charts. Run this any time
+   after training without re-running the training scripts.
 
  USAGE:
    python generate_charts.py              # generate all charts
    python generate_charts.py --bouncer    # bouncer charts only
    python generate_charts.py --teacher    # teacher charts only
+   python generate_charts.py --symptom    # symptom teacher charts only
    python generate_charts.py --student    # student charts only
+   python generate_charts.py --severity   # severity reliability charts only
 
  INPUT CSVs (all under logs/, except gold-standard which is under reports/):
    Bouncer:
@@ -35,6 +38,10 @@
      logs/student_{enc}_{mode}_metrics.csv (per-epoch training curves)
      logs/student_test_metrics_{enc}_{mode}.csv (per-variant test results)
      logs/student_confusion_{enc}_{mode}.csv    (3×3 confusion matrices)
+
+   Severity:
+     reports/severity_analysis.csv        (per-image human vs. HSV severity,
+                                             from evaluate_severity.py --analyze)
 
  OUTPUT PNGs (all under reports/charts/):
    Bouncer:
@@ -61,6 +68,10 @@
      student_training_curves_{enc}_{mode}.png — per-epoch curves (both phases)
      student_confusion_{enc}_{mode}.png   — 3×3 confusion matrix heatmap
      student_radar_{enc}_{mode}.png       — radar/spider chart of test metrics
+
+   Severity:
+     severity_scatter.png                 — human-rated vs. HSV-derived severity,
+                                             per image, colored by class
 ================================================================================
 """
 
