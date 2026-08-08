@@ -65,6 +65,9 @@
 
  OUTPUTS (this script):
    checkpoints/healthy_ae/healthy_ae_best.pth
+   logs/healthy_ae_metrics.csv                    <- per-epoch loss + recon_std
+                                                       (recon_std near zero = collapsed
+                                                       reconstruction, check visually)
    checkpoints/symptom/symptom_teacher_best.pth   <- read by factory_master.py
    logs/symptom_teacher_metrics.csv               <- per-epoch loss/Dice/IoU
    reports/symptom_vs_lab_comparison.csv          <- only with --compare-lab
@@ -233,6 +236,17 @@ def train_healthy_ae() -> Path:
     best_val_loss = float("inf")
     epochs_no_improve = 0
 
+    # FIX: this function previously never logged anything but stdout —
+    # every other training loop in this file (Symptom Teacher included)
+    # writes a per-epoch CSV to LOGS_DIR. Without it, there was no way to
+    # inspect the loss curve after training finished, which matters a lot
+    # for diagnosing whether a collapse happens immediately (epoch 1-2,
+    # points to an unstable early gradient/init issue) or drifts in later
+    # (points to over-training or LR schedule behavior).
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    metrics_path = LOGS_DIR / "healthy_ae_metrics.csv"
+    metrics_rows = []
+
     for epoch in range(1, HEALTHY_AE_EPOCHS + 1):
         model.train()
         train_loss = 0.0
@@ -245,6 +259,18 @@ def train_healthy_ae() -> Path:
             recon = model(batch)
             loss = F.mse_loss(recon, batch)
             loss.backward()
+            # FIX: this loop previously had no gradient clipping at all,
+            # unlike every other training loop in this file. Combined with
+            # BatchNorm layers and a small batch size (16) over a visually
+            # homogeneous HEALTHY-only dataset, an unclipped early gradient
+            # spike is a known trigger for the network collapsing to a
+            # constant-output "predict the average color" solution — which
+            # is exactly what was observed in the first real training run
+            # (every reconstruction was an identical flat gray-mauve block
+            # regardless of input). Clipping guards against that failure
+            # mode; it does not fix a logic bug, because there wasn't one —
+            # forward pass, loss, and data pipeline all check out correctly.
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
             train_loss += loss.item()
             n_batches  += 1
@@ -253,6 +279,7 @@ def train_healthy_ae() -> Path:
         model.eval()
         val_loss = 0.0
         n_val_batches = 0
+        recon_std_sum = 0.0
         with torch.no_grad():
             for batch in val_loader:
                 if batch is None:
@@ -260,18 +287,45 @@ def train_healthy_ae() -> Path:
                 batch = batch.to(DEVICE)
                 recon = model(batch)
                 val_loss += F.mse_loss(recon, batch).item()
+                # Diagnostic: mean per-image pixel std of the reconstruction.
+                # A collapsed ("predict the average color") decoder produces
+                # a near-constant output — this value goes near zero. A
+                # healthy reconstruction that actually varies with the
+                # input should have a std in a similar ballpark to the
+                # input images themselves (roughly 0.1-0.3 for typical
+                # normalized RGB leaf photos). Logged specifically so a
+                # collapse can be confirmed numerically on the next run,
+                # not just spotted visually after the fact.
+                recon_std_sum += recon.std(dim=[1, 2, 3]).mean().item()
                 n_val_batches += 1
         val_loss /= max(n_val_batches, 1)
+        recon_std = recon_std_sum / max(n_val_batches, 1)
         sched.step(val_loss)
 
         print(f"  Epoch {epoch:>3}/{HEALTHY_AE_EPOCHS}  "
-              f"train_mse={train_loss:.5f}  val_mse={val_loss:.5f}")
+              f"train_mse={train_loss:.5f}  val_mse={val_loss:.5f}  "
+              f"recon_std={recon_std:.5f}")
+        if recon_std < 0.01:
+            print(f"  [WARN] recon_std={recon_std:.5f} is near zero — "
+                  f"the reconstruction may have collapsed to a near-constant "
+                  f"output. Check checkpoints/healthy_ae/healthy_ae_best.pth "
+                  f"reconstructions visually if this persists.")
+
+        metrics_rows.append({
+            "epoch": epoch,
+            "train_mse": train_loss,
+            "val_mse": val_loss,
+            "recon_std": recon_std,
+            "lr": opt.param_groups[0]["lr"],
+        })
+        pd.DataFrame(metrics_rows).to_csv(metrics_path, index=False)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
             torch.save({"model_state": model.state_dict(),
                        "val_loss": val_loss,
+                       "recon_std": recon_std,
                        "latent_dim": HEALTHY_AE_LATENT_DIM}, best_path)
         else:
             epochs_no_improve += 1
@@ -282,6 +336,7 @@ def train_healthy_ae() -> Path:
 
     print(f"  Best HealthyAE val_mse: {best_val_loss:.5f}")
     print(f"  Saved: {best_path}")
+    print(f"  Per-epoch metrics: {metrics_path}")
     return best_path
 
 
