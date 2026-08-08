@@ -11,10 +11,12 @@
                    confusion matrix, admission-rate breakdown)
      Section 3  — Teacher model comparison (Dice/latency bar chart, training
                    curves, SAM2 vs. Teacher gold-standard overlay galleries)
-     Section 4  — Symptom Teacher comparison (training curve, Legacy LAB vs.
-                   Symptom Teacher IoU table + chart, HealthyAE anomaly-map,
-                   human-vs-predicted, and LAB-vs-Teacher overlay galleries —
-                   produced by validate_symptom.py)
+     Section 4  — Symptom Teacher comparison (HealthyAE training curve with
+                   an automatic reconstruction-collapse check, Symptom Teacher
+                   training curve, Legacy LAB vs. Symptom Teacher IoU table +
+                   chart, HealthyAE anomaly-map, human-vs-predicted, and
+                   LAB-vs-Teacher overlay galleries — produced by
+                   validate_symptom.py)
      Section 5  — Factory pseudo-labeling QA (pass/reject breakdown table +
                    chart, per-class snapshot for the deployed reference mode)
      Section 6  — Student encoder ablation, Stage 1 (multi-metric comparison
@@ -634,6 +636,47 @@ def build_symptom() -> str:
     Figures 4.16-4.18, all produced by validate_symptom.py.
     """
     html = ""
+
+    # HealthyAE training curve + collapse check — this data did not exist
+    # until healthy_ae_metrics.csv was added specifically to diagnose a real
+    # collapse found in the first training run (every reconstruction was an
+    # identical flat block regardless of input). Shown first, since a
+    # collapsed AE channel affects everything downstream of it, including
+    # the Symptom Teacher training below.
+    ae_csv = LOGS_DIR / "healthy_ae_metrics.csv"
+    if ae_csv.exists():
+        ae_df = pd.read_csv(ae_csv)
+        if not ae_df.empty:
+            html += "<h3>HealthyAE training curve (reconstruction quality check)</h3>"
+            if "recon_std" in ae_df.columns:
+                final_std = float(ae_df["recon_std"].iloc[-1])
+                collapsed = final_std < 0.01
+                html += f"""<div class="grid3">
+{metric_card(f"{final_std:.4f}", "Final reconstruction std", "bad" if collapsed else "good")}
+{metric_card("COLLAPSED" if collapsed else "OK", "Reconstruction collapse check", "bad" if collapsed else "good")}
+{metric_card(f"{float(ae_df['val_mse'].iloc[-1]):.5f}", "Final val MSE")}
+</div>"""
+                if collapsed:
+                    html += ('<div class="note" style="color:#e74c3c">'
+                            'WARNING: recon_std is below 0.01 — the decoder likely '
+                            'collapsed to a near-constant output regardless of input. '
+                            'The AE error channel feeding the Symptom Teacher may carry '
+                            'little real signal. See train_symptom_model.py train_healthy_ae() '
+                            'for the gradient-clipping fix and this diagnostic.</div>')
+                html += safe_chart(
+                    chart_training_curve, ae_df,
+                    ["train_mse", "val_mse", "recon_std"],
+                    "HealthyAE Training")
+            else:
+                html += ('<p style="color:#666;font-size:0.85rem">recon_std column '
+                         'not present — this log is from before the collapse-detection '
+                         'fix; re-run train_symptom_model.py to get it.</p>')
+                html += safe_chart(
+                    chart_training_curve, ae_df, ["train_mse", "val_mse"],
+                    "HealthyAE Training")
+    else:
+        html += ("<p style='color:#666;font-size:0.85rem'>healthy_ae_metrics.csv "
+                 "not found — run train_symptom_model.py first.</p>")
 
     # Training curve
     curve_csv = LOGS_DIR / "symptom_teacher_metrics.csv"

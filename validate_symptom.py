@@ -83,10 +83,17 @@ def get_ae_reconstruction(model, img_rgb: np.ndarray,
                           img_size: int = HEALTHY_AE_IMG_SIZE):
     """
     Mirrors compute_ae_error_map()'s preprocessing exactly (train_symptom_model.py),
-    but returns BOTH the reconstructed image and the error map from a single
-    forward pass. compute_ae_error_map() only returns the error map — Figure
-    4.16 also needs to show the reconstruction itself, so this is a thin
-    wrapper rather than a duplicate implementation of the model logic.
+    but returns the reconstructed image, the error map, AND recon_std from a
+    single forward pass. compute_ae_error_map() only returns the error map —
+    Figure 4.16 also needs to show the reconstruction itself, so this is a
+    thin wrapper rather than a duplicate implementation of the model logic.
+
+    recon_std is the same diagnostic train_healthy_ae() logs per-epoch during
+    training (near zero = collapsed decoder, predicting a near-constant
+    output regardless of input). Returning it here lets this script's own
+    summary flag the same failure mode at validation time, not just during
+    training — useful if validate_symptom.py is run against a checkpoint
+    that predates the collapse-detection fix.
     """
     orig_h, orig_w = img_rgb.shape[:2]
     tf = A.Compose([
@@ -100,6 +107,8 @@ def get_ae_reconstruction(model, img_rgb: np.ndarray,
     with torch.no_grad():
         recon = model(tensor)
 
+    recon_std = recon.std().item()
+
     recon_np = (recon.squeeze(0).permute(1, 2, 0).cpu().numpy() * 255.0
                ).clip(0, 255).astype(np.uint8)
     recon_resized = cv2.resize(recon_np, (orig_w, orig_h),
@@ -111,7 +120,7 @@ def get_ae_reconstruction(model, img_rgb: np.ndarray,
     lo, hi = error.min(), error.max()
     error = (error - lo) / (hi - lo) if hi - lo > 1e-8 else np.zeros_like(error)
 
-    return recon_resized, error.astype(np.float32)
+    return recon_resized, error.astype(np.float32), recon_std
 
 
 def draw_ae_anomaly_panel(img_rgb, recon_rgb, error_map, category, stem):
@@ -258,6 +267,8 @@ def main() -> None:
     comparison_rows = []
 
     # ── Qualitative samples: Figures 4.16, 4.17, 4.18 ────────────────────────
+    recon_std_values = []
+
     for cls in CLASSES:
         pool = by_class.get(cls, [])
         if not pool:
@@ -275,7 +286,8 @@ def main() -> None:
             # Figure 4.16 — every class, including HEALTHY (this is where the
             # suppression behavior is most visible: error should stay low and
             # unstructured on genuinely healthy leaves).
-            recon_rgb, error_map = get_ae_reconstruction(ae_model, img_rgb)
+            recon_rgb, error_map, recon_std = get_ae_reconstruction(ae_model, img_rgb)
+            recon_std_values.append(recon_std)
             ae_panel = draw_ae_anomaly_panel(img_rgb, recon_rgb, error_map, cls, stem)
             cv2.imwrite(str(OVERLAY_DIR / f"{stem}_ae_anomaly.jpg"),
                        cv2.cvtColor(ae_panel, cv2.COLOR_RGB2BGR))
@@ -377,6 +389,20 @@ def main() -> None:
             print("  [SKIP] No comparison data collected.")
 
     print(f"\n{'─' * 72}")
+    if recon_std_values:
+        mean_recon_std = sum(recon_std_values) / len(recon_std_values)
+        n_collapsed = sum(1 for v in recon_std_values if v < 0.01)
+        print(f"  HealthyAE reconstruction check: mean recon_std = "
+              f"{mean_recon_std:.5f}  ({n_collapsed}/{len(recon_std_values)} "
+              f"samples below 0.01)")
+        if mean_recon_std < 0.01:
+            print(f"  [WARN] Mean recon_std is below the collapse threshold — "
+                  f"the AE decoder is likely producing a near-constant "
+                  f"reconstruction regardless of input (see *_ae_anomaly.jpg, "
+                  f"the 'AE Reconstruction' panel should show real leaf "
+                  f"structure, not a flat block). This is the same check "
+                  f"train_healthy_ae() runs during training — see that "
+                  f"function's docstring for the diagnosis and fix.")
     print(f"  Overlay figures saved to: {OVERLAY_DIR}")
     print(f"    *_ae_anomaly.jpg       → Figure 4.16")
     print(f"    *_human_vs_pred.jpg    → Figure 4.17")

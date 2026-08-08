@@ -29,6 +29,7 @@
      reports/gold_standard_iou_summary.csv (human-annotated IoU chain)
 
    Symptom Teacher:
+     logs/healthy_ae_metrics.csv          (per-epoch loss + recon_std collapse check)
      logs/symptom_teacher_metrics.csv     (per-epoch loss/IoU/suppression)
      reports/symptom_vs_lab_comparison.csv (LAB vs. Symptom Teacher IoU)
 
@@ -57,6 +58,7 @@
      teacher_training_curves_{variant}.png — per-epoch loss, Dice, IoU, Recall
 
    Symptom Teacher:
+     healthy_ae_training_curves.png       — reconstruction loss + collapse check (recon_std)
      symptom_training_curves.png          — loss, val/MSV/MLN IoU, HEALTHY suppression
      symptom_vs_lab_bar.png                — LAB vs. Symptom Teacher IoU per class
      (qualitative overlays are saved separately by validate_symptom.py to
@@ -678,6 +680,76 @@ def chart_teacher_training_curves():
                      color=TEXT_COLOR, fontsize=13, y=1.01)
         fig.tight_layout()
         save_chart(fig, f"teacher_training_curves_{variant.replace('-', '_')}.png")
+
+
+def chart_healthy_ae_training_curve():
+    """
+    Per-epoch training curve for HealthyAE, from logs/healthy_ae_metrics.csv.
+    This log did not exist before it was added specifically to diagnose a
+    real collapse found in the first training run: every reconstruction was
+    an identical flat gray-mauve block regardless of input, consistent with
+    the decoder settling into a "predict the average color" trivial
+    solution. recon_std (mean per-image reconstruction pixel std) is the
+    direct numerical signal for this — near zero means collapsed, a healthy
+    reconstruction should track in a similar range to real image variation.
+    A red warning band at 0.01 marks the threshold used by the training
+    script's own live [WARN] check, so a collapse is visible on the chart,
+    not just inferred from eyeballing output images after the fact.
+    """
+    csv_path = LOGS_DIR / "healthy_ae_metrics.csv"
+    if not csv_path.exists():
+        print(f"  [SKIP] {csv_path.name} not found "
+              "(run train_symptom_model.py first).")
+        return
+
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        print(f"  [SKIP] {csv_path.name} is empty.")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
+    apply_dark_style(fig, axes)
+
+    ax = axes[0]
+    ax.plot(df["epoch"], df["train_mse"], color="#F59E0B", linewidth=2.0,
+            label="train MSE")
+    ax.plot(df["epoch"], df["val_mse"], color="#3B82F6", linewidth=2.0,
+            label="val MSE")
+    ax.set_title("HealthyAE Reconstruction Loss", color=TEXT_COLOR)
+    ax.set_xlabel("Epoch", color=TEXT_COLOR)
+    ax.legend(labelcolor=TEXT_COLOR, fontsize=8,
+             facecolor=GRID_COLOR, edgecolor="#334155", framealpha=0.3)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    ax = axes[1]
+    if "recon_std" in df.columns:
+        ax.plot(df["epoch"], df["recon_std"], color="#10B981", linewidth=2.2,
+                label="reconstruction std (mean, per image)", zorder=3)
+        ax.axhspan(0, 0.01, color="#EF4444", alpha=0.15, zorder=1,
+                  label="collapse warning threshold (<0.01)")
+        ax.axhline(0.01, color="#EF4444", linestyle="--", linewidth=1, zorder=2)
+        ax.set_ylim(bottom=0)
+        collapsed_epochs = (df["recon_std"] < 0.01).sum()
+        if collapsed_epochs > 0:
+            ax.set_title(f"Reconstruction Std — COLLAPSE DETECTED "
+                        f"({collapsed_epochs}/{len(df)} epochs below threshold)",
+                        color="#EF4444", fontsize=10.5)
+        else:
+            ax.set_title("Reconstruction Std (collapse check — OK)",
+                        color=TEXT_COLOR)
+    else:
+        ax.text(0.5, 0.5, "recon_std\nnot available\n(older training run)",
+               ha="center", va="center", color=TEXT_COLOR, fontsize=9,
+               transform=ax.transAxes)
+        ax.set_title("Reconstruction Std", color=TEXT_COLOR)
+    ax.set_xlabel("Epoch", color=TEXT_COLOR)
+    ax.legend(labelcolor=TEXT_COLOR, fontsize=7.5,
+             facecolor=GRID_COLOR, edgecolor="#334155", framealpha=0.3)
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+
+    fig.suptitle("HealthyAE Training Curves", color=TEXT_COLOR, fontsize=13, y=1.02)
+    fig.tight_layout()
+    save_chart(fig, "healthy_ae_training_curves.png")
 
 
 def chart_symptom_training_curves():
@@ -1305,6 +1377,7 @@ def run_teacher():
 
 def run_symptom():
     print("\n── Symptom Teacher charts ──────────────────────────────────")
+    chart_healthy_ae_training_curve()
     chart_symptom_training_curves()
     chart_symptom_vs_lab()
 
