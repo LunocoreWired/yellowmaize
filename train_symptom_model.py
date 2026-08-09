@@ -104,7 +104,7 @@ from torch.utils.data import DataLoader, Dataset
 from image_utils import load_image_rgb
 from config import (
     SEED, CLASSES, GLOBAL_MANIFEST,
-    GOLD_IMAGES_DIR, SYMPTOM_ANNOTATION_FILE,
+    GOLD_IMAGES_DIR, SYMPTOM_ANNOTATION_FILE, SYMPTOM_EXTRA_IMAGES_DIR,
     MAIZE_LEAF_LABEL_NAME, MSV_SYMPTOM_LABEL_NAME, MLN_SYMPTOM_LABEL_NAME,
     SYMPTOM_MIN_ANNOTATIONS, SYMPTOM_IMG_SIZE, SYMPTOM_VAL_SPLIT,
     SYMPTOM_BATCH_SIZE, SYMPTOM_EPOCHS, SYMPTOM_LR, SYMPTOM_WEIGHT_DECAY,
@@ -385,7 +385,8 @@ def load_healthy_ae(ckpt_path: Path | None = None) -> nn.Module | None:
 # PART 2 — CVAT COCO-FORMAT ANNOTATION PARSER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def parse_symptom_annotations(json_path: Path, images_dir: Path) -> list[dict]:
+def parse_symptom_annotations(json_path: Path,
+                              images_dir: Path | list[Path]) -> list[dict]:
     """
     Parse a CVAT COCO 1.0 JSON export containing all three annotation labels:
       - MAIZE_LEAF_LABEL_NAME  ("maize-leaf")  — leaf silhouette, all 3 classes
@@ -397,6 +398,14 @@ def parse_symptom_annotations(json_path: Path, images_dir: Path) -> list[dict]:
     This teaches the Symptom Teacher to output nothing on a healthy leaf,
     ensuring graceful degradation when the Student classification head
     misclassifies a HEALTHY image as MSV or MLN.
+
+    images_dir accepts either a single Path or a list of Paths, searched in
+    order. This is what lets additional annotated images live in a separate
+    directory (SYMPTOM_EXTRA_IMAGES_DIR) instead of being mixed into the
+    hash-locked GOLD_IMAGES_DIR — pass both, e.g.
+    [GOLD_IMAGES_DIR, SYMPTOM_EXTRA_IMAGES_DIR], and export the same CVAT
+    task (covering images from both directories) to a single
+    SYMPTOM_ANNOTATION_FILE as usual; one JSON, multiple image sources.
 
     Each record: {
         "img_path" : Path,
@@ -417,6 +426,17 @@ def parse_symptom_annotations(json_path: Path, images_dir: Path) -> list[dict]:
             f"Symptom annotation file not found: {json_path}\n"
             f"Export from CVAT as 'COCO 1.0' and place instances_default.json "
             f"at that path."
+        )
+
+    # Normalize to a list, and drop any directory that doesn't exist (e.g.
+    # SYMPTOM_EXTRA_IMAGES_DIR before it has ever been created) rather than
+    # erroring — this is an optional, additive source, not a requirement.
+    search_dirs = [images_dir] if isinstance(images_dir, Path) else list(images_dir)
+    search_dirs = [d for d in search_dirs if d.exists()]
+    if not search_dirs:
+        raise FileNotFoundError(
+            f"None of the image search directories exist: "
+            f"{[images_dir] if isinstance(images_dir, Path) else images_dir}"
         )
 
     with open(json_path, encoding="utf-8") as f:
@@ -471,16 +491,27 @@ def parse_symptom_annotations(json_path: Path, images_dir: Path) -> list[dict]:
             continue
 
         file_name = Path(img_info["file_name"]).name
-        img_path  = images_dir / file_name
 
-        if not img_path.exists():
-            candidates = [c for c in images_dir.iterdir()
-                          if c.name.endswith(file_name)]
-            if candidates:
-                img_path = candidates[0]
-            else:
-                n_skipped += 1
-                continue
+        img_path = None
+        for d in search_dirs:
+            candidate = d / file_name
+            if candidate.exists():
+                img_path = candidate
+                break
+
+        if img_path is None:
+            # Fallback fuzzy match (e.g. CVAT export nested the filename
+            # under a subfolder prefix) — check each directory, flat listing
+            # only, same as before.
+            for d in search_dirs:
+                candidates = [c for c in d.iterdir() if c.name.endswith(file_name)]
+                if candidates:
+                    img_path = candidates[0]
+                    break
+
+        if img_path is None:
+            n_skipped += 1
+            continue
 
         orig_w = img_info.get("width")
         orig_h = img_info.get("height")
@@ -752,13 +783,8 @@ def dice_bce_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 def compute_iou(pred_binary: np.ndarray, gt_binary: np.ndarray) -> float:
     inter = int(np.logical_and(pred_binary, gt_binary).sum())
     union = int(np.logical_or(pred_binary, gt_binary).sum())
-    # FIX: when both pred and gt are empty (e.g. a HEALTHY image where no
-    # symptom pixels exist and the model correctly predicts none), inter=0
-    # and union=0. The old `inter / max(union, 1)` turned that into 0/1 = 0.0
-    # — scoring a perfect true-negative as total failure. Every HEALTHY row
-    # in symptom_vs_lab_comparison.csv (and the symptom_vs_lab_bar.png chart
-    # built from it) was zero for this reason, independent of model quality.
-    # Empty vs. empty is a perfect match, so it should score 1.0.
+    # Empty pred vs empty gt (e.g. a correctly-suppressed HEALTHY image) is a
+    # perfect match, not a failure — inter/union would be 0/0 -> 0.0 otherwise.
     if union == 0:
         return 1.0
     return inter / union
@@ -1106,7 +1132,8 @@ def main() -> None:
               f"{MSV_SYMPTOM_LABEL_NAME}, {MLN_SYMPTOM_LABEL_NAME}")
         return
 
-    records = parse_symptom_annotations(SYMPTOM_ANNOTATION_FILE, GOLD_IMAGES_DIR)
+    records = parse_symptom_annotations(
+        SYMPTOM_ANNOTATION_FILE, [GOLD_IMAGES_DIR, SYMPTOM_EXTRA_IMAGES_DIR])
 
     n_symptom_annotated = sum(
         1 for r in records
