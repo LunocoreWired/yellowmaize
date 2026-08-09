@@ -480,6 +480,16 @@ GOLD_IOU_TARGET_MEAN     = 0.85
 #   reports/symptom_teacher_iou_report.csv       <- per-image IoU vs human masks
 #   logs/symptom_teacher_metrics.csv             <- per-epoch loss / Dice / IoU
 SYMPTOM_ANNOTATION_FILE   = GOLD_ANNOTATIONS_DIR / "symptom_annotations.json"
+# Additional annotated images beyond the original 501 gold-standard set,
+# kept in a SEPARATE directory deliberately. GOLD_IMAGES_DIR is hash-locked
+# by sample_gold_standard.py against tier1_manifest.csv — if that script is
+# ever re-run, it clears and rebuilds GOLD_IMAGES_DIR from scratch, which
+# would silently delete anything manually added there. New images should be
+# placed here instead; parse_symptom_annotations() searches both directories.
+# Export the SAME CVAT task (containing both the original 501 and the new
+# additions) to SYMPTOM_ANNOTATION_FILE as usual — one annotation file
+# covers images from both directories.
+SYMPTOM_EXTRA_IMAGES_DIR  = GOLD_DIR.parent / "symptom_extra" / "images"
 #   Label names as defined in CVAT (must match exactly, case-insensitive):
 MAIZE_LEAF_LABEL_NAME     = "maize-leaf"     # leaf silhouette — all 3 classes
 MSV_SYMPTOM_LABEL_NAME    = "msv-symptom"    # chlorotic streak regions — MSV only

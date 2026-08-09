@@ -55,6 +55,7 @@ import torch
 from config import (
     CLASSES,
     GOLD_IMAGES_DIR,
+    SYMPTOM_EXTRA_IMAGES_DIR,
     REPORTS_DIR,
     SEED,
     SYMPTOM_ANNOTATION_FILE,
@@ -247,7 +248,8 @@ def main() -> None:
         print("        parse_symptom_annotations()'s docstring in train_symptom_model.py.")
         return
 
-    records = parse_symptom_annotations(Path(SYMPTOM_ANNOTATION_FILE), GOLD_IMAGES_DIR)
+    records = parse_symptom_annotations(
+        Path(SYMPTOM_ANNOTATION_FILE), [GOLD_IMAGES_DIR, SYMPTOM_EXTRA_IMAGES_DIR])
     if not records:
         print("[FATAL] No annotated records parsed.")
         return
