@@ -28,7 +28,9 @@
  PRIMARY METRICS PER COMPONENT:
    Bouncer  → Specificity (maximise) subject to maize recall ≥ 95%
    Teacher  → Dice (maximise)
-   Student  → Composite score (0.5×mIoU + 0.35×MSV_F1 + 0.15×(1−NormMAE))
+   Student  → Mobile-aware composite score (see mobile_composite_score()):
+              MSV_F1×0.32 + MSV_ROC_AUC×0.18 + mIoU×0.18 + speed×0.16
+              + MLN_F1×0.08 + severity×0.05 + size×0.03
 ================================================================================
 """
 
@@ -194,17 +196,25 @@ def mobile_composite_score(test_metrics: dict,
     Mobile-aware composite score for Student model selection.
     Balances clinical accuracy with real-world mobile deployment requirements.
 
-    Weights (sum = 1.0):
-      MSV F1        0.38  — primary clinical metric (thesis claim)
-      Silhouette IoU 0.22 — segmentation quality (XAI overlay visibility)
-      Speed score   0.22  — inference latency (mobile usability)
-      Severity MAE  0.10  — severity calibration (secondary feature)
-      Size score    0.08  — TFLite model size (download / storage)
+    Weights (sum = 1.0), matching the W_* constants defined above:
+      MSV F1         0.32  — primary clinical metric (thesis claim)
+      MSV ROC-AUC    0.18  — threshold-independent detection quality
+      Silhouette IoU 0.18  — segmentation quality (XAI overlay visibility)
+      Speed score    0.16  — inference latency (mobile usability)
+      MLN F1         0.08  — prevents a degenerate MSV-only model
+      Severity MAE   0.05  — severity calibration (secondary feature)
+      Size score     0.03  — TFLite model size (download / storage)
 
     Speed score  = clamp(TARGET_LATENCY_MS / cpu_lat_mean_ms, 0, 1)
     Size score   = clamp(TARGET_SIZE_MB    / tflite_size_mb,  0, 1)
       → If TFLite size unknown: size_score defaults to 1.0 (optimistic)
         (conservative assumption — MobileNet variants are typically small enough)
+
+    msv_roc_auc can be a -1.0 sentinel from train_student.py when ROC-AUC is
+    undefined for a batch (e.g. only one class present) — guarded below to
+    fall back to msv_f1 in that case too, not just when the key is missing
+    entirely, so a degenerate-batch artifact can't silently tank a
+    candidate's score.
 
     Citation basis:
       Clinical accuracy weights: Cruz et al. (2024), Mushayi et al. (2025)
@@ -222,6 +232,14 @@ def mobile_composite_score(test_metrics: dict,
     mln_f1    = _f("mln_f1")
     sil_miou  = _f("sil_mIoU")
     msv_roc   = _f("msv_roc_auc", msv_f1)  # fallback to msv_f1 if AUC not yet computed
+    # FIX: train_student.py writes msv_roc_auc = -1.0 as a sentinel when ROC-AUC
+    # is undefined (e.g. only one class present in a batch). The fallback above
+    # only catches a MISSING key, not a present-but-invalid value — an
+    # unguarded -1.0 here would subtract 0.18 from the composite score instead
+    # of falling back, potentially disqualifying an otherwise good candidate
+    # over a degenerate-batch artifact rather than a real accuracy problem.
+    if msv_roc < 0:
+        msv_roc = msv_f1
     sev_mae   = _f("sev_mae_pct", 100.0)   # percentage — normalise to [0,1]
     lat_ms    = _f("cpu_lat_mean_ms", 999.0)
 
