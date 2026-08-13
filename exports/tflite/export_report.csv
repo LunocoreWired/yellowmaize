@@ -1,0 +1,2 @@
+encoder_variant,factory_mode,n_parameters,onnx_export,tflite_conversion,onnx_size_mb,tflite_size_mb,input_size,quantization,n_validated,cls_agreement,mean_seg_diff,mean_latency_ms,export_duration_s
+mobilenet_v3_small,mode_b,3588102,success,success,13.7,13.75,224×224,FP16,0,0.0,nan,nan,21.0

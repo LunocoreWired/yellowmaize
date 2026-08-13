@@ -1,0 +1,4 @@
+component,winner,primary_metric,primary_value,maize_recall,roc_auc,canonical_ckpt,lat_cpu_ms,winner_encoder,winner_mode,quality_composite,mobile_composite,selection_basis
+Bouncer,mobilenet_v3_large,specificity,1.0,1.0,1.0,/home/luno/yellowmaize/checkpoints/final/bouncer_best.pth,,,,,,
+Teacher,mit_b2,dice,0.9701,,,/home/luno/yellowmaize/checkpoints/final/teacher_best.pth,1575.8,,,,,
+Student,,,,,,/home/luno/yellowmaize/checkpoints/final/student_best.pth,,mobilenet_v3_small,mode_b,0.935,,mobile_composite (MSV_F1×0.32 + ROC_AUC×0.18 + mIoU×0.18 + speed×0.16 + MLN_F1×0.08 + sev×0.05 + size×0.03)

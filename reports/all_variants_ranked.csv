@@ -1,0 +1,15 @@
+variant,best_f1,threshold,specificity,maize_recall,roc_auc,TP,FP,TN,FN,ckpt,component,primary_metric,primary_value,rank,best_dice,lat_cpu_ms,encoder,mode,best_composite
+mobilenet_v2,1.0,0.7,1.0,1.0,1.0,4935.0,0.0,5065.0,0.0,/home/luno/Projects/yellowmaize/checkpoints/bouncer/bouncer_mobilenet_v2_best.pth,Bouncer,specificity,1.0,1,nan,nan,nan,nan,nan
+mobilenet_v3_large,1.0,0.7,1.0,1.0,1.0,4935.0,0.0,5065.0,0.0,/home/luno/Projects/yellowmaize/checkpoints/bouncer/bouncer_mobilenet_v3_large_best.pth,Bouncer,specificity,1.0,1,nan,nan,nan,nan,nan
+edgevit_xxs,0.9998,0.7,0.9996,1.0,1.0,4935.0,2.0,5063.0,0.0,/home/luno/Projects/yellowmaize/checkpoints/bouncer/bouncer_edgevit_xxs_best.pth,Bouncer,specificity,0.9996,3,nan,nan,nan,nan,nan
+gabor_lbp,0.915,nan,0.92,0.915,nan,nan,nan,nan,nan,nan,Bouncer,specificity,0.92,4,nan,nan,nan,nan,nan
+resnet50,nan,nan,nan,nan,nan,nan,nan,nan,nan,/home/luno/Projects/yellowmaize/checkpoints/teacher/teacher_resnet50_best.pth,Teacher,dice,0.9655,4,0.9655,796.7,nan,nan,nan
+efficientnet-b2,nan,nan,nan,nan,nan,nan,nan,nan,nan,/home/luno/Projects/yellowmaize/checkpoints/teacher/teacher_efficientnet-b2_best.pth,Teacher,dice,0.9687,2,0.9687,450.4,nan,nan,nan
+mit_b2,nan,nan,nan,nan,nan,nan,nan,nan,nan,/home/luno/Projects/yellowmaize/checkpoints/teacher/teacher_mit_b2_best.pth,Teacher,dice,0.9701,1,0.9701,1575.8,nan,nan,nan
+deeplabv3plus-eb2,nan,nan,nan,nan,nan,nan,nan,nan,nan,/home/luno/Projects/yellowmaize/checkpoints/teacher/teacher_deeplabv3plus-eb2_best.pth,Teacher,dice,0.9674,3,0.9674,440.7,nan,nan,nan
+nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,Student_Encoder,composite,0.9346,4,nan,nan,mobilenet_v3_small,mode_b,0.9346
+nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,Student_Encoder,composite,0.9414,1,nan,nan,mobilenet_v2,mode_b,0.9414
+nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,Student_Encoder,composite,0.9336,5,nan,nan,mobilenet_v2_cbam,mode_b,0.9336
+nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,Student_Encoder,composite,0.9386,3,nan,nan,efficientnet_b0,mode_b,0.9386
+nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,Student_Encoder,composite,0.9407,2,nan,nan,efficientnet_b0_cbam,mode_b,0.9407
+nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan,Student_Mode,composite,0.935,1,nan,nan,mobilenet_v3_small,mode_b,0.935
