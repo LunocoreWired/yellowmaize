@@ -1,0 +1,51 @@
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Python Cache & Artifacts
+__pycache__/
+*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Datasets & Heavy Data
+data/
+dataset/
+maize_dataset/
+quarantine/
+sam2/
+
+# Model Checkpoints & Large Files
+checkpoints/
+*.pt
+*.pth
+
+# Generated Reports, Overlays, Logs & Run Outputs
+reports/
+logs/
+runs/
+exports/
+
+# Generated Manifests / QA Reports (regenerable from raw data + scripts)
+# NOTE: global_split_manifest.csv is deliberately NOT ignored — it fixes
+# your train/val/test split and matters for thesis reproducibility.
+tier1_manifest.csv
+tier1_qa_report.csv
+global_split_manifest.pre_path_fix.csv
+
+# Backup / Stray Files
+*.bak
+*:Zone.Identifier
+=8.0.0
+
+# Environment Variables & Local Configs
+.env
+*.log
+
+# IDE & OS Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

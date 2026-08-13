@@ -1,0 +1,62 @@
+# Yellow MAIze — Python dependencies
+# Install: pip install -r requirements.txt
+#
+# Notes:
+#   - SAM2 must be installed separately (see below)
+#   - TFLite conversion requires onnx-tf + tensorflow (optional — only for export)
+#   - anomalib required only for PatchCore Bouncer baseline evaluation
+
+# ── Core ML ───────────────────────────────────────────────────────────────────
+torch>=2.1.0
+torchvision>=0.16.0
+torchaudio>=2.1.0
+
+# ── Segmentation models ───────────────────────────────────────────────────────
+segmentation-models-pytorch>=0.3.3
+
+# ── Vision utilities ──────────────────────────────────────────────────────────
+timm>=0.9.12
+albumentations>=1.3.1
+opencv-python>=4.8.0
+Pillow>=10.0.0
+
+# ── XAI ───────────────────────────────────────────────────────────────────────
+grad-cam>=1.4.8
+
+# ── Data science ──────────────────────────────────────────────────────────────
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+scipy>=1.11.0
+
+# ── Image hashing (deduplication) ────────────────────────────────────────────
+imagehash>=4.3.1
+
+# ── ONNX export ───────────────────────────────────────────────────────────────
+onnx>=1.14.0
+onnxruntime>=1.16.0
+
+# ── TFLite conversion (optional — only needed for export_tflite.py) ───────────
+# onnx-tf>=1.10.0
+# tensorflow>=2.13.0
+
+# ── Label Studio brush-tool decoding (optional — only needed if symptom masks
+#    were annotated with the brush tool instead of polygon in train_symptom_model.py)
+# label-studio-converter>=0.0.55
+
+# ── Anomaly detection (optional — only for PatchCore Bouncer baseline) ────────
+anomalib>=1.0.0          # PatchCore Bouncer baseline (optional but recommended)
+
+# ── Visualisation ─────────────────────────────────────────────────────────────
+matplotlib>=3.7.0
+
+# ── Progress bars ─────────────────────────────────────────────────────────────
+tqdm>=4.65.0
+
+# ── Object detection (YOLOv8n leaf detector — Phase 1b) ─────────────────────
+ultralytics>=8.0.0        # YOLOv8n training + inference (train_yolo_detector.py)
+
+# ── SAM2 — install separately ─────────────────────────────────────────────────
+# pip install git+https://github.com/facebookresearch/segment-anything-2
+# Download weights: https://dl.fbaipublicfiles.com/segment_anything_v2/
+# Place at: sam2/sam2_hiera_large.pt
