@@ -1,5 +1,0 @@
-variant,best_dice,lat_cpu_ms,ckpt
-resnet50,0.9655,796.7,/home/luno/Projects/yellowmaize/checkpoints/teacher/teacher_resnet50_best.pth
-efficientnet-b2,0.9687,450.4,/home/luno/Projects/yellowmaize/checkpoints/teacher/teacher_efficientnet-b2_best.pth
-mit_b2,0.9701,1575.8,/home/luno/Projects/yellowmaize/checkpoints/teacher/teacher_mit_b2_best.pth
-deeplabv3plus-eb2,0.9674,440.7,/home/luno/Projects/yellowmaize/checkpoints/teacher/teacher_deeplabv3plus-eb2_best.pth

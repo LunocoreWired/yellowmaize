@@ -1,6 +1,0 @@
-encoder,mode,best_composite
-mobilenet_v3_small,mode_b,0.9346
-mobilenet_v2,mode_b,0.9414
-mobilenet_v2_cbam,mode_b,0.9336
-efficientnet_b0,mode_b,0.9386
-efficientnet_b0_cbam,mode_b,0.9407

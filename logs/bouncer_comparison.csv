@@ -1,5 +1,0 @@
-variant,best_f1,threshold,specificity,maize_recall,roc_auc,TP,FP,TN,FN,ckpt
-mobilenet_v2,1.0,0.7,1.0,1.0,1.0,4935,0,5065,0,/home/luno/Projects/yellowmaize/checkpoints/bouncer/bouncer_mobilenet_v2_best.pth
-mobilenet_v3_large,1.0,0.7,1.0,1.0,1.0,4935,0,5065,0,/home/luno/Projects/yellowmaize/checkpoints/bouncer/bouncer_mobilenet_v3_large_best.pth
-edgevit_xxs,0.9998,0.7,0.9996,1.0,1.0,4935,2,5063,0,/home/luno/Projects/yellowmaize/checkpoints/bouncer/bouncer_edgevit_xxs_best.pth
-gabor_lbp,0.915,N/A,0.92,0.915,,,,,,N/A
