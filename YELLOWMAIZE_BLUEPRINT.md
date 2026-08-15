@@ -119,6 +119,8 @@ One Label Studio / CVAT project, two passes, same 501 images:
 
 > `sample_yolo_annotations.py` is deprecated. `YOLO_IMAGES_DIR`, `YOLO_ANNOTATIONS_DIR`, `YOLO_ANNOTATION_FILE` in `config.py` all point to `data/gold_standard/` paths. `train_yolo_detector.py` derives bboxes from `annotations.json` automatically.
 
+> If Pass 2 falls short of the ≥ 400 MSV+MLN target within the 501-image set, extra images can be annotated into `data/symptom_extra/images/` (`SYMPTOM_EXTRA_IMAGES_DIR`) — same CVAT task, same `symptom_annotations.json` export. `train_symptom_model.py` / `validate_symptom.py` search `[GOLD_IMAGES_DIR, SYMPTOM_EXTRA_IMAGES_DIR]` and skip whichever doesn't exist.
+
 ---
 
 ## PART 3 — IMAGE UTILITIES (image_utils.py)
@@ -170,7 +172,7 @@ Step 10 pHash near-duplicates      Hamming ≤ 2 within class → reject duplica
 
 Additionally: green-content flag (< 5% green pixels → flagged, kept).
 
-Outputs: `global_split_manifest.csv`, `preprocessing_report.csv`, `preprocessing_flagged.csv`, `preprocessing_summary.txt`.
+Outputs: `global_split_manifest.csv`, `preprocessing_report.csv`, `preprocessing_flagged.csv`, `preprocessing_summary.txt`. Rejected files are moved (never deleted) to `quarantine/<reason>/<class>/` at project root, via `quarantine_file()`.
 
 ---
 
@@ -278,8 +280,11 @@ YOLO_CONF_THRESHOLD = 0.25
 YOLO_IOU_NMS        = 0.45
 ```
 
-### 8.3 SAM2 QA Calibration
-After YOLO training, runs YOLO+SAM2 on gold-standard images → finds minimum mean-foreground-confidence threshold that achieves mean IoU ≥ `GOLD_IOU_TARGET_MEAN` (0.85) → writes to `logs/yolo_qa_calibration.csv`. Used by `generate_tier1_masks.py` at runtime.
+### 8.3 Validation Metrics
+`evaluate_yolo()` runs on the val split → mAP@0.5, mAP@0.5:0.95, precision, recall (Ultralytics `model.val()`). Written to `logs/yolo_val_metrics.csv`. Warns if mAP@0.5 < 0.70 (annotation count may be below `YOLO_MIN_ANNOTATIONS`).
+
+### 8.4 SAM2 QA Calibration
+After YOLO training, runs YOLO+SAM2 on gold-standard images → sweeps confidence thresholds 0.50–0.95 in 0.01 steps → for each threshold, computes mean IoU(SAM2 mask, human polygon mask) over images with mean_conf ≥ threshold → picks the **lowest** threshold that reaches `GOLD_IOU_TARGET_MEAN` (0.85), maximizing data retained while meeting the quality bar (fallback 0.65 if the target is never reached). Threshold sweep curve → `logs/yolo_qa_calibration.csv` (read by `generate_tier1_masks.py` at runtime); raw per-image (mean_conf, IoU) points → `logs/yolo_calib_raw.csv`.
 
 ---
 
@@ -393,12 +398,24 @@ Teacher DataLoader uses `load_image_rgb()` — NOT `load_image_clahe()`. SAM2 ge
 ### 10.7 Data Distribution Check
 `build_sample_list()` prints per-class counts and warns if total < 10,000 before training starts. Catches pipeline issues before a long run.
 
+### 10.8 Outputs
+```
+logs/teacher_{variant}_metrics.csv   per-epoch loss/Dice/IoU/Recall curves
+logs/teacher_comparison.csv          best_dice per variant (select_best_pipeline.py primary metric)
+logs/teacher_test_metrics.csv        held-out test Dice/IoU/Recall/Precision/Specificity
+reports/teacher_overlays/            5 qualitative overlays/class from the test split
+```
+Note: `reports/teacher_overlays/` is a separate, earlier qualitative check on the test split. The overlays actually embedded in `evaluation_report.html` (Section 4) come from `validate_gold_standard.py`'s `reports/gold_standard_overlays/` — SAM2/Teacher/Student predictions vs. human ground truth, which is the comparison that matters for the thesis chain-validation claim.
+
 ---
 
 ## PART 11 — SYMPTOM TEACHER (train_symptom_model.py)
 
 ### 11.1 Motivation
 Eight rounds of LAB/HSV colour-threshold tuning (v1→v8 in `factory_master.py`) confirmed a structural ceiling. Static colour rules cannot separate early chlorosis from healthy yellow-maize tissue, or distinguish tip-burn from MLN necrosis, regardless of how many morphological exceptions are added.
+
+### 11.1b Extra Annotation Source
+If the 501 gold-standard images don't reach `SYMPTOM_MIN_ANNOTATIONS` (400) MSV+MLN symptom regions, additional images can be annotated and dropped in `data/symptom_extra/images/` (`SYMPTOM_EXTRA_IMAGES_DIR`) — same CVAT task, same `symptom_annotations.json` export. `parse_symptom_annotations()` accepts `images_dir` as a single `Path` or a `list[Path]` and searches `[GOLD_IMAGES_DIR, SYMPTOM_EXTRA_IMAGES_DIR]` in order, silently dropping any directory that doesn't exist yet — this is an optional, additive source, not a requirement.
 
 ### 11.2 HealthyAE
 ```
@@ -479,7 +496,7 @@ Process ~215k train+val Tier 2 images. Generate pseudo-labels across 4 modes sim
 
 2. Leaf silhouette source:
    Tier 1 → load pre-existing SAM2 .npy
-   Tier 2 → Teacher inference at 512×512 → resize to original
+   Tier 2 → Teacher inference at TEACHER_IMG_SIZE (768×768) → resize to original
 
 3. Silhouette refinement:
    Threshold at 0.35 (catches dark leaves)
@@ -500,10 +517,17 @@ Process ~215k train+val Tier 2 images. Generate pseudo-labels across 4 modes sim
 
 6. Severity = (symptom pixels / leaf pixels) × 100
 
-7. CIMMYT grade (per class):
-   MSV scale (1-9 odd): 1=<5%, 3=5-25%, 5=25-50%, 7=50-75%, 9=>75%
-   MLN scale (1-5):     1=<10%, 2=10-25%, 3=25-50%, 4=50-75%, 5=>75%
-   HEALTHY: grade = 0
+7. CIMMYT/agronomic grade (per class), via sev_to_cimmyt_grade():
+   MSV scale (1-5, Soto et al. 1982; validated Sime et al. 2021):
+     1=≤10% chlorotic area · 2=11-25% · 3=26-50% · 4=51-75% · 5=≥75%
+   MLN scale (1-5, Beyene et al. 2017; Gowda et al. 2015):
+     1=<10% · 2=10-25% · 3=25-50% · 4=50-75% · 5=>75%
+   HEALTHY: grade = 0. Excluded images (severity < 0): grade = -1.
+   NOTE: a published CIMMYT 1-9 odd-numbered scale also exists for MSV, but
+   it is used for whole-plant visual resistance scoring by breeders, not
+   for leaf-area percentage mapping — CIMMYT_MSV_BRACKETS in config.py
+   explicitly uses the 0-5 Soto/IITA scale instead, matching MLN's scale
+   structure. Do not confuse the two.
 ```
 
 ### 12.3 4 Factory Modes
@@ -515,26 +539,42 @@ Process ~215k train+val Tier 2 images. Generate pseudo-labels across 4 modes sim
 | C | SAM2 soft float | Hard binary | `mode_c/` |
 | D | SAM2 soft float | Soft HSV confidence | `mode_d/` |
 
-### 12.4 HSV Ranges (legacy fallback — used when Symptom Teacher absent)
+### 12.4 Legacy Symptom Fallback — LAB, not HSV (used when Symptom Teacher absent)
 
-**Green exclusion zone:** H 38–85, S 80–255, V 60–230
+**Correction:** `HSV_MSV_RANGES` / `HSV_MLN_RANGES` / `HSV_GREEN_EXCL` (below) are defined in `config.py` and implemented as `compute_hsv_hard_mask()` / `compute_hsv_soft_confidence()` in `factory_master.py`, but **neither function is called anywhere in the pipeline** — they are orphaned code from an earlier (pre v4→v5) iteration. The function actually used as the Symptom-Teacher fallback is the **LAB-based** `compute_lab_hard_mask()` / `compute_lab_soft_confidence()` (v8), which is considerably more elaborate than simple HSV banding:
 
-**MSV (4 bands):**
 ```
-R1: H 15–38,  S 50–255, V 150–255   bright yellow streaks
-R2: H 20–45,  S 15–70,  V 130–255   pale yellow / early
-R3: H 0–179,  S 0–35,   V 210–255   near-white / bleached (R3 area filter ≥ 80px)
-R4: H 38–55,  S 10–55,  V 140–255   pale yellow-green
+Green exclusion : a* < LAB_GREEN_A_MAX (121)  — greener pixels treated as healthy tissue
+Frangi vesselness: skimage.filters.frangi on L*, sigmas FRANGI_SIGMAS=(0.5,1.5,3.0,6.0,10.0),
+                   soft-suppresses vein-ridge false positives — (1 − sqrt(vesselness)).
+                   Threshold: HEALTHY 0.6 (most aggressive) · MSV 0.5 · MLN 0.35 (necrosis
+                   crosses veins, so suppression must be gentler) — hardcoded per-class.
+Morphology       : _multiscale_symptom_union() — small (1×7) opening always runs; large
+                   (1×15) angled-kernel union (MORPH_OPEN_ANGLES) added only when
+                   symptomatic area > 8% of leaf, so early flecks survive.
+MSV threshold    : 2D joint Otsu over the (a*, b*) histogram within the leaf mask
+                   (OTSU_2D_BIN_COUNT=64 bins/axis; falls back to independent 1D Otsu
+                   per channel when leaf pixel count < 200) — catches cases where
+                   neither channel alone is elevated but their combination is.
+MSV texture      : Gabor filter combines grayscale texture with a*-channel texture
+                   (GABOR_A_CHANNEL_WEIGHT=0.4) — chromatic texture of chlorotic
+                   streaks is more discriminative than luminance under overcast light.
+MLN dark necrosis: additional gate (L* < 110) & (a* ≥ 125) for dark necrotic patches.
+MLN margin guard : convex-hull margin erosion (MARGIN_EROSION_FRAC=0.08 × sqrt(leaf
+                   area) px) suppresses tip-burn false positives (physiologically
+                   distinct from MLN) — applied to MLN branch only, not MSV/HEALTHY.
+CLAHE            : L* CLAHE (clipLimit 2.0) then a* CLAHE (CLAHE_A_CLIP_LIMIT=1.0,
+                   lower to avoid chromatic noise amplification) within the leaf mask.
 ```
+This LAB pipeline is itself the legacy path (superseded by the Symptom Teacher, active when `SYMPTOM_TEACHER_DEPLOYED=True` and checkpoints exist) — but it is the *real* fallback and comparison baseline, not the orphaned HSV bands below.
 
-**MLN (5 bands):**
-```
-R1: H 18–40,  S 40–255, V 90–255    chlorotic yellow
-R2: H 5–20,   S 40–255, V 50–220    orange-amber necrosis
-R3: H 22–55,  S 15–85,  V 80–240    pale yellow-green mosaic
-R4: H 8–35,   S 0–45,   V 160–255   tan / straw tissue
-R5: H 0–18,   S 30–180, V 30–150    dark brown dead tissue
-```
+**Orphaned HSV bands (dead code, kept for reference only — not called):**
+
+Green exclusion zone: H 38–85, S 80–255, V 60–230
+
+MSV (4 bands): R1 H15–38/S50–255/V150–255 (bright streaks) · R2 H20–45/S15–70/V130–255 (pale/early) · R3 H0–179/S0–35/V210–255 (near-white, ≥80px area filter) · R4 H38–55/S10–55/V140–255 (pale yellow-green)
+
+MLN (5 bands): R1 H18–40/S40–255/V90–255 (chlorotic yellow) · R2 H5–20/S40–255/V50–220 (orange-amber necrosis) · R3 H22–55/S15–85/V80–240 (pale mosaic) · R4 H8–35/S0–45/V160–255 (tan/straw) · R5 H0–18/S30–180/V30–150 (dark brown dead tissue)
 
 ### 12.5 Output Files per Image per Mode
 ```
@@ -547,6 +587,14 @@ R5: H 0–18,   S 30–180, V 30–150    dark brown dead tissue
 
 All outputs downscaled to STUDENT_IMG_SIZE (224×224) at write time.
 Silhouettes: INTER_LINEAR. Binary symptom PNGs: INTER_NEAREST.
+```
+
+Also written once per full run (not per mode):
+```
+reports/phase4_report.csv          per-image unified report — all 4 modes' severity/
+                                    grade/weight columns for every processed image
+reports/factory_summary.csv        pass/reject counts + rates
+reports/factory_filter_breakdown.csv  rejection reason breakdown
 ```
 
 ### 12.6 Factory QA — validate_factory.py
@@ -660,12 +708,20 @@ composite = (
 
 ### 13.6 Mobile Composite (select_best_pipeline.py)
 ```python
-mobile = (0.38 × MSV_F1
-        + 0.22 × sil_mIoU
-        + 0.22 × clamp(150ms / cpu_lat, 0, 1)
-        + 0.10 × (1 − sev_mae / 100)
-        + 0.08 × clamp(15MB / tflite_mb, 0, 1))
-# TFLite-incompatible variants excluded from ranking
+# Module-level weight constants W_MSV_F1..W_SIZE in select_best_pipeline.py,
+# consumed directly by mobile_composite_score(). Sum = 1.00.
+mobile = (0.32 × MSV_F1                                # W_MSV_F1  — primary clinical metric
+        + 0.18 × MSV_ROC_AUC                           # W_ROC_AUC — threshold-independent detection
+        + 0.18 × sil_mIoU                               # W_MIOU    — segmentation/XAI overlay quality
+        + 0.16 × clamp(150ms / cpu_lat_mean_ms, 0, 1)   # W_SPEED   — speed_score
+        + 0.08 × MLN_F1                                 # W_MLN_F1  — prevents degenerate MSV-only model
+        + 0.05 × (1 − sev_mae_pct / 100)                # W_SEV     — severity calibration
+        + 0.03 × clamp(15MB / tflite_size_mb, 0, 1))    # W_SIZE    — size_score
+# size_score defaults to 1.0 (optimistic) if TFLite size is not yet known —
+# noted in the report rather than arbitrarily penalising unexported variants.
+# msv_roc falls back to msv_f1 if ROC-AUC hasn't been computed yet.
+# TFLite-incompatible variants (TFLITE_VARIANTS_INCOMPATIBLE = {"mobilevit_xxs"})
+# excluded from ranking. Targets: TARGET_LATENCY_MS=150, TARGET_SIZE_MB=15.
 ```
 
 ### 13.7 Two-Phase Transfer Learning
@@ -772,11 +828,11 @@ reports/gold_standard_overlays/         5 overlay PNGs per class per artifact
 ### 15.2 Target Layers
 ```python
 XAI_TARGET_LAYERS = {
-    "mobilenet_v2":         "encoder.features[-1][0]",
-    "mobilenet_v2_cbam":    "encoder.features[-1][0]",
-    "mobilenet_v3_small":   "encoder.features[-1][0]",
-    "efficientnet_b0":      "encoder.blocks[-1][-1]",
-    "efficientnet_b0_cbam": "encoder.blocks[-1][-1]",
+    "mobilenet_v2":          "unet.encoder.features[-1][0]",
+    "mobilenet_v2_cbam":     "unet.encoder.features[-1][0]",
+    "mobilenet_v3_small":    "unet.encoder.model.blocks[-1][-1]",
+    "efficientnet_b0":       "unet.encoder._blocks[-1]",
+    "efficientnet_b0_cbam":  "unet.encoder._blocks[-1]",
 }
 ```
 
@@ -798,6 +854,9 @@ Output 2 — Diagnostic attention (amber heatmap):
 XAI_INSERTION_STEPS = 25    # progressively reveal pixels in importance order
 # Pointing game accuracy, Insertion AUC, Deletion AUC — all on GPU
 ```
+
+### 15.5 Auto-Selection
+After computing per-method metrics, auto-selects the empirically best method: highest MSV pointing-game accuracy, tiebreak on Insertion AUC. Written to `logs/xai_method_selection.csv` (selected_method + msv_pg + ins_auc + del_auc + per-method pointing-game scores). This is an evidence-based check against the `XAI_DEPLOYED_METHOD` hardcoded in `config.py` — the two should agree, but the CSV records what the data actually says.
 
 ---
 
@@ -825,15 +884,57 @@ Auto-updates config.py via regex:
 
 ---
 
-## PART 17 — DEPLOYMENT (export_tflite.py + build_deployment_package.py)
+## PART 17 — SEVERITY RELIABILITY (evaluate_severity.py)
 
-### 17.1 Export Path
+### 17.1 Purpose
+Grounds the severity MAE disclaimer with empirical evidence: how well do human raters agree with each other, and how well does the pipeline's severity estimate track human judgment.
+
+### 17.2 Protocol
+```
+1. Sample SEVERITY_EVAL_N_IMAGES (60 = 20/class) from the test split.
+2. Two independent raters assign 0–SEVERITY_EVAL_SCALE_MAX (0–3) severity scores:
+     0 = No visible symptoms
+     1 = Mild     — < 25% of visible leaf area shows symptoms
+     2 = Moderate — 25–60% of visible leaf area shows symptoms
+     3 = Severe   — > 60% of visible leaf area shows symptoms
+3. Cohen's Kappa — inter-rater agreement.
+4. Spearman ρ — human ratings vs. pipeline severity (the deployed pseudo-label
+   severity, read from data/pseudo_masks/{STUDENT_FACTORY_MODE}/{stem}_sev.txt
+   for the current STUDENT_BEST_VARIANT/STUDENT_FACTORY_MODE; the CSV column is
+   still named "hsv_severity" for historical reasons even though it reflects
+   the Symptom Teacher pseudo-label when SYMPTOM_TEACHER_DEPLOYED=True).
+
+Target: Spearman ρ ≥ 0.60 supports "moderate correlation with expert assessment."
+If ρ < 0.50, the severity disclaimer must be made stronger in Chapter 4.
+```
+
+### 17.3 Usage
+```bash
+python evaluate_severity.py --sample     # Step 1: writes reports/severity_sample.csv
+                                          # + reports/severity_rating_guide.txt
+# → two raters independently fill in the blank score columns
+python evaluate_severity.py --analyze    # Step 2: kappa + spearman
+```
+
+### 17.4 Outputs
+```
+reports/severity_sample.csv       60 images for raters to fill in
+reports/severity_rating_guide.txt rater instructions (0–3 scale definitions)
+reports/severity_analysis.csv     per-image human vs. pipeline severity + correlation
+logs/severity_reliability.csv     kappa + spearman for thesis table
+```
+
+---
+
+## PART 18 — DEPLOYMENT (export_tflite.py + build_deployment_package.py)
+
+### 18.1 Export Path
 ```
 Student: PyTorch → ONNX (opset 12) → TF SavedModel → TFLite (FP16)
 Bouncer: same path
 ```
 
-### 17.2 Student TFLite I/O
+### 18.2 Student TFLite I/O
 ```
 Input:   [1, 3, 224, 224] float32, NCHW, ImageNet normalized
 Output 0 (seg):  [1, 2, 224, 224] raw logits → sigmoid → binary at 0.5
@@ -841,13 +942,13 @@ Output 1 (cls):  [1, 3] raw logits → softmax → argmax (0=HEALTHY, 1=MSV, 2=M
 Output 2 (sev):  [1, 1] float32 ∈ [0,1] → ×100 = severity %
 ```
 
-### 17.3 Bouncer TFLite I/O
+### 18.3 Bouncer TFLite I/O
 ```
 Input:  [1, 3, 224, 224] float32, NCHW
 Output: [1, 1] raw logit → sigmoid → ≥ threshold → PASS
 ```
 
-### 17.4 Android Runtime
+### 18.4 Android Runtime
 ```
 Min API     : 21
 TFLite      : org.tensorflow:tensorflow-lite:2.13.0
@@ -860,7 +961,7 @@ Pipeline:
   → display: green contour + amber heatmap + class badge + severity gauge
 ```
 
-### 17.5 Deploy Bundle
+### 18.5 Deploy Bundle
 ```
 exports/deploy/
   bouncer_model.tflite
@@ -872,7 +973,7 @@ exports/deploy/
 
 ---
 
-## PART 18 — CHART GENERATOR (generate_charts.py)
+## PART 19 — CHART GENERATOR (generate_charts.py)
 
 Standalone — no project module imports. Reads `logs/*.csv`. Safe mid-training; missing CSVs silently skipped. Dark theme (navy #0F172A, teal #34D399). Agg backend. 150 DPI PNG.
 
@@ -898,7 +999,7 @@ efficientnet_b0_cbam              #14B8A6  teal
 
 ---
 
-## PART 19 — HTML REPORT (generate_report.py)
+## PART 20 — HTML REPORT (generate_report.py)
 
 `reports/evaluation_report.html` — 100% self-contained (charts base64-embedded), dark theme, no external dependencies.
 
@@ -917,23 +1018,23 @@ efficientnet_b0_cbam              #14B8A6  teal
 
 ---
 
-## PART 20 — INFRASTRUCTURE
+## PART 21 — INFRASTRUCTURE
 
-### 20.1 safe_collate
+### 21.1 safe_collate
 Every DataLoader: `collate_fn=safe_collate`. Filters None `__getitem__` returns. All-None batch returns None; training loop skips with `continue`. `reset_skip_counter()` at epoch start, `get_skip_count()` at epoch end.
 
-### 20.2 Gradient Clipping
+### 21.2 Gradient Clipping
 All training scripts: `clip_grad_norm_(model.parameters(), max_norm=5.0)`. Student also clips uncertainty log_vars (s1/s2/s3). Protects against log_var spikes and encoder-unfreeze gradient surges.
 
-### 20.3 Reproducibility
+### 21.3 Reproducibility
 Every script calls `set_seeds(42)`: random, numpy, torch, cuda, cudnn.deterministic=True, benchmark=False. Stage 1 Mode B reused in Stage 2: same seed + same manifest + same hyperparameters = identical run.
 
-### 20.4 Timing
+### 21.4 Timing
 Wall-clock duration logged in every script. Student: 220 CPU passes (20 warmup + 200 measured) → mean ms, std ms, FPS. Teacher: 20 CPU passes per variant.
 
 ---
 
-## PART 21 — EXECUTION REFERENCE
+## PART 22 — EXECUTION REFERENCE
 
 ```bash
 pip install -r requirements.txt
@@ -986,7 +1087,7 @@ python generate_report.py                            # Step 16
 
 ---
 
-## PART 22 — KEY TERMINOLOGY
+## PART 23 — KEY TERMINOLOGY
 
 | Wrong | Correct |
 |---|---|
@@ -997,7 +1098,7 @@ python generate_report.py                            # Step 16
 
 ---
 
-## PART 23 — KEY CITATIONS
+## PART 24 — KEY CITATIONS
 
 | Reference | Used for |
 |---|---|
@@ -1009,6 +1110,8 @@ python generate_report.py                            # Step 16
 | Lin et al. (2017) ICCV | Focal loss (Symptom Teacher) |
 | Cruz et al. (2024) | First confirmed MSV in the Philippines |
 | Mushayi et al. (2025) | MSV / HEALTHY confusion — asymmetric prior basis |
+| Soto et al. (1982); Sime et al. (2021) Agriculture 11(2):130 | MSV 1-5 severity scale (CIMMYT_MSV_BRACKETS) |
+| Beyene et al. (2017) Euphytica 213:224; Gowda et al. (2015); Eunice et al. (2021) | MLN 1-5 severity scale (CIMMYT_MLN_BRACKETS) |
 | Selvaraju et al. (2017) ICCV | Grad-CAM |
 | Chattopadhay et al. (2018) WACV | Grad-CAM++ |
 | Wang et al. (2020) CVPR | Score-CAM |
