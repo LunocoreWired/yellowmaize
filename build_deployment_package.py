@@ -52,6 +52,7 @@ from config import (
     BOUNCER_IMG_SIZE, STUDENT_IMG_SIZE,
     BOUNCER_DEPLOYED_VARIANT, STUDENT_BEST_VARIANT, STUDENT_FACTORY_MODE,
     CLASSES, CLASS_TO_IDX,
+    CIMMYT_MSV_BRACKETS, CIMMYT_MLN_BRACKETS,
 )
 
 DEPLOY_DIR   = EXPORTS_DIR.parent / "deploy"
@@ -335,6 +336,14 @@ def write_metadata(bouncer_thresh: float,
                     "post_process":"value is already clamped [0,1]; severity_pct = value * 100",
                     "note":        "Severity is a model-learned estimate consistent with HSV-derived pseudo-labels. Not agronomically validated.",
                 },
+                "cimmyt_grade": {
+                    "derived_from": "severity (see above) — not a separate model output",
+                    "post_process": "sev_to_cimmyt_grade(severity_pct, class_name) — bracket lookup, see brackets below",
+                    "msv_brackets": CIMMYT_MSV_BRACKETS,
+                    "mln_brackets": CIMMYT_MLN_BRACKETS,
+                    "healthy_grade": 0,
+                    "note":         "Grade is a bracket-lookup on the same model-learned severity estimate above, not an independently validated agronomic rating. Same caveat as severity applies transitively.",
+                },
             },
             "grad_cam_note": {
                 "description": "Grad-CAM++ heatmap is computed at runtime in the Android app, not stored in TFLite.",
@@ -379,11 +388,55 @@ def write_metadata(bouncer_thresh: float,
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# KOTLIN CODE GENERATION — CIMMYT GRADE LOOKUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _kotlin_bracket_when(brackets: list[tuple[int, int, int]]) -> str:
+    """
+    Renders a bracket table (lo, hi, grade) as a Kotlin `when` block, built
+    directly from the real CIMMYT_MSV_BRACKETS / CIMMYT_MLN_BRACKETS tuples
+    in config.py rather than hand-typed — the generated Kotlin literally
+    cannot drift from the Python bracket values this way, unlike a
+    separately hand-maintained Kotlin copy would.
+    """
+    lines = []
+    for lo, hi, grade in brackets:
+        lines.append(f"        severityPct >= {lo}f && severityPct < {hi}f -> {grade}")
+    return "\n".join(lines)
+
+
+def _build_kotlin_grade_function() -> str:
+    msv_when = _kotlin_bracket_when(CIMMYT_MSV_BRACKETS)
+    mln_when = _kotlin_bracket_when(CIMMYT_MLN_BRACKETS)
+    msv_fallback_grade = CIMMYT_MSV_BRACKETS[-1][2]
+    mln_fallback_grade = CIMMYT_MLN_BRACKETS[-1][2]
+    return f"""// Generated directly from config.py's CIMMYT_MSV_BRACKETS / CIMMYT_MLN_BRACKETS —
+// the SAME bracket definitions sev_to_cimmyt_grade() (factory_master.py) and
+// validate_student.py use, so this on-device grade always matches the
+// training-time / validation-time grade for the same severity value.
+fun sevToCimmytGrade(severityPct: Float, className: String): Int {{
+    if (className == "HEALTHY") return 0
+    return if (className == "MSV") {{
+        when {{
+{msv_when}
+            else -> {msv_fallback_grade}  // severity >= 100, clamp to highest grade
+        }}
+    }} else {{  // MLN
+        when {{
+{mln_when}
+            else -> {mln_fallback_grade}  // severity >= 100, clamp to highest grade
+        }}
+    }}
+}}"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # DEPLOYMENT README
 # ══════════════════════════════════════════════════════════════════════════════
 
 def write_readme(bouncer_ok: bool, student_ok: bool,
                  bouncer_thresh: float) -> None:
+    kotlin_grade_fn = _build_kotlin_grade_function()
     readme = f"""# MAIze Android Deployment Guide
 Generated: {time.strftime("%Y-%m-%d %H:%M:%S")}
 
@@ -486,6 +539,11 @@ studentInterpreter.runForMultipleInputsOutputs(
     arrayOf(tensorImage.buffer), outputs)
 ```
 
+### 6b. CIMMYT severity grade lookup
+```kotlin
+{kotlin_grade_fn}
+```
+
 ### 7. Post-processing
 ```kotlin
 // Classification
@@ -494,8 +552,9 @@ val classIndex = classProbs.indexOfMax()
 val className  = arrayOf("HEALTHY", "MSV", "MLN")[classIndex]
 val confidence = classProbs[classIndex] * 100f
 
-// Severity
+// Severity + CIMMYT grade
 val severityPct = sevOutput[0][0] * 100f
+val cimmytGrade = sevToCimmytGrade(severityPct, className)
 
 // Segmentation — NHWC layout: segOutput[0][y][x][channel]
 // channel 0 = leaf silhouette, channel 1 = symptom mask
@@ -507,7 +566,7 @@ val symptoms   = Array(224) {{ y -> FloatArray(224) {{ x -> segOutput[0][y][x][1
 
 // UI labels
 displayResult(
-    className, confidence, severityPct,
+    className, confidence, severityPct, cimmytGrade,
     silhouetteMask = binarize(sigmoid(silhouette), 0.5f),
     symptomMask    = binarize(sigmoid(symptoms),   0.5f)
 )
@@ -518,6 +577,7 @@ displayResult(
 - **Amber heatmap** from Grad-CAM++ on classification output → label: "Diagnostic attention"
 - **Class badge**: HEALTHY / MSV / MLN with confidence %
 - **Severity gauge**: 0–100% bar
+- **CIMMYT grade badge**: 0 (HEALTHY) or 1–5, shown alongside the severity gauge, not in place of it — see disclaimer note 4 below
 
 ---
 
@@ -526,7 +586,7 @@ displayResult(
 1. **Input normalization** — must use ImageNet mean/std exactly as above. Wrong normalization produces random outputs with no error.
 2. **Channel order** — TFLite uses NHWC (channels last): shape `[1, 224, 224, 3]`. The ONNX→TF→TFLite conversion handles the PyTorch NCHW→NHWC transpose automatically. Pass your Android `TensorImage` directly — do NOT manually transpose to NCHW.
 3. **Sigmoid vs softmax** — segmentation and severity outputs need sigmoid; classification needs softmax. Applying the wrong function produces incorrect results silently.
-4. **Severity disclaimer** — severity % is learned from HSV-derived pseudo-labels, not expert agronomic ratings. Display as an estimate, not a diagnosis.
+4. **Severity and grade disclaimer** — severity % is learned from HSV-derived pseudo-labels, not expert agronomic ratings. The CIMMYT grade is a bracket lookup on that same learned estimate, not an independently validated agronomic rating — it can look more "official" to a user than a raw percentage precisely because it matches a published scale, so it is important to still display it as a model-derived estimate, not a diagnosis.
 5. **Bouncer threshold** — the value `{bouncer_thresh}` was empirically selected on the validation split. Do not hardcode a different value.
 
 ---

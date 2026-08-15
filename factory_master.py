@@ -91,8 +91,8 @@ Change-log (v6 → v7):
   NEW-2  — CLAHE applied to L* channel within leaf mask before LAB symptom
             detection via _clahe_L(). Locally adaptive contrast on the leaf
             region only — more targeted than full-image CLAHE in load_image_clahe.
-  NEW-3  — CIMMYT severity grading added. _sev_to_cimmyt_grade() maps
-            continuous severity % to published CIMMYT 1–9 (MSV) and 1–5 (MLN)
+  NEW-3  — CIMMYT severity grading added. sev_to_cimmyt_grade() maps
+            continuous severity % to published CIMMYT 1–5 (MSV) and 1–5 (MLN)
             scales. Written as _grade.txt alongside _sev.txt per image.
 
 Change-log (v7 → v8):
@@ -717,8 +717,15 @@ def _margin_erosion_mask(silhouette: np.ndarray) -> np.ndarray:
     return eroded.astype(np.uint8)
 
 
-def _sev_to_cimmyt_grade(severity_pct: float, category: str) -> int:
+def sev_to_cimmyt_grade(severity_pct: float, category: str) -> int:
     """Map continuous severity % to published agronomic grade.
+
+    Public (no leading underscore): originally Factory-internal only, used
+    here to compute grade-stratified training weights, but now also imported
+    directly by validate_student.py to show the grade alongside severity on
+    the deployed Student's own predictions, not just during Factory
+    pseudo-labeling. Kept as a single source of truth rather than
+    reimplementing the same bracket lookup twice.
 
     Brackets are read from config.py (CIMMYT_MSV_BRACKETS / CIMMYT_MLN_BRACKETS)
     so config remains the single source of truth — see config.py's
@@ -1717,14 +1724,14 @@ def process_single_image_cpu(args):
         (mode_dir / f"{stem}_sev.txt").write_text(str(round(data["severity"], 4)))
         (mode_dir / f"{stem}_weight.txt").write_text(str(result["weight"]))
         # NEW-3: CIMMYT agronomic grade alongside continuous severity
-        grade = _sev_to_cimmyt_grade(data["severity"], category)
+        grade = sev_to_cimmyt_grade(data["severity"], category)
         (mode_dir / f"{stem}_grade.txt").write_text(str(grade))
 
     result["status"] = "processed"
     result.update({f"{m}_sev": round(modes_data[m]["severity"], 4) for m in modes_data})
     result.update(
         {
-            f"{m}_grade": _sev_to_cimmyt_grade(modes_data[m]["severity"], category)
+            f"{m}_grade": sev_to_cimmyt_grade(modes_data[m]["severity"], category)
             for m in modes_data
         }
     )

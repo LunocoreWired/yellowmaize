@@ -13,9 +13,12 @@
 
    For each sampled image, this produces a single panel showing:
      Original | Predicted leaf silhouette | Predicted symptom mask
-   with a text header reporting the predicted class and severity, so a
-   reader can see what the deployed model actually outputs on real images,
-   not just its aggregate accuracy numbers.
+   with a text header reporting the predicted class, continuous severity
+   (%), and the corresponding CIMMYT agronomic grade (1-5, via
+   factory_master.py's sev_to_cimmyt_grade() — the same function used
+   during Factory pseudo-labeling), so a reader can see what the deployed
+   model actually outputs on real images, not just its aggregate accuracy
+   numbers.
 
  MODEL LOADED:
    The deployed Student checkpoint, resolved from STUDENT_BEST_VARIANT and
@@ -58,6 +61,7 @@ from config import (
     STUDENT_FACTORY_MODE,
     STUDENT_IMG_SIZE,
 )
+from factory_master import sev_to_cimmyt_grade
 from train_student import StudentModel
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -103,8 +107,18 @@ def load_deployed_student() -> torch.nn.Module | None:
 def predict(model, img_rgb: np.ndarray):
     """
     Runs the Student on a single image, returns:
-      sil_mask (H,W bool), sym_mask (H,W bool), pred_class (str), severity (float 0-100)
+      sil_mask (H,W bool), sym_mask (H,W bool), pred_class (str),
+      severity (float 0-100), grade (int, CIMMYT agronomic grade)
     at the ORIGINAL image resolution (resized back up from STUDENT_IMG_SIZE).
+
+    grade is computed via sev_to_cimmyt_grade() (factory_master.py) — the
+    SAME function used during Factory pseudo-labeling to compute
+    grade-stratified training weights. Reusing it here, rather than a
+    second bracket-lookup implementation, is what keeps the grade shown in
+    this validation output consistent with the grade the training pipeline
+    itself used, even if the CIMMYT_MSV_BRACKETS / CIMMYT_MLN_BRACKETS
+    tables in config.py are ever revised later — there is exactly one
+    place that needs updating, not two.
     """
     orig_h, orig_w = img_rgb.shape[:2]
     tensor = _INFER_TF(image=img_rgb)["image"].unsqueeze(0).to(DEVICE)
@@ -118,12 +132,13 @@ def predict(model, img_rgb: np.ndarray):
 
     pred_class = CLASSES[cls_out.argmax(dim=1).item()]
     severity = float(sev_out.item()) * 100.0
+    grade = sev_to_cimmyt_grade(severity, pred_class)
 
-    return sil_prob >= 0.5, sym_prob >= 0.5, pred_class, severity
+    return sil_prob >= 0.5, sym_prob >= 0.5, pred_class, severity, grade
 
 
 def draw_prediction_panel(img_rgb, sil_mask, sym_mask, pred_class, severity,
-                          gt_category, stem):
+                          grade, gt_category, stem):
     """Original | Predicted silhouette | Predicted symptom mask, with a text header."""
     h, w = img_rgb.shape[:2]
     sym_color = CLASS_COLORS.get(pred_class, (200, 200, 0))
@@ -156,7 +171,7 @@ def draw_prediction_panel(img_rgb, sil_mask, sym_mask, pred_class, severity,
     correct = pred_class == gt_category
     status = "match" if correct else "mismatch"
     footer = (f"GT: {gt_category}  |  Predicted: {pred_class} ({status})  |  "
-             f"Severity: {severity:.1f}%  |  {stem}")
+             f"Severity: {severity:.1f}%  (CIMMYT Grade {grade})  |  {stem}")
     cv2.putText(combined, footer, (8, combined.shape[0] - 10),
                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
     cv2.putText(combined, footer, (8, combined.shape[0] - 10),
@@ -201,9 +216,9 @@ def main() -> None:
                 continue
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-            sil_mask, sym_mask, pred_class, severity = predict(model, img_rgb)
+            sil_mask, sym_mask, pred_class, severity, grade = predict(model, img_rgb)
             panel = draw_prediction_panel(
-                img_rgb, sil_mask, sym_mask, pred_class, severity,
+                img_rgb, sil_mask, sym_mask, pred_class, severity, grade,
                 gt_category=cls, stem=img_path.stem)
 
             out_path = OVERLAY_DIR / f"{img_path.stem}_student_pred.jpg"
