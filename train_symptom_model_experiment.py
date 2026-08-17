@@ -742,8 +742,8 @@ def _symptom_collate(batch):
 
 
 def focal_tversky_loss(logits: torch.Tensor, target: torch.Tensor,
-                       alpha_per_channel: tuple[float, float] = (0.3, 0.5),
-                       beta_per_channel: tuple[float, float] = (0.7, 0.5),
+                       alpha_per_channel: tuple[float, float] = (0.4, 0.5),
+                       beta_per_channel: tuple[float, float] = (0.6, 0.5),
                        gamma: float = 0.75, smooth: float = 1.0) -> torch.Tensor:
     """
     EXPERIMENTAL: Focal Tversky Loss (Abraham & Khan, ISBI 2019,
