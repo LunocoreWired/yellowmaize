@@ -869,7 +869,7 @@ MSV_UPWEIGHT_FACTOR = 1.5   # only used if EXPERIMENTAL_LOSS_MODE == "msv_upweig
 # Set BOUNDARY_LOSS_LAMBDA = 0.0 to exactly reproduce prior behavior (pure
 # Focal Tversky, no boundary term). Starting value 0.2 is a first guess, not
 # yet swept.
-BOUNDARY_LOSS_LAMBDA = 0.2
+BOUNDARY_LOSS_LAMBDA = 0.0
 BOUNDARY_WIDTH_PX = 15          # distance (px) over which the weight decays to the floor
 BOUNDARY_WEIGHT_FLOOR = 0.1     # minimum weight far from any boundary
 
