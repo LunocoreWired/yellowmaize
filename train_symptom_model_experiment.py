@@ -99,6 +99,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from albumentations.pytorch import ToTensorV2
+from scipy.ndimage import distance_transform_edt
 from torch.utils.data import DataLoader, Dataset
 
 from image_utils import load_image_rgb
@@ -845,10 +846,72 @@ def dice_focal_loss(logits: torch.Tensor, target: torch.Tensor,
 #                   help, cost MLN slightly; kept for reference, not used)
 # "focal_tversky" = Focal Tversky Loss (Abraham & Khan 2019) — research-backed
 #                   fix for small/thin foreground class imbalance, MSV set to
-#                   favor recall (beta=0.7) since it's the underperforming
-#                   class. This is the current active experiment.
+#                   favor recall (beta=0.6, tuned via sweep from 0.7/0.6/0.55)
+#                   since it's the underperforming class. This is the current
+#                   active base loss.
 EXPERIMENTAL_LOSS_MODE = "focal_tversky"
 MSV_UPWEIGHT_FACTOR = 1.5   # only used if EXPERIMENTAL_LOSS_MODE == "msv_upweight"
+
+# ── EXPERIMENTAL: boundary-aware loss term ──────────────────────────────────
+# Diagnosis (see check_precision_recall.py + visual inspection of predicted
+# masks): MSV false positives form a halo hugging the true streak boundaries
+# rather than being scattered elsewhere on the leaf — a boundary-precision
+# problem, not a structural misclassification problem. Tversky/Dice weigh
+# every pixel equally regardless of distance from the mask edge, so neither
+# has a specific incentive to tighten boundaries.
+#
+# This adds a distance-weighted BCE term on top of Focal Tversky: for each
+# ground-truth mask, a normalized distance-transform weight map is computed
+# (1.0 at the boundary, decaying to a floor of BOUNDARY_WEIGHT_FLOOR deep in
+# the interior/background), and per-pixel BCE is multiplied by that map
+# before being added to the base Tversky loss, scaled by BOUNDARY_LOSS_LAMBDA.
+#
+# Set BOUNDARY_LOSS_LAMBDA = 0.0 to exactly reproduce prior behavior (pure
+# Focal Tversky, no boundary term). Starting value 0.2 is a first guess, not
+# yet swept.
+BOUNDARY_LOSS_LAMBDA = 0.2
+BOUNDARY_WIDTH_PX = 15          # distance (px) over which the weight decays to the floor
+BOUNDARY_WEIGHT_FLOOR = 0.1     # minimum weight far from any boundary
+
+
+def _boundary_weight_map(target_np: np.ndarray) -> np.ndarray:
+    """
+    target_np: [H, W] binary ground-truth mask (single channel, single image).
+    Returns a [H, W] float32 weight map, 1.0 at the mask boundary, decaying
+    linearly to BOUNDARY_WEIGHT_FLOOR at BOUNDARY_WIDTH_PX pixels away (in
+    either direction — inside or outside the mask), and equal to
+    BOUNDARY_WEIGHT_FLOOR beyond that.
+    """
+    if target_np.max() == 0:
+        # No foreground pixels at all (pure HEALTHY image) — flat floor weight.
+        return np.full(target_np.shape, BOUNDARY_WEIGHT_FLOOR, dtype=np.float32)
+    # Distance from each foreground pixel to nearest background pixel, and
+    # vice versa — combined gives distance to the boundary from both sides.
+    dist_out = distance_transform_edt(target_np == 0)   # dist from background into mask
+    dist_in  = distance_transform_edt(target_np == 1)    # dist from foreground out of mask
+    dist_to_boundary = np.where(target_np == 1, dist_in, dist_out)
+    weight = 1.0 - (dist_to_boundary / BOUNDARY_WIDTH_PX)
+    weight = np.clip(weight, BOUNDARY_WEIGHT_FLOOR, 1.0)
+    return weight.astype(np.float32)
+
+
+def boundary_weighted_bce(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Distance-weighted BCE across both channels (MSV, MLN). Weight maps are
+    computed per-image, per-channel on CPU (numpy/scipy) since this runs
+    once per batch, not per pixel — cheap relative to the forward/backward
+    pass at this batch size (SYMPTOM_BATCH_SIZE).
+    """
+    target_np = target.detach().cpu().numpy()  # [B, 2, H, W]
+    B, C, H, W = target_np.shape
+    weight_np = np.empty_like(target_np, dtype=np.float32)
+    for b in range(B):
+        for c in range(C):
+            weight_np[b, c] = _boundary_weight_map(target_np[b, c])
+    weight = torch.from_numpy(weight_np).to(logits.device)
+
+    bce_per_pixel = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    return (bce_per_pixel * weight).mean()
 
 
 def symptom_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -859,7 +922,10 @@ def symptom_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     SYMPTOM_FOCAL_GAMMA / SYMPTOM_FOCAL_POS_WEIGHT).
     """
     if EXPERIMENTAL_LOSS_MODE == "focal_tversky":
-        return focal_tversky_loss(logits, target)
+        loss = focal_tversky_loss(logits, target)
+        if BOUNDARY_LOSS_LAMBDA > 0:
+            loss = loss + BOUNDARY_LOSS_LAMBDA * boundary_weighted_bce(logits, target)
+        return loss
     if EXPERIMENTAL_LOSS_MODE == "msv_upweight":
         return dice_focal_loss(
             logits, target,
