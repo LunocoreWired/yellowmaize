@@ -688,9 +688,9 @@ class SymptomDataset(Dataset):
                 A.VerticalFlip(p=0.3),
                 A.RandomRotate90(p=0.3),
                 A.RandomBrightnessContrast(p=0.5),
-                A.HueSaturationValue(hue_shift_limit=8, sat_shift_limit=12,
-                                     val_shift_limit=8, p=0.5),
-                A.RandomGamma(gamma_limit=(90, 110), p=0.3),
+                A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30,
+                                     val_shift_limit=20, p=0.5),
+                A.RandomGamma(gamma_limit=(80, 120), p=0.3),
             ], additional_targets={"err": "image", "mask": "mask"})
         else:
             self.tf = A.Compose([
@@ -742,8 +742,8 @@ def _symptom_collate(batch):
 
 
 def focal_tversky_loss(logits: torch.Tensor, target: torch.Tensor,
-                       alpha_per_channel: tuple[float, float] = (0.45, 0.5),
-                       beta_per_channel: tuple[float, float] = (0.55, 0.5),
+                       alpha_per_channel: tuple[float, float] = (0.4, 0.5),
+                       beta_per_channel: tuple[float, float] = (0.6, 0.5),
                        gamma: float = 0.75, smooth: float = 1.0) -> torch.Tensor:
     """
     EXPERIMENTAL: Focal Tversky Loss (Abraham & Khan, ISBI 2019,
