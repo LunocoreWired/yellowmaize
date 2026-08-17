@@ -610,6 +610,11 @@ def _decode_coco_rle(seg: dict, height: int, width: int) -> np.ndarray | None:
 # PART 3 — SYMPTOM TEACHER MODEL + DATASET
 # ══════════════════════════════════════════════════════════════════════════════
 
+# EXPERIMENTAL: see SymptomTeacher.__init__ docstring below for rationale.
+# None = use config.py's SYMPTOM_ENCODER (efficientnet-b2) unchanged.
+EXPERIMENTAL_ENCODER_OVERRIDE = None   # scrapped — use config's efficientnet-b2
+
+
 class SymptomTeacher(nn.Module):
     """
     EfficientNet-B2 UNet adapted to 4-channel input (RGB + AE error map).
@@ -625,8 +630,21 @@ class SymptomTeacher(nn.Module):
     Same backbone family as train_teacher.py leaf-silhouette Teacher.
     """
 
-    def __init__(self, encoder_name: str = SYMPTOM_ENCODER):
+    def __init__(self, encoder_name: str = None):
         super().__init__()
+        # EXPERIMENTAL: encoder override, decoupled from config.py's
+        # SYMPTOM_ENCODER (which is derived from TEACHER_DEPLOYED_VARIANT —
+        # the main Teacher's deployed variant, unaffected by this override).
+        # mit_b2 has the highest raw Dice among tested Teacher variants
+        # (0.9701 vs efficientnet-b2's 0.9687) but ~3.5x slower CPU latency
+        # (1575.8ms vs 450.4ms/image). Acceptable to test here since Symptom
+        # Teacher runs offline in factory_master.py, not on-device — but
+        # note the Dice numbers are from the main Teacher's different task
+        # (leaf/disease segmentation from SAM2 masks), not a guaranteed
+        # predictor of MSV/MLN performance here. Set to None to fall back
+        # to config's SYMPTOM_ENCODER (efficientnet-b2) unchanged.
+        if encoder_name is None:
+            encoder_name = EXPERIMENTAL_ENCODER_OVERRIDE or SYMPTOM_ENCODER
         self.net = smp.Unet(
             encoder_name=encoder_name,
             encoder_weights="imagenet",
@@ -1020,7 +1038,7 @@ def train_symptom_teacher(ae_model: nn.Module, records: list[dict]) -> Path:
             epochs_no_improve = 0
             torch.save({"model_state": model.state_dict(),
                        "val_iou": val_iou,
-                       "encoder": SYMPTOM_ENCODER}, best_path)
+                       "encoder": (EXPERIMENTAL_ENCODER_OVERRIDE or SYMPTOM_ENCODER)}, best_path)
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= EXPERIMENTAL_EARLY_STOP_PATIENCE:
