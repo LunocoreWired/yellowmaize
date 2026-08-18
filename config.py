@@ -211,7 +211,7 @@ FACTORY_WEIGHT_BRACKETS = [
 FACTORY_R3_MIN_AREA_PX = 80
 
 # Morphological ops for silhouette refinement
-FACTORY_MORPH_KERNEL_SIZE = 5
+FACTORY_MORPH_KERNEL_SIZE = 3
 
 # HSV green exclusion zone (removes healthy leaf tissue from symptom masks)
 HSV_GREEN_EXCL = {"h_min": 38, "h_max": 85, "s_min": 80, "v_min": 60, "v_max": 230}
