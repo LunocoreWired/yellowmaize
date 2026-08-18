@@ -1649,6 +1649,24 @@ def process_single_image_cpu(args):
         # symptom area is below a noise floor (< 2 % of leaf area), treating
         # those as artefacts.  Genuine very-early symptoms (≥ 2 % leaf area)
         # are preserved so the student can learn from them.
+        #
+        # v10 FIX (HEALTHY ceiling): the three bands above were tuned around
+        # the old LAB/HSV pipeline's typical false-positive magnitude (a few
+        # percent of leaf area). The Symptom Teacher occasionally hallucinates
+        # far more dramatically on HEALTHY leaves — QA spot-checks
+        # (reports/validate_factory_mode_b.html) showed HEALTHY images with
+        # 99.7% and 11.5% predicted symptom coverage, both sailing straight
+        # through the old unbounded "≥ 4% → preserve at full strength" branch
+        # as if they were genuine early-stage disease. No real early-stage
+        # symptom on a HEALTHY-labeled leaf should approach anywhere near
+        # whole-leaf coverage, so a fourth band adds a hard ceiling: anything
+        # above HEALTHY_CEILING_FRAC is treated as a Symptom Teacher failure
+        # on that image, not signal, and is zeroed rather than preserved.
+        # This is a Factory-side guard, not a fix to the underlying Symptom
+        # Teacher HEALTHY-suppression weakness (see HEALTHY_act instability
+        # noted during training) — it stops corrupted pseudo-labels from
+        # reaching the Student while that deeper issue is addressed separately.
+        HEALTHY_CEILING_FRAC = 0.15  # tune based on re-run QA pass rate
         if category == "HEALTHY":
             leaf_px_for_check = float(sil.sum())
             if leaf_px_for_check > 0:
@@ -1674,7 +1692,16 @@ def process_single_image_cpu(args):
                             0,
                             255,
                         )
-                # ≥ 4 % → preserved at full strength (genuine early-stage signal)
+                elif sym_area_frac > HEALTHY_CEILING_FRAC:
+                    # v10: implausibly large coverage on a HEALTHY leaf —
+                    # Symptom Teacher hallucination, not genuine early-stage
+                    # signal. Zero completely rather than preserving.
+                    if mode == "mode_d":
+                        symptom = np.zeros_like(symptom, dtype=np.float32)
+                    else:
+                        symptom = np.zeros_like(symptom, dtype=np.uint8)
+                # 4 % – HEALTHY_CEILING_FRAC → preserved at full strength
+                # (genuine early-stage signal, plausible magnitude)
             else:
                 symptom = np.zeros_like(symptom)
 
