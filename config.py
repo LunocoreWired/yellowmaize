@@ -194,7 +194,7 @@ TEACHER_DEPLOYED_VARIANT = "efficientnet-b2"  # best by val Dice
 FACTORY_MODES = ["mode_a", "mode_b", "mode_c", "mode_d"]
 
 # Teacher inference threshold (lowered from 0.5 to catch dark leaves)
-FACTORY_SILHOUETTE_THRESHOLD = 0.25
+FACTORY_SILHOUETTE_THRESHOLD = 0.35
 
 # Coverage guard — below this, severity = -1 (excluded from training)
 FACTORY_MIN_LEAF_COVERAGE    = 0.15   # 15% minimum (was 25%, relaxed)
@@ -211,7 +211,7 @@ FACTORY_WEIGHT_BRACKETS = [
 FACTORY_R3_MIN_AREA_PX = 80
 
 # Morphological ops for silhouette refinement
-FACTORY_MORPH_KERNEL_SIZE = 3
+FACTORY_MORPH_KERNEL_SIZE = 5
 
 # HSV green exclusion zone (removes healthy leaf tissue from symptom masks)
 HSV_GREEN_EXCL = {"h_min": 38, "h_max": 85, "s_min": 80, "v_min": 60, "v_max": 230}

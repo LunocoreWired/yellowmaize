@@ -245,23 +245,23 @@ def _auto_flag(category: str, stats: dict, severity: float) -> tuple[str, str]:
 
     elif category == "MSV":
         if pct < 1.0:
-            return "🔴", f"UNDER-DETECTION ({pct:.1f}%). MSV streaks likely missed. Lower LAB_MSV_B_MIN, reduce GABOR_THRESHOLD, or shorten directional kernel (1,7)→(1,5)."
+            return "🔴", f"UNDER-DETECTION ({pct:.1f}%). MSV streaks likely missed. Visually confirm against raw image."
         elif pct < 5.0:
             return "⚠️", f"Low coverage ({pct:.1f}%). May be early-stage MSV or marginal detection. Visually confirm streaks present in raw image."
-        elif pct < 40.0:
+        elif pct < 65.0:
             return "✅", f"Reasonable MSV coverage ({pct:.1f}%). Verify streaks are vein-parallel, not solid fill."
         else:
-            return "🔴", f"OVER-DETECTION ({pct:.1f}%). Mask covering most of leaf — likely green-exclusion failure or threshold too loose. Check LAB_GREEN_A_MAX."
+            return "🔴", f"VERY HIGH coverage ({pct:.1f}%). Visually confirm this is genuinely a severe/advanced case before accepting — outside the typical range even for confirmed severe MSV leaves."
 
     elif category == "MLN":
         if pct < 2.0:
-            return "🔴", f"UNDER-DETECTION ({pct:.1f}%). MLN yellowing/necrosis likely missed. Lower LAB_MLN_B_MIN or dark_necrosis L*<110 ceiling."
+            return "🔴", f"UNDER-DETECTION ({pct:.1f}%). MLN yellowing/necrosis likely missed. Visually confirm against raw image."
         elif pct < 10.0:
             return "⚠️", f"Low-moderate coverage ({pct:.1f}%). May be early-stage MLN. Check for margin drying in raw image."
-        elif pct < 60.0:
+        elif pct < 85.0:
             return "✅", f"Reasonable MLN coverage ({pct:.1f}%). Confirm necrosis is margin-inward and necrotic patches captured."
         else:
-            return "🔴", f"OVER-DETECTION ({pct:.1f}%). Nearly whole leaf masked — possible green-exclusion failure or MLN thresholds too loose."
+            return "🔴", f"VERY HIGH coverage ({pct:.1f}%). Visually confirm this is genuinely a severe/advanced case before accepting — outside the typical range even for confirmed severe MLN leaves."
 
     return "❓", "Unknown category."
 
