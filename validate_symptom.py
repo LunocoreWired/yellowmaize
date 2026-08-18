@@ -7,33 +7,54 @@
    had no code behind them at all:
 
      Figure 4.16 — HealthyAE reconstruction and anomaly map
-     Figure 4.17 — Human symptom mask vs. predicted symptom mask
+     Figure 4.17 — Human symptom mask vs. Symptom Teacher predicted mask
      Figure 4.18 — Symptom Teacher vs. legacy LAB/HSV comparison
+     Figure 4.19 — Human symptom mask vs. STUDENT predicted mask, with
+                    classification (HEALTHY/MSV/MLN) and severity % agreement
      Table 4.13  — Symptom Teacher vs. legacy LAB, numeric IoU comparison
+     Table 4.14  — Human vs. Student: IoU, classification accuracy,
+                    severity % mean absolute error (all in the same CSV as
+                    Table 4.13 — see OUTPUTS below)
 
    This script does NOT reimplement inference logic. It reuses
    load_healthy_ae(), load_symptom_teacher(), predict_symptom_mask(),
    parse_symptom_annotations(), and compute_iou() directly from
    train_symptom_model.py, so behavior here always matches training exactly
-   — the only new code is the visualization layer on top.
+   — the only new code is the visualization/scoring layer on top. Student
+   loading and letterbox inference mirror validate_gold_standard.py's
+   load_student()/_predict_letterbox() exactly.
+
+   NOTE ON STUDENT SCOPE: the Student (train_student.py) predicts a single
+   combined symptom channel (not separate MSV/MLN masks like the Symptom
+   Teacher) plus a separate classification head (HEALTHY/MSV/MLN) and a
+   separate severity-% regression head. Figure 4.19/Table 4.14 therefore
+   validate three things simultaneously: symptom mask IoU (against whichever
+   human mask matches the image's true category), classification accuracy,
+   and severity % accuracy (human severity % computed as human symptom
+   pixels / human leaf pixels, via the same CVAT export's leaf polygons).
 
  PREREQUISITE:
    SYMPTOM_ANNOTATION_FILE (data/gold_standard/annotations/symptom_annotations.json)
    must already exist — export from CVAT as COCO 1.0 (see
    parse_symptom_annotations()'s docstring in train_symptom_model.py). No
    script can produce Figures 4.16-4.18 without this human annotation pass
-   having already happened.
+   having already happened. Figure 4.19/Table 4.14 additionally require a
+   trained Student checkpoint (STUDENT_CKPT_DIR) — if none is found, that
+   section is skipped with a warning rather than failing the whole run.
 
  OUTPUTS:
-   reports/symptom_vs_lab_comparison.csv            — Table 4.13
-   reports/symptom_overlays/{stem}_ae_anomaly.jpg     — Figure 4.16
-   reports/symptom_overlays/{stem}_human_vs_pred.jpg  — Figure 4.17
-   reports/symptom_overlays/{stem}_lab_vs_teacher.jpg — Figure 4.18
+   reports/symptom_vs_lab_comparison.csv               — Tables 4.13 + 4.14
+   reports/symptom_overlays/{stem}_ae_anomaly.jpg        — Figure 4.16
+   reports/symptom_overlays/{stem}_human_vs_pred.jpg     — Figure 4.17
+   reports/symptom_overlays/{stem}_lab_vs_teacher.jpg    — Figure 4.18
+   reports/symptom_overlays/{stem}_human_vs_student.jpg  — Figure 4.19
 
  USAGE:
-   python validate_symptom.py                # 5 qualitative samples/class + full numeric table
-   python validate_symptom.py --n 10          # more qualitative samples per class
-   python validate_symptom.py --skip-lab      # Figure 4.16/4.17 only, no LAB comparison
+   python validate_symptom.py                  # 5 qualitative samples/class + full numeric tables
+   python validate_symptom.py --n 10            # more qualitative samples per class
+   python validate_symptom.py --skip-lab        # no LAB comparison (Figure 4.18/Table 4.13 cols)
+   python validate_symptom.py --skip-student     # no Student comparison (Figure 4.19/Table 4.14 cols)
+   python validate_symptom.py --student-variant mobilenet_v3_small_cbam
 
  CONSUMED BY (once the outputs above exist):
    generate_charts.py --symptom  → symptom_vs_lab_bar.png (from the CSV above)
@@ -60,6 +81,11 @@ from config import (
     SEED,
     SYMPTOM_ANNOTATION_FILE,
     HEALTHY_AE_IMG_SIZE,
+    STUDENT_BEST_VARIANT,
+    STUDENT_CKPT_DIR,
+    STUDENT_FACTORY_MODE,
+    STUDENT_IMG_SIZE,
+    STUDENT_MAX_SEVERITY,
 )
 from image_utils import load_image_rgb
 from train_symptom_model import (
@@ -69,6 +95,7 @@ from train_symptom_model import (
     load_symptom_teacher,
     parse_symptom_annotations,
     predict_symptom_mask,
+    _build_mask,
 )
 
 OVERLAY_ALPHA = 0.40
@@ -184,6 +211,165 @@ def draw_human_vs_pred_panel(img_rgb, human_mask, pred_prob, iou, category, stem
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# STUDENT — HUMAN SYMPTOM VS STUDENT SYMPTOM (Figure 4.19, Table 4.14)
+# ══════════════════════════════════════════════════════════════════════════════
+# NOTE ON SCOPE: the Student (train_student.py) outputs a single combined
+# symptom channel (seg_logits Ch1) rather than separate MSV/MLN channels like
+# the Symptom Teacher — class identity comes from the classification head
+# (cls_out) and severity from a dedicated regression head (sev_out), not from
+# per-class masks. This section therefore validates three things the Symptom
+# Teacher comparison above does not: (1) symptom mask IoU using whichever
+# human mask (MSV or MLN) matches the image's true category, (2) HEALTHY/
+# MSV/MLN classification accuracy, (3) severity % regression accuracy against
+# a human-derived severity % (human symptom pixels / human leaf pixels).
+
+def load_student(encoder_variant: str = STUDENT_BEST_VARIANT):
+    """
+    Mirrors validate_gold_standard.py's load_student() exactly, so behavior
+    (checkpoint resolution, CBAM detection) matches that script.
+    """
+    try:
+        from train_student import StudentModel
+    except ImportError as e:
+        raise ImportError(f"Could not import StudentModel from train_student.py: {e}")
+
+    use_cbam = "cbam" in encoder_variant
+    model = StudentModel(encoder_name=encoder_variant, use_cbam=use_cbam)
+
+    mode = STUDENT_FACTORY_MODE
+    ckpt_path = STUDENT_CKPT_DIR / f"student_{encoder_variant}_{mode}_best.pth"
+    if not ckpt_path.exists():
+        ckpt_path = STUDENT_CKPT_DIR / f"student_{encoder_variant}_mode_b_best.pth"
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Student checkpoint not found for {encoder_variant}.")
+
+    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+    model.load_state_dict(ckpt["model_state"])
+    model.eval().to(DEVICE)
+    print(f"  Student loaded: {encoder_variant}  ({ckpt_path.name})")
+    return model
+
+
+def _load_leaf_masks(json_path: Path, records: list) -> dict:
+    """
+    Re-reads SYMPTOM_ANNOTATION_FILE (already parsed once by
+    parse_symptom_annotations for the msv/mln masks) to also rasterize the
+    'maize-leaf' polygons, so human severity % can be computed as
+    (human symptom pixels / human leaf pixels) — the same definition the
+    CIMMYT brackets in config.py use downstream. This is a second, cheap
+    pass over the same JSON rather than a change to
+    parse_symptom_annotations() itself, to avoid touching training code.
+
+    Returns {filename: leaf_mask (np.uint8 H×W)}, keyed by image filename —
+    only for images that also appear in `records` (avoids wasted rasterization).
+    """
+    from config import MAIZE_LEAF_LABEL_NAME
+    import json as _json
+    from collections import defaultdict
+
+    wanted_names = {r["img_path"].name for r in records}
+
+    with open(json_path, encoding="utf-8") as f:
+        data = _json.load(f)
+
+    id_to_image = {img["id"]: img for img in data.get("images", [])}
+    id_to_cat = {cat["id"]: cat["name"] for cat in data.get("categories", [])}
+    leaf_cat_ids = {cid for cid, name in id_to_cat.items()
+                    if name.lower() == MAIZE_LEAF_LABEL_NAME.lower()}
+
+    leaf_anns = defaultdict(list)
+    for ann in data.get("annotations", []):
+        if ann.get("category_id") in leaf_cat_ids:
+            leaf_anns[ann.get("image_id")].append(ann)
+
+    leaf_masks = {}
+    for img_id, img_info in id_to_image.items():
+        fname = Path(img_info["file_name"]).name
+        if fname not in wanted_names:
+            continue
+        h, w = img_info.get("height"), img_info.get("width")
+        if not h or not w:
+            continue
+        leaf_masks[fname] = _build_mask(leaf_anns.get(img_id, []), h, w)
+
+    return leaf_masks
+
+
+def _student_predict_full(model, img_rgb: np.ndarray, img_size: int = STUDENT_IMG_SIZE):
+    """
+    Single forward pass returning everything Table 4.14 needs:
+      symptom_prob : H×W float32, Ch1 (symptom) sigmoid probs, letterbox-reversed
+      cls_pred     : str, argmax over CLASSES
+      sev_pred_pct : float, severity 0-100 (sev_out is 0-1, scaled by
+                     STUDENT_MAX_SEVERITY same as inference elsewhere)
+
+    Letterbox handling matches validate_gold_standard.py's _predict_letterbox
+    exactly (LongestMaxSize + centered PadIfNeeded, ImageNet normalization)
+    so Student inputs here are preprocessed identically to training/other
+    validation — this is not a reimplementation with different behavior.
+    """
+    h_orig, w_orig = img_rgb.shape[:2]
+    scale = img_size / max(h_orig, w_orig)
+    new_h, new_w = int(h_orig * scale), int(w_orig * scale)
+    img_resized = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    pad_top = (img_size - new_h) // 2
+    pad_bottom = img_size - new_h - pad_top
+    pad_left = (img_size - new_w) // 2
+    pad_right = img_size - new_w - pad_left
+    img_padded = cv2.copyMakeBorder(
+        img_resized, pad_top, pad_bottom, pad_left, pad_right,
+        cv2.BORDER_CONSTANT, value=[0, 0, 0])
+
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
+    img_norm = (img_padded.astype(np.float32) / 255.0 - mean) / std
+    img_t = torch.from_numpy(img_norm).permute(2, 0, 1).unsqueeze(0).to(DEVICE)
+
+    with torch.no_grad():
+        seg_logits, cls_out, sev_out = model(img_t)
+
+    if seg_logits.shape[1] != 2:
+        raise RuntimeError(
+            f"Expected StudentModel seg_logits with 2 channels "
+            f"(Ch0=leaf, Ch1=symptom), got shape {tuple(seg_logits.shape)}. "
+            f"StudentModel's architecture may have changed since this "
+            f"validation code was written — check train_student.py's "
+            f"StudentModel.forward() before trusting these numbers."
+        )
+
+    symptom_prob = torch.sigmoid(seg_logits[:, 1]).squeeze().cpu().numpy()
+    y0, y1 = pad_top, pad_top + new_h
+    x0, x1 = pad_left, pad_left + new_w
+    symptom_prob = cv2.resize(symptom_prob[y0:y1, x0:x1], (w_orig, h_orig),
+                              interpolation=cv2.INTER_LINEAR)
+
+    cls_idx = int(cls_out.argmax(dim=1).item())
+    cls_pred = CLASSES[cls_idx] if cls_idx < len(CLASSES) else f"UNKNOWN_{cls_idx}"
+    sev_pred_pct = float(sev_out.item()) * STUDENT_MAX_SEVERITY
+
+    return symptom_prob, cls_pred, sev_pred_pct
+
+
+def draw_human_vs_student_panel(img_rgb, human_mask, student_prob, iou_student,
+                                cls_true, cls_pred, sev_human, sev_student,
+                                category, stem):
+    """
+    Figure 4.19. Same TP/FP/FN convention as draw_human_vs_pred_panel (Figure
+    4.17), plus a footer reporting classification and severity agreement,
+    since those are Student-only outputs with no Symptom Teacher equivalent.
+    """
+    panel = draw_human_vs_pred_panel(img_rgb, human_mask, student_prob,
+                                     iou_student, category, stem)
+    cls_ok = "OK" if cls_pred == cls_true else "MISMATCH"
+    text2 = (f"cls: true={cls_true} pred={cls_pred} [{cls_ok}]  |  "
+             f"severity: human={sev_human:.1f}%  student={sev_student:.1f}%")
+    cv2.putText(panel, text2, (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    cv2.putText(panel, text2, (8, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+    return panel
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # LAB VS SYMPTOM TEACHER (Figure 4.18)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -225,6 +411,10 @@ def main() -> None:
                         help="Qualitative overlay figures per class (default 5)")
     parser.add_argument("--skip-lab", action="store_true",
                         help="Skip Figure 4.18 and Table 4.13 (LAB comparison)")
+    parser.add_argument("--skip-student", action="store_true",
+                        help="Skip Figure 4.19 and Table 4.14 (Student comparison)")
+    parser.add_argument("--student-variant", type=str, default=STUDENT_BEST_VARIANT,
+                        help="Student encoder variant to load (default: STUDENT_BEST_VARIANT)")
     args = parser.parse_args()
 
     random.seed(SEED)
@@ -265,10 +455,20 @@ def main() -> None:
             print(f"  [WARN] Could not import factory_master ({e}) — "
                   "skipping LAB comparison (Figure 4.18 / Table 4.13).")
 
+    student_model = None
+    leaf_masks_for_severity = {}
+    if not args.skip_student:
+        try:
+            student_model = load_student(args.student_variant)
+            leaf_masks_for_severity = _load_leaf_masks(Path(SYMPTOM_ANNOTATION_FILE), records)
+        except (FileNotFoundError, ImportError) as e:
+            print(f"  [WARN] Could not load Student ({e}) — "
+                  "skipping Student comparison (Figure 4.19 / Table 4.14).")
+
     by_class = {c: [r for r in records if r["category"] == c] for c in CLASSES}
     comparison_rows = []
 
-    # ── Qualitative samples: Figures 4.16, 4.17, 4.18 ────────────────────────
+    # ── Qualitative samples: Figures 4.16, 4.17, 4.18, 4.19 ──────────────────
     recon_std_values = []
 
     for cls in CLASSES:
@@ -311,6 +511,9 @@ def main() -> None:
             cv2.imwrite(str(OVERLAY_DIR / f"{stem}_human_vs_pred.jpg"),
                        cv2.cvtColor(hp_panel, cv2.COLOR_RGB2BGR))
 
+            row = {"image": rec["img_path"].name, "category": cls,
+                  "iou_symptom_teacher": round(iou_teacher, 4)}
+
             if lab_import_ok:
                 gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
                 otsu_sil = (cv2.threshold(gray, 0, 255,
@@ -324,25 +527,46 @@ def main() -> None:
                     iou_lab, iou_teacher, cls, stem)
                 cv2.imwrite(str(OVERLAY_DIR / f"{stem}_lab_vs_teacher.jpg"),
                            cv2.cvtColor(lab_panel, cv2.COLOR_RGB2BGR))
+                row["iou_lab"] = round(iou_lab, 4)
 
-                comparison_rows.append({
-                    "image": rec["img_path"].name,
-                    "category": cls,
-                    "iou_lab": round(iou_lab, 4),
-                    "iou_symptom_teacher": round(iou_teacher, 4),
-                })
+            if student_model is not None:
+                leaf_mask = leaf_masks_for_severity.get(rec["img_path"].name)
+                sev_human = (100.0 * human_mask.sum() / max(leaf_mask.sum(), 1)
+                            if leaf_mask is not None else float("nan"))
+                student_prob, cls_pred, sev_student = _student_predict_full(
+                    student_model, img_rgb)
+                student_mask = (student_prob >= 0.5).astype(np.uint8)
+                iou_student = compute_iou(student_mask, human_mask)
 
-    # ── Table 4.13: numeric comparison over EVERY annotated image ────────────
+                stu_panel = draw_human_vs_student_panel(
+                    img_rgb, human_mask, student_prob, iou_student,
+                    cls, cls_pred, sev_human, sev_student, cls, stem)
+                cv2.imwrite(str(OVERLAY_DIR / f"{stem}_human_vs_student.jpg"),
+                           cv2.cvtColor(stu_panel, cv2.COLOR_RGB2BGR))
+
+                row["iou_student"]       = round(iou_student, 4)
+                row["cls_true"]          = cls
+                row["cls_pred"]          = cls_pred
+                row["cls_correct"]       = (cls_pred == cls)
+                row["severity_human"]    = round(sev_human, 2)
+                row["severity_student"]  = round(sev_student, 2)
+                row["severity_abs_error"] = round(abs(sev_student - sev_human), 2) \
+                                            if not np.isnan(sev_human) else float("nan")
+
+            if lab_import_ok or student_model is not None:
+                comparison_rows.append(row)
+
+    # ── Table 4.13/4.14: numeric comparison over EVERY annotated image ───────
     # The qualitative loop above is capped at --n per class for figure
-    # generation. Table 4.13 should reflect the full annotated set, not just
-    # the sampled subset, so score everything else here (numbers only, no
-    # image writes — avoids re-doing the ones already scored above).
-    if lab_import_ok:
+    # generation. The full tables should reflect the full annotated set, not
+    # just the sampled subset, so score everything else here (numbers only,
+    # no image writes — avoids re-doing the ones already scored above).
+    if lab_import_ok or student_model is not None:
         already_scored = {r["image"] for r in comparison_rows}
         remaining = [r for r in records
                     if r["category"] != "HEALTHY" and r["img_path"].name not in already_scored]
         print(f"\n  Scoring remaining {len(remaining)} annotated images "
-              f"for the full Table 4.13 comparison ...")
+              f"for the full Table 4.13/4.14 comparison ...")
 
         for rec in remaining:
             img_rgb = load_image_rgb(rec["img_path"])
@@ -354,20 +578,37 @@ def main() -> None:
                 human_mask = cv2.resize(human_mask, (img_rgb.shape[1], img_rgb.shape[0]),
                                         interpolation=cv2.INTER_NEAREST)
 
-            gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-            otsu_sil = (cv2.threshold(gray, 0, 255,
-                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1] > 0
-                       ).astype(np.uint8)
-            lab_mask = (compute_lab_hard_mask(img_rgb, otsu_sil, cls) > 0).astype(np.uint8)
             pred_prob = predict_symptom_mask(symptom_model, ae_model, img_rgb, category=cls)
             pred_mask = (pred_prob >= 0.5).astype(np.uint8)
+            row = {"image": rec["img_path"].name, "category": cls,
+                  "iou_symptom_teacher": round(compute_iou(pred_mask, human_mask), 4)}
 
-            comparison_rows.append({
-                "image": rec["img_path"].name,
-                "category": cls,
-                "iou_lab": round(compute_iou(lab_mask, human_mask), 4),
-                "iou_symptom_teacher": round(compute_iou(pred_mask, human_mask), 4),
-            })
+            if lab_import_ok:
+                gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+                otsu_sil = (cv2.threshold(gray, 0, 255,
+                                          cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1] > 0
+                           ).astype(np.uint8)
+                lab_mask = (compute_lab_hard_mask(img_rgb, otsu_sil, cls) > 0).astype(np.uint8)
+                row["iou_lab"] = round(compute_iou(lab_mask, human_mask), 4)
+
+            if student_model is not None:
+                leaf_mask = leaf_masks_for_severity.get(rec["img_path"].name)
+                sev_human = (100.0 * human_mask.sum() / max(leaf_mask.sum(), 1)
+                            if leaf_mask is not None else float("nan"))
+                student_prob, cls_pred, sev_student = _student_predict_full(
+                    student_model, img_rgb)
+                student_mask = (student_prob >= 0.5).astype(np.uint8)
+
+                row["iou_student"]       = round(compute_iou(student_mask, human_mask), 4)
+                row["cls_true"]          = cls
+                row["cls_pred"]          = cls_pred
+                row["cls_correct"]       = (cls_pred == cls)
+                row["severity_human"]    = round(sev_human, 2)
+                row["severity_student"]  = round(sev_student, 2)
+                row["severity_abs_error"] = round(abs(sev_student - sev_human), 2) \
+                                            if not np.isnan(sev_human) else float("nan")
+
+            comparison_rows.append(row)
 
         if comparison_rows:
             df = pd.DataFrame(comparison_rows)
@@ -376,16 +617,38 @@ def main() -> None:
             df.to_csv(out_path, index=False)
 
             print(f"\n{'─' * 72}")
-            print(f"  LAB vs Symptom Teacher comparison ({len(df)} images):")
-            print(f"    Mean IoU (LAB pipeline)    : {df['iou_lab'].mean():.4f}")
-            print(f"    Mean IoU (Symptom Teacher) : {df['iou_symptom_teacher'].mean():.4f}")
-            for cls in CLASSES:
-                cls_df = df[df["category"] == cls]
-                if cls_df.empty:
-                    continue
-                print(f"    [{cls}] LAB={cls_df['iou_lab'].mean():.3f}  "
-                      f"SymptomTeacher={cls_df['iou_symptom_teacher'].mean():.3f}  "
-                      f"(n={len(cls_df)})")
+            if lab_import_ok:
+                print(f"  LAB vs Symptom Teacher comparison ({len(df)} images):")
+                print(f"    Mean IoU (LAB pipeline)    : {df['iou_lab'].mean():.4f}")
+                print(f"    Mean IoU (Symptom Teacher) : {df['iou_symptom_teacher'].mean():.4f}")
+                for cls in CLASSES:
+                    cls_df = df[df["category"] == cls]
+                    if cls_df.empty:
+                        continue
+                    print(f"    [{cls}] LAB={cls_df['iou_lab'].mean():.3f}  "
+                          f"SymptomTeacher={cls_df['iou_symptom_teacher'].mean():.3f}  "
+                          f"(n={len(cls_df)})")
+
+            if student_model is not None:
+                print(f"\n  Human vs Student comparison ({len(df)} images):")
+                print(f"    Mean IoU (Student symptom mask) : {df['iou_student'].mean():.4f}")
+                print(f"    Classification accuracy         : "
+                      f"{100 * df['cls_correct'].mean():.1f}%  "
+                      f"({df['cls_correct'].sum()}/{len(df)})")
+                sev_valid = df.dropna(subset=["severity_abs_error"])
+                if not sev_valid.empty:
+                    print(f"    Severity MAE (percentage points) : "
+                          f"{sev_valid['severity_abs_error'].mean():.2f}")
+                for cls in CLASSES:
+                    if cls == "HEALTHY":
+                        continue
+                    cls_df = df[df["category"] == cls]
+                    if cls_df.empty:
+                        continue
+                    print(f"    [{cls}] IoU={cls_df['iou_student'].mean():.3f}  "
+                          f"cls_acc={100*cls_df['cls_correct'].mean():.1f}%  "
+                          f"(n={len(cls_df)})")
+
             print(f"  Saved: {out_path}")
         else:
             print("  [SKIP] No comparison data collected.")
@@ -406,10 +669,12 @@ def main() -> None:
                   f"train_healthy_ae() runs during training — see that "
                   f"function's docstring for the diagnosis and fix.")
     print(f"  Overlay figures saved to: {OVERLAY_DIR}")
-    print(f"    *_ae_anomaly.jpg       → Figure 4.16")
-    print(f"    *_human_vs_pred.jpg    → Figure 4.17")
+    print(f"    *_ae_anomaly.jpg        → Figure 4.16")
+    print(f"    *_human_vs_pred.jpg     → Figure 4.17")
     if lab_import_ok:
-        print(f"    *_lab_vs_teacher.jpg   → Figure 4.18")
+        print(f"    *_lab_vs_teacher.jpg    → Figure 4.18")
+    if student_model is not None:
+        print(f"    *_human_vs_student.jpg  → Figure 4.19")
     print("=" * 72)
 
 
