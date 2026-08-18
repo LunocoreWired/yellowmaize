@@ -194,7 +194,7 @@ TEACHER_DEPLOYED_VARIANT = "efficientnet-b2"  # best by val Dice
 FACTORY_MODES = ["mode_a", "mode_b", "mode_c", "mode_d"]
 
 # Teacher inference threshold (lowered from 0.5 to catch dark leaves)
-FACTORY_SILHOUETTE_THRESHOLD = 0.35
+FACTORY_SILHOUETTE_THRESHOLD = 0.25
 
 # Coverage guard — below this, severity = -1 (excluded from training)
 FACTORY_MIN_LEAF_COVERAGE    = 0.15   # 15% minimum (was 25%, relaxed)
