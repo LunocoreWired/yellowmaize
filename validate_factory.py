@@ -248,7 +248,7 @@ def _auto_flag(category: str, stats: dict, severity: float) -> tuple[str, str]:
             return "🔴", f"UNDER-DETECTION ({pct:.1f}%). MSV streaks likely missed. Visually confirm against raw image."
         elif pct < 5.0:
             return "⚠️", f"Low coverage ({pct:.1f}%). May be early-stage MSV or marginal detection. Visually confirm streaks present in raw image."
-        elif pct < 65.0:
+        elif pct < 80.0:
             return "✅", f"Reasonable MSV coverage ({pct:.1f}%). Verify streaks are vein-parallel, not solid fill."
         else:
             return "🔴", f"VERY HIGH coverage ({pct:.1f}%). Visually confirm this is genuinely a severe/advanced case before accepting — outside the typical range even for confirmed severe MSV leaves."
