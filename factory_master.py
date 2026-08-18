@@ -147,8 +147,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import albumentations as A
+import argparse
 import cv2
-import numpy as np
 import pandas as pd
 import segmentation_models_pytorch as smp
 import torch
@@ -1863,6 +1863,17 @@ def generate_factory_summary(report_rows):
 # MAIN ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sample", type=int, default=None,
+                        help="Process only N images total (random sample, "
+                             "stratified across categories where possible). "
+                             "For quick QA checks instead of a full 12h run.")
+    parser.add_argument("--sample-per-class", type=int, default=None,
+                        help="Process only N images per category (e.g. --sample-per-class 10 "
+                             "= ~30 images across HEALTHY/MSV/MLN). Takes priority over --sample "
+                             "if both are given.")
+    args = parser.parse_args()
+
     print(
         "=" * 72,
         "\n  Yellow MAIze | Phase 4: Factory Pseudo-Label Generation\n" + "=" * 72,
@@ -1880,6 +1891,24 @@ def main() -> None:
     tier1_fnames = set(
         Path(p).name for p in pd.read_csv(TIER1_MANIFEST)["source_path"].tolist()
     )
+
+    # QA sampling: process a small subset instead of the full run. Sampled
+    # from `trainval` (post train/val split, pre bouncer/teacher filtering),
+    # so actual output counts may be slightly lower than requested if some
+    # sampled images get filtered by the bouncer.
+    if args.sample_per_class is not None:
+        trainval = (
+            trainval.groupby("category", group_keys=False)
+            .apply(lambda g: g.sample(min(len(g), args.sample_per_class), random_state=42))
+            .reset_index(drop=True)
+        )
+        print(f"\n  [SAMPLE MODE] --sample-per-class {args.sample_per_class} — "
+              f"{len(trainval)} images total across categories.")
+    elif args.sample is not None:
+        trainval = trainval.sample(
+            min(len(trainval), args.sample), random_state=42
+        ).reset_index(drop=True)
+        print(f"\n  [SAMPLE MODE] --sample {args.sample} — {len(trainval)} images.")
 
     mode_dirs = {m.strip(): PSEUDO_DIR / m.strip() for m in FACTORY_MODES}
     for d in mode_dirs.values():
