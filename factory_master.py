@@ -149,6 +149,7 @@ from pathlib import Path
 import albumentations as A
 import argparse
 import cv2
+import numpy as np
 import pandas as pd
 import segmentation_models_pytorch as smp
 import torch
@@ -1897,13 +1898,32 @@ def main() -> None:
     # so actual output counts may be slightly lower than requested if some
     # sampled images get filtered by the bouncer.
     if args.sample_per_class is not None:
-        trainval = (
-            trainval.groupby("category", group_keys=False)
-            .apply(lambda g: g.sample(min(len(g), args.sample_per_class), random_state=42))
-            .reset_index(drop=True)
+        sampled_parts = []
+
+    for category, group in trainval.groupby("category", sort=False):
+        n = min(len(group), args.sample_per_class)
+        sampled_parts.append(
+            group.sample(n=n, random_state=42)
         )
-        print(f"\n  [SAMPLE MODE] --sample-per-class {args.sample_per_class} — "
-              f"{len(trainval)} images total across categories.")
+
+    trainval = (
+        pd.concat(sampled_parts, ignore_index=True)
+        if sampled_parts
+        else trainval.iloc[0:0].copy()
+    )
+
+    print(
+        f"\n  [SAMPLE MODE] --sample-per-class {args.sample_per_class} "
+        f"— {len(trainval)} images total across categories."
+    )
+
+    print(f"  Trainval columns: {trainval.columns.tolist()}")
+
+    if "category" not in trainval.columns:
+        raise RuntimeError(
+            "Internal error: 'category' disappeared from trainval. "
+            f"Columns: {trainval.columns.tolist()}"
+        )
     elif args.sample is not None:
         trainval = trainval.sample(
             min(len(trainval), args.sample), random_state=42
