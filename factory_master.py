@@ -219,6 +219,12 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 _SYMPTOM_MODEL = None
 _AE_MODEL      = None
 
+# TUNING: see the category-aware threshold comment in process_single_image_cpu.
+# First value to try (not yet swept) — try 0.60-0.75 if Factory QA still shows
+# over-broad MSV masks after this change, or back off toward 0.5 if MSV
+# coverage looks too sparse/broken.
+SYMPTOM_MSV_THRESHOLD = 0.60
+
 # Transforms
 TEACHER_INFER_TF = A.Compose(
     [
@@ -347,9 +353,17 @@ def load_symptom_models() -> tuple[object | None, object | None]:
 # ═══════════════════════════════════════════════════════════════════════════════
 class FactoryDataset(Dataset):
     def __init__(self, df, tier1_fnames, test_fnames):
-        # Exclude Tier 1 images that belong to the test split (Blueprint 10.1)
+        # Exclude Tier 1 images that belong to the test split (Blueprint 10.1).
+        # Must key by (category, filename), not bare filename — HEALTHY/MSV/
+        # MLN are separate folders with independently-numbered filenames, so
+        # bare-name membership would wrongly exclude (or fail to exclude)
+        # train/val images whose name happens to collide with a differently-
+        # categorized test image. See main()'s test_fnames construction.
         self.df = df[
-            ~df["source_path"].apply(lambda p: Path(p).name in test_fnames)
+            ~df.apply(
+                lambda r: (r["category"], Path(r["source_path"]).name) in test_fnames,
+                axis=1,
+            )
         ].reset_index(drop=True)
         self.tier1_fnames = tier1_fnames
 
@@ -360,6 +374,28 @@ class FactoryDataset(Dataset):
         row = self.df.iloc[idx]
         img_path = Path(row["source_path"])
         category = row["category"]
+        # Category-qualified stem — mirrors the {CLASS}_{original} naming
+        # already used for data/tier1_raw/ (sample_15000.py) and
+        # data/gold_standard/images/ (sample_gold_standard.py). Without
+        # this, HEALTHY/Image_1.jpg and MSV/Image_1.jpg (different physical
+        # images, same bare filename) both write to the same
+        # {stem}_symptom.png etc. in data/pseudo_masks/{mode}/, and
+        # whichever is processed later silently overwrites the other's
+        # output. This is the actual fix for the false HEALTHY-gate QA
+        # alarms — the manifest was never corrupted, the output key was
+        # just missing the category.
+        #
+        # BUGFIX: strip an existing leading category token before
+        # re-prefixing. Some source filenames are already category-prefixed
+        # (e.g. "HEALTHY_HEALTHY_12456", "MSV_MSV_2235", "MLN_MLN_1919" in
+        # the raw dataset) — blindly prepending category again doubled the
+        # prefix instead of normalizing to a single one.
+        bare_stem = img_path.stem
+        for _cat_token in ("HEALTHY", "MSV", "MLN"):
+            if bare_stem.upper().startswith(_cat_token + "_"):
+                bare_stem = bare_stem[len(_cat_token) + 1:]
+                break
+        output_stem = f"{category}_{bare_stem}"
         is_tier1 = img_path.name in self.tier1_fnames
 
         img_rgb = load_image_clahe(img_path)
@@ -376,12 +412,28 @@ class FactoryDataset(Dataset):
             npy_candidates = list(
                 TIER1_MASKS_DIR.glob(f"*{img_path.stem}*softmask.npy")
             )
+            if len(npy_candidates) > 1:
+                # Bare-stem glob can match more than one file if Tier 1
+                # happens to contain same-named images from different
+                # categories (see the TIER1_MANIFEST convention check in
+                # main()). Prefer a candidate whose name also contains this
+                # image's category to disambiguate; fall back to the first
+                # match (previous behavior) if that doesn't narrow it down.
+                cat_matches = [c for c in npy_candidates if category in c.name]
+                if len(cat_matches) == 1:
+                    npy_candidates = cat_matches
+                else:
+                    print(
+                        f"[WARN] Ambiguous Tier1 mask match for "
+                        f"{img_path.name} ({category}): "
+                        f"{[c.name for c in npy_candidates]} — using first."
+                    )
             if npy_candidates:
                 tier1_mask = np.load(str(npy_candidates[0])).astype(np.float32)
 
         return {
             "img_path": str(img_path),
-            "stem": img_path.stem,
+            "stem": output_stem,
             "category": category,
             "is_tier1": is_tier1,
             "orig_h": orig_h,
@@ -1623,12 +1675,37 @@ def process_single_image_cpu(args):
         # when FACTORY_SYMPTOM_COMPARE_LAB is True.
         if _SYMPTOM_MODEL is not None and _AE_MODEL is not None:
             from train_symptom_model import predict_symptom_mask
-            symptom_prob = predict_symptom_mask(_SYMPTOM_MODEL, _AE_MODEL, img_rgb)
+            # BUGFIX (handoff summary, integration bug): category was not
+            # being passed here, so every image silently used the default
+            # category="MSV" — MLN images read the wrong output channel
+            # (Ch0/MSV instead of Ch1/MLN), and HEALTHY images never hit
+            # the zero-map shortcut in predict_symptom_mask(). `category`
+            # is already in scope here (process_single_image_cpu's own
+            # parameter, used by compute_lab_hard_mask/compute_hsv_hard_mask
+            # above) — this just wires it through to the Symptom Teacher too.
+            symptom_prob = predict_symptom_mask(_SYMPTOM_MODEL, _AE_MODEL, img_rgb,
+                                                category=category)
             symptom_prob = symptom_prob * sil.astype(np.float32)  # restrict to leaf silhouette
+
+            # TUNING: category-aware binarization threshold for the Symptom
+            # Teacher's hard-mask modes (a/b/c). Previously a flat 0.5 for
+            # every category. MSV has a confirmed, diagnosed precision/recall
+            # imbalance at threshold=0.5 (precision ~0.67-0.70, recall
+            # ~0.86-0.90 — see check_precision_recall.py output and the
+            # scattered-FP visualization: the model over-predicts MSV,
+            # not merely blurring boundaries). Raising MSV's threshold trades
+            # some of that excess recall for real precision, directly
+            # targeting the diagnosed problem with zero retraining cost.
+            # MLN's precision/recall was already closer to balanced
+            # (~0.78-0.80 / ~0.84-0.87), so it keeps the original 0.5.
+            # SYMPTOM_MSV_THRESHOLD is a first value to try, not yet swept —
+            # if Factory QA still shows broad MSV masks, try 0.70-0.75 next;
+            # if MSV coverage looks too sparse/broken now, back off to 0.60.
+            symptom_threshold = SYMPTOM_MSV_THRESHOLD if category == "MSV" else 0.5
             symptom = (
                 symptom_prob
                 if mode == "mode_d"
-                else (symptom_prob >= 0.5).astype(np.uint8) * 255
+                else (symptom_prob >= symptom_threshold).astype(np.uint8) * 255
             )
         else:
             symptom = (
@@ -1888,10 +1965,82 @@ def main() -> None:
 
     global_df = pd.read_csv(GLOBAL_MANIFEST)
     trainval = global_df[global_df["split"] != "test"].reset_index(drop=True)
-    test_fnames = set(global_df[global_df["split"] == "test"]["filename"].tolist())
-    tier1_fnames = set(
-        Path(p).name for p in pd.read_csv(TIER1_MANIFEST)["source_path"].tolist()
+
+    # NOTE: `filename` is the bare basename (e.g. "Image_1.jpg") and is NOT
+    # a unique image identifier on its own — the dataset stores HEALTHY/
+    # MSV/MLN in separate folders (maize_dataset/{CLASS}/), each with its
+    # own independently-numbered filenames, so "Image_1.jpg" under HEALTHY
+    # and "Image_1.jpg" under MSV are two different physical images that
+    # coincidentally share a name. `(category, filename)` — or equivalently
+    # `source_path` — is the real unique key. Any check that compares by
+    # bare filename/stem alone is a latent collision bug; category must be
+    # part of the key everywhere below.
+    test_fnames = set(
+        zip(
+            global_df.loc[global_df["split"] == "test", "category"],
+            global_df.loc[global_df["split"] == "test", "filename"],
+        )
     )
+    tier1_df = pd.read_csv(TIER1_MANIFEST)
+    tier1_fnames = set(Path(p).name for p in tier1_df["source_path"].tolist())
+    # ^ NOTE: sample_15000.py copies Tier 1 images to data/tier1_raw/ with
+    # {CLASS}_{original}.jpg names specifically to avoid this exact
+    # collision (same convention as gold_standard/images/). If
+    # TIER1_MANIFEST's `source_path` points at those renamed tier1_raw
+    # files, tier1_fnames is already category-qualified and this set is
+    # safe as-is. If it instead points back at the original
+    # maize_dataset/{CLASS}/ paths, this needs the same (category, name)
+    # tuple treatment as test_fnames above — confirm which before trusting
+    # `is_tier1` downstream; see the print check below.
+    _tier1_sample = tier1_df["source_path"].iloc[0] if len(tier1_df) else ""
+    if _tier1_sample and Path(_tier1_sample).name.split("_")[0] not in ("HEALTHY", "MSV", "MLN"):
+        print(
+            f"[WARN] TIER1_MANIFEST source_path does not look like the "
+            f"{{CLASS}}_{{original}} tier1_raw convention (got: "
+            f"{_tier1_sample!r}). is_tier1 detection and the Tier1 SAM2 "
+            f"mask lookup by bare stem may be collision-prone — verify "
+            f"against sample_15000.py before trusting Tier1-flagged images."
+        )
+
+    # Genuine manifest corruption check: an identical (filename, category,
+    # source_path) row appearing more than once is a real duplicate (copy/
+    # paste bug), unlike the (filename, category) collisions across
+    # different category folders discussed above, which are legitimate.
+    exact_dupe_mask = trainval.duplicated(subset=["source_path"], keep=False)
+    if exact_dupe_mask.any():
+        print(
+            f"[WARN] {exact_dupe_mask.sum()} manifest row(s) share an "
+            f"identical source_path — dropping the extras."
+        )
+        trainval = trainval.drop_duplicates(subset=["source_path"]).reset_index(drop=True)
+
+    # Manifest hygiene guard: output_stem is f"{category}_{bare_stem}" (see
+    # FactoryDataset.__getitem__), so a stem appearing under two DIFFERENT
+    # categories is already safe (different output_stem, no collision) — the
+    # remaining real risk is two DIFFERENT source files that land on the same
+    # (category, bare_stem after prefix-stripping), which WOULD collide.
+    def _bare_stem(path_str):
+        s = Path(path_str).stem
+        for tok in ("HEALTHY", "MSV", "MLN"):
+            if s.upper().startswith(tok + "_"):
+                return s[len(tok) + 1:]
+        return s
+
+    check_df = trainval.copy()
+    check_df["_bare_stem"] = check_df["source_path"].map(_bare_stem)
+    same_output_stem = check_df.duplicated(subset=["category", "_bare_stem"], keep=False)
+    if same_output_stem.any():
+        offending = check_df.loc[same_output_stem, ["source_path", "category", "_bare_stem"]]
+        print("[FATAL] The following rows would collide on the same output "
+              "stem (same category + same bare filename, different source "
+              "file). This WILL cause silent output overwrite downstream:")
+        for (cat, stem), rows in offending.groupby(["category", "_bare_stem"]):
+            print(f"    {cat}_{stem}:")
+            for p in rows["source_path"]:
+                print(f"      {p}")
+        print("  Fix the manifest (rename or remove the duplicate) before "
+              "running the full Factory. Refusing to proceed.")
+        raise SystemExit(1)
 
     # QA sampling: process a small subset instead of the full run. Sampled
     # from `trainval` (post train/val split, pre bouncer/teacher filtering),
@@ -1899,23 +2048,22 @@ def main() -> None:
     # sampled images get filtered by the bouncer.
     if args.sample_per_class is not None:
         sampled_parts = []
+        for category, group in trainval.groupby("category", sort=False):
+            n = min(len(group), args.sample_per_class)
+            sampled_parts.append(
+                group.sample(n=n, random_state=42)
+            )
 
-    for category, group in trainval.groupby("category", sort=False):
-        n = min(len(group), args.sample_per_class)
-        sampled_parts.append(
-            group.sample(n=n, random_state=42)
+        trainval = (
+            pd.concat(sampled_parts, ignore_index=True)
+            if sampled_parts
+            else trainval.iloc[0:0].copy()
         )
 
-    trainval = (
-        pd.concat(sampled_parts, ignore_index=True)
-        if sampled_parts
-        else trainval.iloc[0:0].copy()
-    )
-
-    print(
-        f"\n  [SAMPLE MODE] --sample-per-class {args.sample_per_class} "
-        f"— {len(trainval)} images total across categories."
-    )
+        print(
+            f"\n  [SAMPLE MODE] --sample-per-class {args.sample_per_class} "
+            f"— {len(trainval)} images total across categories."
+        )
 
     print(f"  Trainval columns: {trainval.columns.tolist()}")
 
@@ -1987,7 +2135,7 @@ def main() -> None:
                 if idx not in passed_set:
                     report_rows.append(
                         {
-                            "filename": Path(batch["img_path"][idx]).stem,
+                            "filename": batch["stem"][idx],
                             "status": "filtered_bouncer",
                             "category": batch["category"][idx],
                         }

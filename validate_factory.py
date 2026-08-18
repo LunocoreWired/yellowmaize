@@ -270,6 +270,30 @@ def _auto_flag(category: str, stats: dict, severity: float) -> tuple[str, str]:
 # IMAGE DISCOVERY
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _output_stem(category: str, filename: str) -> str:
+    """
+    Must exactly mirror FactoryDataset.__getitem__'s `output_stem` in
+    factory_master.py. Pseudo-mask files on disk are keyed by this, not by
+    bare filename stem — HEALTHY/MSV/MLN live in separate folders with
+    independently-numbered filenames (e.g. HEALTHY/Image_1.jpg and
+    MSV/Image_1.jpg are different images), so bare-stem lookups collide.
+    If factory_master.py's naming ever changes, update this in lockstep.
+
+    BUGFIX (kept in sync with factory_master.py): strip an existing leading
+    category token before re-prefixing. Some source filenames are already
+    category-prefixed (e.g. "HEALTHY_HEALTHY_12456" in the raw dataset) —
+    blindly prepending category again doubled the prefix. Pseudo-masks
+    regenerated after this fix use the single-prefix form; this must match
+    or validation will look for files that don't exist.
+    """
+    bare_stem = Path(filename).stem
+    for cat_token in ("HEALTHY", "MSV", "MLN"):
+        if bare_stem.upper().startswith(cat_token + "_"):
+            bare_stem = bare_stem[len(cat_token) + 1:]
+            break
+    return f"{category}_{bare_stem}"
+
+
 def _discover_images(n_per_class: int, mode: str, single_img: str | None) -> list[dict]:
     """
     Returns a list of dicts: {stem, source_path, category}
@@ -298,8 +322,8 @@ def _discover_images(n_per_class: int, mode: str, single_img: str | None) -> lis
             # Only keep images that have pseudo masks
             mode_dir = PSEUDO_DIR / mode
             cls_df = cls_df[cls_df["filename"].apply(
-                lambda f: (mode_dir / f"{Path(f).stem}_symptom.png").exists() or
-                           (mode_dir / f"{Path(f).stem}_symptom.npy").exists()
+                lambda f: (mode_dir / f"{_output_stem(cls, f)}_symptom.png").exists() or
+                           (mode_dir / f"{_output_stem(cls, f)}_symptom.npy").exists()
             )]
             n = min(n_per_class, len(cls_df))
             if n == 0:
@@ -308,7 +332,7 @@ def _discover_images(n_per_class: int, mode: str, single_img: str | None) -> lis
             sampled = cls_df.sample(n=n, random_state=42)
             for _, row in sampled.iterrows():
                 entries.append({
-                    "stem": Path(row["filename"]).stem,
+                    "stem": _output_stem(cls, row["filename"]),
                     "source_path": row.get("source_path", row.get("filename", "")),
                     "category": cls,
                 })
@@ -871,7 +895,8 @@ def _discover_borderline_images(mode: str, margin: float = 5.0) -> list[dict]:
     mode_dir = PSEUDO_DIR / mode
 
     for _, row in df.iterrows():
-        stem = Path(row.get("filename", row.get("source_path", ""))).stem
+        category = row.get("category", "UNKNOWN")
+        stem = _output_stem(category, row.get("filename", row.get("source_path", "")))
         sev_path = mode_dir / f"{stem}_sev.txt"
         if not sev_path.exists():
             continue
@@ -886,7 +911,7 @@ def _discover_borderline_images(mode: str, margin: float = 5.0) -> list[dict]:
             entries.append({
                 "stem":        stem,
                 "source_path": row.get("source_path", ""),
-                "category":    row.get("category", "UNKNOWN"),
+                "category":    category,
             })
 
     # Limit to max 30 per class to keep report manageable

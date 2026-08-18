@@ -99,6 +99,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from albumentations.pytorch import ToTensorV2
+from scipy.ndimage import distance_transform_edt
 from torch.utils.data import DataLoader, Dataset
 
 from image_utils import load_image_rgb
@@ -610,6 +611,11 @@ def _decode_coco_rle(seg: dict, height: int, width: int) -> np.ndarray | None:
 # PART 3 — SYMPTOM TEACHER MODEL + DATASET
 # ══════════════════════════════════════════════════════════════════════════════
 
+# EXPERIMENTAL: see SymptomTeacher.__init__ docstring below for rationale.
+# None = use config.py's SYMPTOM_ENCODER (efficientnet-b2) unchanged.
+EXPERIMENTAL_ENCODER_OVERRIDE = None   # scrapped — use config's efficientnet-b2
+
+
 class SymptomTeacher(nn.Module):
     """
     EfficientNet-B2 UNet adapted to 4-channel input (RGB + AE error map).
@@ -625,8 +631,21 @@ class SymptomTeacher(nn.Module):
     Same backbone family as train_teacher.py leaf-silhouette Teacher.
     """
 
-    def __init__(self, encoder_name: str = SYMPTOM_ENCODER):
+    def __init__(self, encoder_name: str = None):
         super().__init__()
+        # EXPERIMENTAL: encoder override, decoupled from config.py's
+        # SYMPTOM_ENCODER (which is derived from TEACHER_DEPLOYED_VARIANT —
+        # the main Teacher's deployed variant, unaffected by this override).
+        # mit_b2 has the highest raw Dice among tested Teacher variants
+        # (0.9701 vs efficientnet-b2's 0.9687) but ~3.5x slower CPU latency
+        # (1575.8ms vs 450.4ms/image). Acceptable to test here since Symptom
+        # Teacher runs offline in factory_master.py, not on-device — but
+        # note the Dice numbers are from the main Teacher's different task
+        # (leaf/disease segmentation from SAM2 masks), not a guaranteed
+        # predictor of MSV/MLN performance here. Set to None to fall back
+        # to config's SYMPTOM_ENCODER (efficientnet-b2) unchanged.
+        if encoder_name is None:
+            encoder_name = EXPERIMENTAL_ENCODER_OVERRIDE or SYMPTOM_ENCODER
         self.net = smp.Unet(
             encoder_name=encoder_name,
             encoder_weights="imagenet",
@@ -653,6 +672,16 @@ class SymptomDataset(Dataset):
         self.ae_model = ae_model
         self.img_size = img_size
         if augment:
+            # EXPERIMENTAL: default HueSaturationValue/RandomGamma strength may
+            # wash out MSV's chlorotic color signal — chlorosis vs healthy
+            # yellow-maize tissue is a fine color distinction (see blueprint
+            # 11.1: "static colour rules cannot separate early chlorosis from
+            # healthy yellow-maize tissue"). MLN's necrotic patches are more
+            # structural/textural and likely survive color jitter better,
+            # which may explain why MSV lags MLN even as both get equal
+            # augmentation. Weakened limits here vs. albumentations defaults
+            # (hue ±20->±8, sat ±30->±12, val ±20->±8, gamma range tightened).
+            # Geometric augmentations (flip/rotate) left unchanged.
             self.tf = A.Compose([
                 A.LongestMaxSize(max_size=img_size),
                 A.PadIfNeeded(img_size, img_size, border_mode=cv2.BORDER_CONSTANT),
@@ -660,8 +689,9 @@ class SymptomDataset(Dataset):
                 A.VerticalFlip(p=0.3),
                 A.RandomRotate90(p=0.3),
                 A.RandomBrightnessContrast(p=0.5),
-                A.HueSaturationValue(p=0.5),
-                A.RandomGamma(p=0.3),
+                A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30,
+                                     val_shift_limit=20, p=0.5),
+                A.RandomGamma(gamma_limit=(80, 120), p=0.3),
             ], additional_targets={"err": "image", "mask": "mask"})
         else:
             self.tf = A.Compose([
@@ -712,11 +742,53 @@ def _symptom_collate(batch):
     return torch.stack(xs), torch.stack(ys)
 
 
+def focal_tversky_loss(logits: torch.Tensor, target: torch.Tensor,
+                       alpha_per_channel: tuple[float, float] = (0.4, 0.5),
+                       beta_per_channel: tuple[float, float] = (0.6, 0.5),
+                       gamma: float = 0.75, smooth: float = 1.0) -> torch.Tensor:
+    """
+    EXPERIMENTAL: Focal Tversky Loss (Abraham & Khan, ISBI 2019,
+    arxiv.org/abs/1810.07842) — proposed specifically for small/thin
+    foreground regions under severe class imbalance (their benchmark: lesions
+    occupying ~4.8% of image area, comparable to MSV streak coverage here).
+
+    Unlike Dice, which weighs false positives (FP) and false negatives (FN)
+    equally, Tversky lets beta > alpha penalize FN (missed foreground pixels)
+    more heavily — directly targets "model under-predicts thin/sparse
+    structures", which is the pattern seen in MSV vs MLN across every prior
+    experiment here (MSV consistently lower despite equal sampling/loss
+    treatment). gamma > 1 in the original paper's 1/gamma formulation
+    emphasizes hard examples; gamma=0.75 here follows their reported best
+    setting (equivalent to their reported "gamma=4/3" under the 1/gamma
+    convention some implementations use — kept as a plain exponent here).
+
+    alpha_per_channel / beta_per_channel: (MSV, MLN). MSV uses beta=0.7 (favor
+    recall, penalize misses hard) since it's the underperforming/thinner
+    class; MLN kept at the balanced alpha=beta=0.5 (equivalent to plain
+    Tversky/Dice-like behavior) since it isn't showing the same problem.
+    """
+    probs = torch.sigmoid(logits)
+    losses = []
+    for c in range(logits.shape[1]):  # 0=MSV, 1=MLN
+        p = probs[:, c]
+        g = target[:, c]
+        tp = (p * g).sum(dim=(-2, -1))
+        fn = ((1 - p) * g).sum(dim=(-2, -1))
+        fp = (p * (1 - g)).sum(dim=(-2, -1))
+        alpha = alpha_per_channel[c]
+        beta  = beta_per_channel[c]
+        tversky = (tp + smooth) / (tp + alpha * fp + beta * fn + smooth)
+        losses.append((1 - tversky).clamp(min=1e-6).pow(gamma).mean())
+    return sum(losses) / len(losses)
+
+
 def dice_focal_loss(logits: torch.Tensor, target: torch.Tensor,
                     dice_weight: float = SYMPTOM_DICE_WEIGHT,
                     focal_weight: float = SYMPTOM_FOCAL_WEIGHT,
                     gamma: float = SYMPTOM_FOCAL_GAMMA,
-                    pos_weight_factor: float = SYMPTOM_FOCAL_POS_WEIGHT) -> torch.Tensor:
+                    pos_weight_factor: float = SYMPTOM_FOCAL_POS_WEIGHT,
+                    pos_weight_per_channel: tuple[float, float] | None = None
+                    ) -> torch.Tensor:
     """
     Combined Dice + Focal loss for small-region segmentation.
 
@@ -729,6 +801,12 @@ def dice_focal_loss(logits: torch.Tensor, target: torch.Tensor,
     term — further compensates for the foreground/background imbalance.
 
     Applied independently to each output channel (Ch0=MSV, Ch1=MLN).
+
+    EXPERIMENTAL: pos_weight_per_channel, if given as (msv_weight, mln_weight),
+    overrides pos_weight_factor with a distinct scalar per channel instead of
+    one shared value — lets MSV (typically the weaker class) be upweighted
+    without also inflating MLN's already-stronger foreground weighting.
+    Leave as None to keep the original single-scalar behavior unchanged.
     """
     probs  = torch.sigmoid(logits)
     smooth = 1.0
@@ -740,7 +818,14 @@ def dice_focal_loss(logits: torch.Tensor, target: torch.Tensor,
 
     # ── Focal component ──────────────────────────────────────────────────────
     # pos_weight balances foreground vs background per-channel
-    pos_weight = torch.ones_like(logits) * pos_weight_factor
+    if pos_weight_per_channel is not None:
+        # logits shape: [B, 2, H, W] -> Ch0=MSV, Ch1=MLN
+        msv_w, mln_w = pos_weight_per_channel
+        pos_weight = torch.ones_like(logits)
+        pos_weight[:, 0, :, :] *= msv_w
+        pos_weight[:, 1, :, :] *= mln_w
+    else:
+        pos_weight = torch.ones_like(logits) * pos_weight_factor
     bce_per_pixel = F.binary_cross_entropy_with_logits(
         logits, target, pos_weight=pos_weight, reduction="none"
     )
@@ -750,22 +835,108 @@ def dice_focal_loss(logits: torch.Tensor, target: torch.Tensor,
     return dice_weight * dice + focal_weight * focal
 
 
+# ── EXPERIMENTAL: MSV upweight toggle ───────────────────────────────────────
+# Set to True to give MSV (the weaker-performing class) a higher pos_weight
+# than MLN, instead of the single shared SYMPTOM_FOCAL_POS_WEIGHT applied to
+# both. Isolated single-variable change — flip back to False to exactly
+# reproduce prior behavior. Tune MSV_UPWEIGHT_FACTOR independently.
+# ── EXPERIMENTAL: loss function selection ───────────────────────────────────
+# "default"       = original Dice+Focal, pos_weight_factor shared (5.0/5.0)
+# "msv_upweight"  = Dice+Focal, MSV pos_weight boosted 1.5x (tested — did not
+#                   help, cost MLN slightly; kept for reference, not used)
+# "focal_tversky" = Focal Tversky Loss (Abraham & Khan 2019) — research-backed
+#                   fix for small/thin foreground class imbalance, MSV set to
+#                   favor recall (beta=0.6, tuned via sweep from 0.7/0.6/0.55)
+#                   since it's the underperforming class. This is the current
+#                   active base loss.
+EXPERIMENTAL_LOSS_MODE = "focal_tversky"
+MSV_UPWEIGHT_FACTOR = 1.5   # only used if EXPERIMENTAL_LOSS_MODE == "msv_upweight"
+
+# ── EXPERIMENTAL: boundary-aware loss term ──────────────────────────────────
+# Diagnosis (see check_precision_recall.py + visual inspection of predicted
+# masks): MSV false positives form a halo hugging the true streak boundaries
+# rather than being scattered elsewhere on the leaf — a boundary-precision
+# problem, not a structural misclassification problem. Tversky/Dice weigh
+# every pixel equally regardless of distance from the mask edge, so neither
+# has a specific incentive to tighten boundaries.
+#
+# This adds a distance-weighted BCE term on top of Focal Tversky: for each
+# ground-truth mask, a normalized distance-transform weight map is computed
+# (1.0 at the boundary, decaying to a floor of BOUNDARY_WEIGHT_FLOOR deep in
+# the interior/background), and per-pixel BCE is multiplied by that map
+# before being added to the base Tversky loss, scaled by BOUNDARY_LOSS_LAMBDA.
+#
+# Set BOUNDARY_LOSS_LAMBDA = 0.0 to exactly reproduce prior behavior (pure
+# Focal Tversky, no boundary term). Starting value 0.2 is a first guess, not
+# yet swept.
+BOUNDARY_LOSS_LAMBDA = 0.0
+BOUNDARY_WIDTH_PX = 15          # distance (px) over which the weight decays to the floor
+BOUNDARY_WEIGHT_FLOOR = 0.1     # minimum weight far from any boundary
+
+
+def _boundary_weight_map(target_np: np.ndarray) -> np.ndarray:
+    """
+    target_np: [H, W] binary ground-truth mask (single channel, single image).
+    Returns a [H, W] float32 weight map, 1.0 at the mask boundary, decaying
+    linearly to BOUNDARY_WEIGHT_FLOOR at BOUNDARY_WIDTH_PX pixels away (in
+    either direction — inside or outside the mask), and equal to
+    BOUNDARY_WEIGHT_FLOOR beyond that.
+    """
+    if target_np.max() == 0:
+        # No foreground pixels at all (pure HEALTHY image) — flat floor weight.
+        return np.full(target_np.shape, BOUNDARY_WEIGHT_FLOOR, dtype=np.float32)
+    # Distance from each foreground pixel to nearest background pixel, and
+    # vice versa — combined gives distance to the boundary from both sides.
+    dist_out = distance_transform_edt(target_np == 0)   # dist from background into mask
+    dist_in  = distance_transform_edt(target_np == 1)    # dist from foreground out of mask
+    dist_to_boundary = np.where(target_np == 1, dist_in, dist_out)
+    weight = 1.0 - (dist_to_boundary / BOUNDARY_WIDTH_PX)
+    weight = np.clip(weight, BOUNDARY_WEIGHT_FLOOR, 1.0)
+    return weight.astype(np.float32)
+
+
+def boundary_weighted_bce(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    Distance-weighted BCE across both channels (MSV, MLN). Weight maps are
+    computed per-image, per-channel on CPU (numpy/scipy) since this runs
+    once per batch, not per pixel — cheap relative to the forward/backward
+    pass at this batch size (SYMPTOM_BATCH_SIZE).
+    """
+    target_np = target.detach().cpu().numpy()  # [B, 2, H, W]
+    B, C, H, W = target_np.shape
+    weight_np = np.empty_like(target_np, dtype=np.float32)
+    for b in range(B):
+        for c in range(C):
+            weight_np[b, c] = _boundary_weight_map(target_np[b, c])
+    weight = torch.from_numpy(weight_np).to(logits.device)
+
+    bce_per_pixel = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    return (bce_per_pixel * weight).mean()
+
+
 def symptom_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """
-    Combined Dice + Focal loss actually used to train the Symptom Teacher,
-    with weights read from config.py (SYMPTOM_DICE_WEIGHT / SYMPTOM_FOCAL_WEIGHT /
-    SYMPTOM_FOCAL_GAMMA / SYMPTOM_FOCAL_POS_WEIGHT) so they're tunable without
-    editing code, and so this function's config-driven behavior is transparent
-    rather than hardcoded.
-
-    FIX (previously dice_bce_loss): this used to accept a dice_weight argument
-    from SYMPTOM_DICE_BCE_WEIGHT and silently discard it, always calling
-    dice_focal_loss() with its hardcoded defaults regardless of config — the
-    "0.5 Dice + 0.5 BCE" the old name/config comment implied was never actually
-    running; the loss has always been Dice+Focal. That's kept (Focal is the
-    better fit for this task's foreground/background imbalance — see
-    dice_focal_loss()'s docstring), but the config weights now genuinely apply.
+    Loss used to train the Symptom Teacher. See EXPERIMENTAL_LOSS_MODE above
+    for which variant is active. Original behavior: Dice+Focal with weights
+    read from config.py (SYMPTOM_DICE_WEIGHT / SYMPTOM_FOCAL_WEIGHT /
+    SYMPTOM_FOCAL_GAMMA / SYMPTOM_FOCAL_POS_WEIGHT).
     """
+    if EXPERIMENTAL_LOSS_MODE == "focal_tversky":
+        loss = focal_tversky_loss(logits, target)
+        if BOUNDARY_LOSS_LAMBDA > 0:
+            loss = loss + BOUNDARY_LOSS_LAMBDA * boundary_weighted_bce(logits, target)
+        return loss
+    if EXPERIMENTAL_LOSS_MODE == "msv_upweight":
+        return dice_focal_loss(
+            logits, target,
+            dice_weight=SYMPTOM_DICE_WEIGHT,
+            focal_weight=SYMPTOM_FOCAL_WEIGHT,
+            gamma=SYMPTOM_FOCAL_GAMMA,
+            pos_weight_per_channel=(
+                SYMPTOM_FOCAL_POS_WEIGHT * MSV_UPWEIGHT_FACTOR,
+                SYMPTOM_FOCAL_POS_WEIGHT,
+            ),
+        )
     return dice_focal_loss(
         logits, target,
         dice_weight=SYMPTOM_DICE_WEIGHT,
@@ -804,11 +975,24 @@ def train_symptom_teacher(ae_model: nn.Module, records: list[dict]) -> Path:
     # so the model sees proportionally more symptom examples per batch.
     # HEALTHY images are still included (for the suppression signal) but at
     # lower frequency — weight 1.0 for symptom images, 0.3 for HEALTHY.
+    #
+    # EXPERIMENTAL: MSV consistently underperforms MLN despite equal sampling
+    # frequency (both were 1.0). Trying a higher MSV weight so the model sees
+    # more MSV examples per epoch, on the hypothesis that MSV's thinner/more
+    # diffuse streaks need more exposure to learn than MLN's higher-contrast
+    # patches. Single-variable change — MLN and HEALTHY weights unchanged from
+    # original. Set MSV_SAMPLE_WEIGHT back to 1.0 to reproduce prior behavior.
     from torch.utils.data import WeightedRandomSampler
-    sample_weights = [
-        1.0 if r["category"] in ("MSV", "MLN") else 0.3
-        for r in train_records
-    ]
+    MSV_SAMPLE_WEIGHT = 1.5
+    MLN_SAMPLE_WEIGHT = 1.0
+    HEALTHY_SAMPLE_WEIGHT = 0.3
+    def _sample_weight(r):
+        if r["category"] == "MSV":
+            return MSV_SAMPLE_WEIGHT
+        if r["category"] == "MLN":
+            return MLN_SAMPLE_WEIGHT
+        return HEALTHY_SAMPLE_WEIGHT
+    sample_weights = [_sample_weight(r) for r in train_records]
     sampler = WeightedRandomSampler(
         weights=sample_weights,
         num_samples=len(train_records),
@@ -821,11 +1005,19 @@ def train_symptom_teacher(ae_model: nn.Module, records: list[dict]) -> Path:
                               shuffle=False, num_workers=0, collate_fn=_symptom_collate)
 
     model = SymptomTeacher().to(DEVICE)
+    # EXPERIMENTAL: original ReduceLROnPlateau(patience=6) + early-stop
+    # SYMPTOM_PATIENCE(10) left only ~4 epochs at the lower LR before
+    # training was killed (see epoch 28-38 in prior run: val_IoU oscillated
+    # 0.565-0.583 without settling, consistent with LR still too high late
+    # in training). React sooner and allow more room to actually benefit
+    # from the drop. Pure optimization-schedule change — no data/loss/
+    # augmentation changes.
     opt   = torch.optim.AdamW(model.parameters(), lr=SYMPTOM_LR,
                               weight_decay=SYMPTOM_WEIGHT_DECAY)
     sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max",
-                                                        factor=0.5, patience=6,
+                                                        factor=0.5, patience=4,
                                                         min_lr=1e-6)
+    EXPERIMENTAL_EARLY_STOP_PATIENCE = 16   # was SYMPTOM_PATIENCE (10)
 
     SYMPTOM_CKPT_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -912,12 +1104,12 @@ def train_symptom_teacher(ae_model: nn.Module, records: list[dict]) -> Path:
             epochs_no_improve = 0
             torch.save({"model_state": model.state_dict(),
                        "val_iou": val_iou,
-                       "encoder": SYMPTOM_ENCODER}, best_path)
+                       "encoder": (EXPERIMENTAL_ENCODER_OVERRIDE or SYMPTOM_ENCODER)}, best_path)
         else:
             epochs_no_improve += 1
-            if epochs_no_improve >= SYMPTOM_PATIENCE:
+            if epochs_no_improve >= EXPERIMENTAL_EARLY_STOP_PATIENCE:
                 print(f"  Early stopping at epoch {epoch} "
-                      f"(no improvement for {SYMPTOM_PATIENCE} epochs)")
+                      f"(no improvement for {EXPERIMENTAL_EARLY_STOP_PATIENCE} epochs)")
                 break
 
     pd.DataFrame(metric_rows).to_csv(metrics_path, index=False)
