@@ -65,9 +65,17 @@ def build_gold_sample_list(mode: str) -> list[dict]:
     which uses the same gold-standard set for the same reason.
 
     Gold-standard filenames are "{CATEGORY}_{original_name}" (per
-    validate_student.py); the pseudo-mask files on disk are keyed by
-    {original_name} only, so the category prefix is stripped before
-    looking up mask/severity/weight files in PSEUDO_DIR/mode.
+    validate_student.py). Pseudo-mask files on disk are ALSO category-
+    qualified — factory_master.py's FactoryDataset.__getitem__ builds
+    output_stem as f"{category}_{bare_stem}" (with any pre-existing leading
+    category token stripped first, to avoid double-prefixing) — confirmed
+    directly from factory_master.py and mirrored by validate_factory.py's
+    _output_stem() helper. This function previously assumed pseudo-mask
+    files were keyed by bare stem only and stripped the category prefix
+    before lookup — that mismatch is why 472 gold-standard images were
+    silently skipped ("no matching pseudo-mask/severity files"): the lookup
+    was searching for a filename that was never written. Fixed to use the
+    same category-qualified stem convention as the rest of the pipeline.
     """
     mode_dir = PSEUDO_DIR / mode
     samples  = []
@@ -79,16 +87,27 @@ def build_gold_sample_list(mode: str) -> list[dict]:
 
         raw_stem = img_path.stem
         category = None
-        original_stem = raw_stem
+        bare_stem = raw_stem
         for cls in CLASSES:
             prefix = cls + "_"
             if raw_stem.startswith(prefix):
                 category = cls
-                original_stem = raw_stem[len(prefix):]
+                bare_stem = raw_stem[len(prefix):]
                 break
         if category is None:
             n_skipped += 1
             continue  # filename doesn't match the expected {CLASS}_ prefix
+
+        # BUGFIX: re-apply the category prefix (matching factory_master.py's
+        # output_stem convention) instead of leaving it stripped. Also strip
+        # a SECOND leading category token if present, in case bare_stem
+        # itself still starts with a class prefix (source filename was
+        # already double-prefixed) — mirrors factory_master.py's own guard.
+        for cls in CLASSES:
+            if bare_stem.startswith(cls + "_"):
+                bare_stem = bare_stem[len(cls) + 1:]
+                break
+        original_stem = f"{category}_{bare_stem}"
 
         # Mirrors build_sample_list's exclusion logic exactly.
         sev_path = mode_dir / f"{original_stem}_sev.txt"
@@ -270,12 +289,40 @@ class GradCAMWrapper:
 # VISUALIZATION HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def unletterbox_resize(map_sq: np.ndarray,
+                        orig_h: int,
+                        orig_w: int,
+                        img_size: int = STUDENT_IMG_SIZE) -> np.ndarray:
+    """
+    Map a model-space array (predictions live in the padded square space
+    produced by make_student_transforms()'s LongestMaxSize + PadIfNeeded
+    letterbox — see train_student.py) back onto the original, non-square
+    image. Crops out the letterbox padding before resizing, so predictions
+    aren't stretched across pixels that were only ever black padding.
+    Without this, any non-square photo (i.e. nearly all field crops) gets
+    its symptom/CAM map smeared into artificial horizontal or vertical
+    bands.
+    """
+    if map_sq.shape[:2] != (img_size, img_size):
+        map_sq = cv2.resize(map_sq, (img_size, img_size),
+                             interpolation=cv2.INTER_LINEAR)
+
+    scale    = img_size / max(orig_h, orig_w)
+    new_h    = max(1, round(orig_h * scale))
+    new_w    = max(1, round(orig_w * scale))
+    pad_top  = (img_size - new_h) // 2
+    pad_left = (img_size - new_w) // 2
+
+    cropped = map_sq[pad_top:pad_top + new_h, pad_left:pad_left + new_w]
+    return cv2.resize(cropped, (orig_w, orig_h), interpolation=cv2.INTER_LINEAR)
+
+
 def heatmap_overlay(img_rgb: np.ndarray,
                     heatmap: np.ndarray,
                     alpha: float = OVERLAY_ALPHA) -> np.ndarray:
     """Overlay a [0,1] heatmap as amber colormap on an RGB image."""
     h, w     = img_rgb.shape[:2]
-    heatmap  = cv2.resize(heatmap, (w, h), interpolation=cv2.INTER_LINEAR)
+    heatmap  = unletterbox_resize(heatmap, h, w)
     heatmap8 = (heatmap * 255).astype(np.uint8)
     colored  = cv2.applyColorMap(heatmap8, cv2.COLORMAP_JET)
     colored  = cv2.cvtColor(colored, cv2.COLOR_BGR2RGB)
@@ -292,7 +339,7 @@ def seg_boundary_overlay(img_rgb: np.ndarray,
     """
     h, w    = img_rgb.shape[:2]
     prob    = torch.sigmoid(seg_logits[0, channel]).cpu().numpy()
-    prob    = cv2.resize(prob, (w, h), interpolation=cv2.INTER_LINEAR)
+    prob    = unletterbox_resize(prob, h, w)
     binary  = (prob >= 0.5).astype(np.uint8)
 
     overlay   = img_rgb.copy()
@@ -326,7 +373,7 @@ def side_by_side(img_rgb: np.ndarray,
     cv2.putText(panel, "Symptom boundary",      (w+18, 18), font, scale, (0, 255, 0), 1)
     cv2.putText(panel, f"Diagnostic attn ({method})",
                 (2*w+28, 18), font, scale, (255, 200, 0), 1)
-    cv2.putText(panel, f"{category} → pred:{pred_class}",
+    cv2.putText(panel, f"{category} -> pred:{pred_class}",
                 (8, h - 8), font, scale, (200, 200, 200), 1)
     return panel
 
@@ -527,6 +574,7 @@ def main() -> None:
 
     # ── XAI evaluation loop ───────────────────────────────────────────────────
     quant_rows = []
+    best_method = None   # set below if auto-selection runs; used in final summary
 
     for sample_idx in selected_indices:
         sample   = test_samples[sample_idx]
@@ -569,11 +617,20 @@ def main() -> None:
         leaf_mask  = (leaf_prob >= 0.5)
 
         # Segmentation boundary overlay (same for all XAI methods)
-        seg_ov = seg_boundary_overlay(img_rgb, seg_logits, channel=0)
+        # Ch1 = symptom mask (Ch0 is the leaf silhouette) — the app's
+        # "Symptom boundary" output must trace the disease region, not
+        # the whole leaf outline. See YELLOWMAIZE_BLUEPRINT.md §15.3.
+        seg_ov = seg_boundary_overlay(img_rgb, seg_logits, channel=1)
 
         # Per-method XAI
         for method, cam in cam_wrappers.items():
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            _cam_t0 = _time.time()
             heatmap = cam(inp_t, true_cls)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            cam_latency_ms = (_time.time() - _cam_t0) * 1000.0
 
             # Leaf-constrained GradCAM++ severity (within leaf mask only)
             if heatmap is not None and leaf_mask.sum() > 0:
@@ -601,7 +658,16 @@ def main() -> None:
                             cv2.cvtColor(panel, cv2.COLOR_RGB2BGR))
 
             # Quantitative metrics
-            seg_mask_np = (seg_tgt[0].numpy() >= 0.5).astype(np.uint8)
+            # Ch1 = symptom mask — pointing game must check whether the
+            # heatmap's hottest pixels fall on the disease region, not
+            # merely anywhere on the leaf (Ch0), which is a near-trivial
+            # target. NOTE: HEALTHY samples have an empty symptom mask,
+            # so pointing_game_accuracy() will now trivially return ~0.0
+            # for that class (nothing to "point" at) rather than the old
+            # inflated ~1.0 — this is expected and correct; the metric is
+            # only meaningful for MSV/MLN, which is also what the
+            # auto-selection criterion (msv_pg) already keys off.
+            seg_mask_np = (seg_tgt[1].numpy() >= 0.5).astype(np.uint8)
             pg_acc = pointing_game_accuracy(heatmap, seg_mask_np)
 
             ins_auc, del_auc = insertion_deletion_auc(
@@ -617,6 +683,7 @@ def main() -> None:
                 "pointing_game_acc": round(pg_acc, 4) if not np.isnan(pg_acc) else "nan",
                 "insertion_auc":     round(ins_auc, 4) if not np.isnan(ins_auc) else "nan",
                 "deletion_auc":      round(del_auc, 4) if not np.isnan(del_auc) else "nan",
+                "latency_ms":        round(cam_latency_ms, 1),
             })
 
         print(f"  [{category}] {stem[:40]:<40} "
@@ -633,8 +700,8 @@ def main() -> None:
         # ── Per-method overall summary ────────────────────────────────────
         print(f"\n{'─' * 72}")
         print("  XAI quantitative summary (mean across all samples):")
-        print(f"  {'Method':<20} {'Pointing Game':>14} {'Ins AUC':>8} {'Del AUC':>8}")
-        print(f"  {'─'*20} {'─'*14} {'─'*8} {'─'*8}")
+        print(f"  {'Method':<20} {'Pointing Game':>14} {'Ins AUC':>8} {'Del AUC':>8} {'Latency(ms)':>12}")
+        print(f"  {'─'*20} {'─'*14} {'─'*8} {'─'*8} {'─'*12}")
 
         df = pd.DataFrame(quant_rows)
         method_scores = {}
@@ -643,12 +710,14 @@ def main() -> None:
             pg  = pd.to_numeric(mdf["pointing_game_acc"], errors="coerce")
             ins = pd.to_numeric(mdf["insertion_auc"],     errors="coerce")
             dl  = pd.to_numeric(mdf["deletion_auc"],      errors="coerce")
+            lat = pd.to_numeric(mdf["latency_ms"],        errors="coerce")
             print(f"  {method:<20} {pg.mean():>14.4f} "
-                  f"{ins.mean():>8.4f} {dl.mean():>8.4f}")
+                  f"{ins.mean():>8.4f} {dl.mean():>8.4f} {lat.mean():>12.1f}")
             method_scores[method] = {
                 "pg_mean":  pg.mean(),
                 "ins_mean": ins.mean(),
                 "del_mean": dl.mean(),
+                "lat_mean": lat.mean(),
                 # MSV-specific pointing game (thesis primary focus)
                 "msv_pg": pd.to_numeric(
                     mdf[mdf["category"] == "MSV"]["pointing_game_acc"],
@@ -673,43 +742,101 @@ def main() -> None:
                 print(f"    {cls:<12} {pg:>14.4f} {ins:>8.4f} {dl:>8.4f} {acc:>8.1f}%")
 
         # ── Auto-select best XAI method ───────────────────────────────────────
-        # Selection criterion: highest MSV pointing game accuracy (primary thesis focus).
-        # Tiebreaker: insertion AUC (measures faithfulness of top activations).
+        # Selection criterion: weighted composite of accuracy (MSV pointing
+        # game — primary thesis focus) and speed (latency), not accuracy
+        # alone. Justification: this deployment serves XAI from a server
+        # (e.g. Google Cloud Run free tier), not on-device — free-tier
+        # instances are CPU-only, so a method requiring many forward passes
+        # per image (ScoreCAM) costs meaningfully more wall-clock time per
+        # user request than a single-pass method (GradCAM/GradCAM++), and
+        # that cost is paid live, once per uploaded photo, not amortized
+        # across a batch. Accuracy still dominates the score (0.7 weight)
+        # since the explanation's diagnostic value is the primary purpose;
+        # speed (0.3 weight) breaks ties and discourages picking a much
+        # slower method for a marginal accuracy gain.
+        #
+        # Adjust these two weights directly if the deployment target or
+        # its constraints change (e.g. move to on-device → raise
+        # XAI_SPEED_WEIGHT; move to a GPU-backed server → lower it).
+        XAI_ACCURACY_WEIGHT = 0.7
+        XAI_SPEED_WEIGHT    = 0.3
+
         valid_methods = {m: s for m, s in method_scores.items()
-                         if not np.isnan(s["msv_pg"])}
+                         if not np.isnan(s["msv_pg"]) and not np.isnan(s["lat_mean"])}
         if valid_methods:
-            best_method = max(
-                valid_methods,
-                key=lambda m: (valid_methods[m]["msv_pg"],
-                               valid_methods[m]["ins_mean"])
-            )
-            best_pg  = valid_methods[best_method]["msv_pg"]
-            best_ins = valid_methods[best_method]["ins_mean"]
+            # Speed normalized within the compared set: fastest method → 1.0,
+            # slowest → 0.0. Min-max normalization keeps the score relative
+            # to the actual methods being compared rather than an assumed
+            # absolute latency budget.
+            lats     = [s["lat_mean"] for s in valid_methods.values()]
+            lat_min, lat_max = min(lats), max(lats)
+            lat_span = (lat_max - lat_min) or 1.0  # avoid /0 if all equal
+
+            for m, s in valid_methods.items():
+                s["speed_score"] = 1.0 - (s["lat_mean"] - lat_min) / lat_span
+                s["composite"]   = (XAI_ACCURACY_WEIGHT * s["msv_pg"]
+                                     + XAI_SPEED_WEIGHT * s["speed_score"])
+
+            best_method = max(valid_methods, key=lambda m: valid_methods[m]["composite"])
+            best_pg      = valid_methods[best_method]["msv_pg"]
+            best_ins     = valid_methods[best_method]["ins_mean"]
+            best_lat     = valid_methods[best_method]["lat_mean"]
+            best_speed   = valid_methods[best_method]["speed_score"]
+            best_comp    = valid_methods[best_method]["composite"]
 
             print(f"\n{'─' * 72}")
-            print(f"  XAI AUTO-SELECTION:")
-            print(f"    Best method : {best_method}")
+            print(f"  XAI AUTO-SELECTION (weighted accuracy + speed):")
+            print(f"    {'Method':<20} {'MSV PG':>8} {'Speed*':>8} {'Composite':>10} {'Latency(ms)':>12}")
+            print(f"    {'─'*20} {'─'*8} {'─'*8} {'─'*10} {'─'*12}")
+            for m, s in sorted(valid_methods.items(), key=lambda kv: -kv[1]["composite"]):
+                marker = " <-- selected" if m == best_method else ""
+                print(f"    {m:<20} {s['msv_pg']:>8.4f} {s['speed_score']:>8.4f} "
+                      f"{s['composite']:>10.4f} {s['lat_mean']:>12.1f}{marker}")
+            print(f"    *Speed score: min-max normalized latency within this")
+            print(f"     comparison set (fastest=1.0, slowest=0.0), not an")
+            print(f"     absolute latency budget.")
+            print(f"\n    Best method : {best_method}")
             print(f"    MSV pointing game : {best_pg:.4f}")
             print(f"    Insertion AUC     : {best_ins:.4f}")
-            print(f"    Criterion: highest MSV pointing game accuracy")
-            print(f"    Tiebreaker: insertion AUC")
+            print(f"    Mean latency      : {best_lat:.1f} ms/image")
+            print(f"    Composite score   : {best_comp:.4f}  "
+                  f"(= {XAI_ACCURACY_WEIGHT}*MSV_PG + {XAI_SPEED_WEIGHT}*speed_score)")
+            print(f"    Criterion: weighted composite "
+                  f"({XAI_ACCURACY_WEIGHT} accuracy / {XAI_SPEED_WEIGHT} speed)")
+            print(f"    Rationale: server-side deployment (e.g. Cloud Run free")
+            print(f"    tier, CPU-only), XAI computed live per uploaded photo —")
+            print(f"    see comment above XAI_ACCURACY_WEIGHT for full context.")
 
             # Write best method to selection log
             selection_path = LOGS_DIR / "xai_method_selection.csv"
             import csv as _csv
             with open(selection_path, "w", newline="", encoding="utf-8") as f_sel:
                 _w = _csv.DictWriter(f_sel, fieldnames=[
-                    "selected_method","msv_pg","ins_auc","del_auc",
-                    "gradcam_pg","gradcamplusplus_pg","scorecam_pg"])
+                    "selected_method","msv_pg","ins_auc","del_auc","latency_ms",
+                    "speed_score","composite_score","accuracy_weight","speed_weight",
+                    "gradcam_pg","gradcamplusplus_pg","scorecam_pg",
+                    "gradcam_latency_ms","gradcamplusplus_latency_ms","scorecam_latency_ms",
+                    "gradcam_composite","gradcamplusplus_composite","scorecam_composite"])
                 _w.writeheader()
                 _w.writerow({
                     "selected_method":   best_method,
                     "msv_pg":            round(best_pg, 4),
                     "ins_auc":           round(best_ins, 4),
                     "del_auc":           round(valid_methods[best_method]["del_mean"], 4),
+                    "latency_ms":        round(best_lat, 1),
+                    "speed_score":       round(best_speed, 4),
+                    "composite_score":   round(best_comp, 4),
+                    "accuracy_weight":   XAI_ACCURACY_WEIGHT,
+                    "speed_weight":      XAI_SPEED_WEIGHT,
                     "gradcam_pg":        round(valid_methods.get("gradcam",        {}).get("msv_pg", float("nan")), 4),
                     "gradcamplusplus_pg":round(valid_methods.get("gradcamplusplus",{}).get("msv_pg", float("nan")), 4),
                     "scorecam_pg":       round(valid_methods.get("scorecam",       {}).get("msv_pg", float("nan")), 4),
+                    "gradcam_latency_ms":         round(valid_methods.get("gradcam",        {}).get("lat_mean", float("nan")), 1),
+                    "gradcamplusplus_latency_ms": round(valid_methods.get("gradcamplusplus",{}).get("lat_mean", float("nan")), 1),
+                    "scorecam_latency_ms":        round(valid_methods.get("scorecam",       {}).get("lat_mean", float("nan")), 1),
+                    "gradcam_composite":          round(valid_methods.get("gradcam",        {}).get("composite", float("nan")), 4),
+                    "gradcamplusplus_composite":  round(valid_methods.get("gradcamplusplus",{}).get("composite", float("nan")), 4),
+                    "scorecam_composite":         round(valid_methods.get("scorecam",       {}).get("composite", float("nan")), 4),
                 })
             print(f"    Selection log: {selection_path}")
 
@@ -734,12 +861,18 @@ def main() -> None:
         print(f"\n  Comparison saved : {comp_path}")
         print(f"  Overlays saved   : {XAI_OUTPUT_DIR}")
 
+    # `best_method` reflects what auto-selection just wrote to config.py;
+    # the module-level `XAI_DEPLOYED_METHOD` was captured at import time,
+    # before that write happened, and is stale by this point in the run.
+    # Fall back to it only if auto-selection never ran (e.g. no valid
+    # methods / quant_rows was empty).
+    deployed_method = best_method if best_method is not None else XAI_DEPLOYED_METHOD
     print(f"\n  Note: In the Android app, two distinct outputs are shown:")
     print(f"    (1) Green contour overlay  — UNet segmentation head")
     print(f"        'Symptom boundary' — pixel-level localization")
-    print(f"    (2) Amber heatmap overlay  — {XAI_DEPLOYED_METHOD} on encoder")
+    print(f"    (2) Amber heatmap overlay  — {deployed_method} on encoder")
     print(f"        'Diagnostic attention' — explainability / justification")
-    print(f"    Deployed XAI method: {XAI_DEPLOYED_METHOD} (auto-selected or config default)")
+    print(f"    Deployed XAI method: {deployed_method} (auto-selected or config default)")
 
     print(f"\n  NEXT STEP: python evaluate_severity.py")
     print("=" * 72)

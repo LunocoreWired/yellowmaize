@@ -112,6 +112,7 @@ from config import (
     SYMPTOM_PATIENCE, SYMPTOM_ENCODER,
     SYMPTOM_DICE_WEIGHT, SYMPTOM_FOCAL_WEIGHT,
     SYMPTOM_FOCAL_GAMMA, SYMPTOM_FOCAL_POS_WEIGHT,
+    HEALTHY_ACT_PENALTY_WEIGHT,
     SYMPTOM_IOU_TARGET_MEAN,
     HEALTHY_AE_IMG_SIZE, HEALTHY_AE_LATENT_DIM, HEALTHY_AE_BATCH_SIZE,
     HEALTHY_AE_EPOCHS, HEALTHY_AE_LR, HEALTHY_AE_VAL_SPLIT, HEALTHY_AE_PATIENCE,
@@ -867,9 +868,22 @@ MSV_UPWEIGHT_FACTOR = 1.5   # only used if EXPERIMENTAL_LOSS_MODE == "msv_upweig
 # before being added to the base Tversky loss, scaled by BOUNDARY_LOSS_LAMBDA.
 #
 # Set BOUNDARY_LOSS_LAMBDA = 0.0 to exactly reproduce prior behavior (pure
-# Focal Tversky, no boundary term). Starting value 0.2 is a first guess, not
-# yet swept.
-BOUNDARY_LOSS_LAMBDA = 0.0
+# Focal Tversky, no boundary term).
+#
+# FIX (see evaluate_xai.py HEALTHY false-positive investigation): pure
+# Focal Tversky has no dense per-pixel term at all, so on a fully-empty
+# (HEALTHY) mask its only signal is the aggregate FP ratio in the Tversky
+# fraction, which saturates quickly and under-penalizes small/sparse
+# false-positive blobs — confirmed by symptom_teacher_metrics.csv, where
+# HEALTHY_act fluctuates as high as 0.37 during training and the
+# best-val_iou checkpoint (epoch 25, HEALTHY_act=0.048) was not even the
+# best available tradeoff (epoch 39: nearly equal val_iou, 5.8x lower
+# HEALTHY_act). _boundary_weight_map() already returns a flat
+# BOUNDARY_WEIGHT_FLOOR-everywhere map for all-zero masks, so enabling
+# this term gives real, non-saturating dense BCE pressure on HEALTHY
+# images specifically. Turned on at the value the original comment above
+# already flagged as the first-guess starting point.
+BOUNDARY_LOSS_LAMBDA = 0.2
 BOUNDARY_WIDTH_PX = 15          # distance (px) over which the weight decays to the floor
 BOUNDARY_WEIGHT_FLOOR = 0.1     # minimum weight far from any boundary
 
@@ -1025,6 +1039,7 @@ def train_symptom_teacher(ae_model: nn.Module, records: list[dict]) -> Path:
     metrics_path = LOGS_DIR / "symptom_teacher_metrics.csv"
 
     best_val_iou = -1.0
+    best_composite_score = float("-inf")
     epochs_no_improve = 0
     metric_rows = []
 
@@ -1099,11 +1114,19 @@ def train_symptom_teacher(ae_model: nn.Module, records: list[dict]) -> Path:
             "healthy_act": round(healthy_act, 5),
         })
 
-        if val_iou > best_val_iou:
+        # Composite score folds in HEALTHY_act (false-positive suppression),
+        # which val_iou alone never reflects — see HEALTHY_ACT_PENALTY_WEIGHT
+        # in config.py for why and the epoch-25-vs-39 evidence.
+        composite_score = val_iou - HEALTHY_ACT_PENALTY_WEIGHT * healthy_act
+
+        if composite_score > best_composite_score:
             best_val_iou = val_iou
+            best_composite_score = composite_score
             epochs_no_improve = 0
             torch.save({"model_state": model.state_dict(),
                        "val_iou": val_iou,
+                       "healthy_act": healthy_act,
+                       "composite_score": composite_score,
                        "encoder": (EXPERIMENTAL_ENCODER_OVERRIDE or SYMPTOM_ENCODER)}, best_path)
         else:
             epochs_no_improve += 1

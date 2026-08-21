@@ -478,6 +478,35 @@ class StudentDataset(Dataset):
         }
 
 
+class DiceBCELoss(nn.Module):
+    """
+    FIX (see evaluate_xai.py HEALTHY false-positive investigation): pure
+    DiceLoss gives a near-saturated, uninformative gradient on fully-empty
+    (all-zero) ground-truth masks — exactly the case for every HEALTHY
+    image's symptom channel (Ch1). A small false-positive blob and a large
+    one get almost the same loss once foreground pixel count exceeds the
+    smoothing epsilon, so the network is never strongly pushed to suppress
+    hallucinated activation on clean leaves. Adding a plain per-pixel BCE
+    term restores dense, non-saturating supervision on every pixel
+    (including fully-negative masks), matching the fix already applied to
+    the Symptom Teacher's loss (see BOUNDARY_LOSS_LAMBDA in
+    train_symptom_model.py). bce_weight is deliberately modest so this
+    doesn't undo Dice's usual benefit on the genuinely small/thin lesion
+    regions in MSV/MLN images — only tune down dice_weight if BCE starts
+    dominating.
+    """
+    def __init__(self, dice_weight: float = 0.7, bce_weight: float = 0.3):
+        super().__init__()
+        self.dice = smp.losses.DiceLoss(mode="binary", from_logits=True)
+        self.bce  = nn.BCEWithLogitsLoss()
+        self.dice_weight = dice_weight
+        self.bce_weight  = bce_weight
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        return (self.dice_weight * self.dice(logits, target)
+                + self.bce_weight * self.bce(logits, target))
+
+
 def make_student_transforms(img_size: int, is_train: bool):
     if is_train:
         return A.Compose([
@@ -1220,7 +1249,7 @@ def train_one(encoder_variant: str, factory_mode: str, stage: int = 1) -> dict:
     # ── Model + losses ────────────────────────────────────────────────────────
     model = StudentModel(encoder_variant, use_cbam=use_cbam).to(DEVICE)
 
-    seg_criterion = smp.losses.DiceLoss(mode="binary", from_logits=True)
+    seg_criterion = DiceBCELoss()
     cls_criterion = AsymmetricLabelSmoothingLoss(ASYMMETRIC_PRIOR).to(DEVICE)
     # sev_criterion removed — MSE computed inline with F.mse_loss in
     # train_one_epoch/validate; nn.MSELoss() was instantiated but never called.

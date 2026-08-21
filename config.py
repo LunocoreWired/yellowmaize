@@ -530,6 +530,16 @@ SYMPTOM_DICE_WEIGHT       = 0.6           # Dice component weight
 SYMPTOM_FOCAL_WEIGHT      = 0.4           # Focal component weight
 SYMPTOM_FOCAL_GAMMA       = 2.0           # focal focusing parameter (Lin et al. 2017)
 SYMPTOM_FOCAL_POS_WEIGHT  = 5.0           # foreground (symptom) pixel upweighting
+
+# FIX (see evaluate_xai.py HEALTHY false-positive investigation): checkpoint
+# selection previously used val_iou alone, even though val_iou is computed
+# only from MSV/MLN images and never reflects HEALTHY_act (the false-positive
+# suppression check). Composite score = val_iou - HEALTHY_ACT_PENALTY_WEIGHT *
+# healthy_act. Weight of 1.0 puts real lesion IoU and healthy-suppression on
+# equal footing; confirmed against symptom_teacher_metrics.csv this correctly
+# prefers epoch 39 (val_iou=0.602, healthy_act=0.008) over epoch 25
+# (val_iou=0.610, healthy_act=0.048), the checkpoint that was actually saved.
+HEALTHY_ACT_PENALTY_WEIGHT = 1.0
 SYMPTOM_IOU_TARGET_MEAN   = 0.70         # lower bar than leaf silhouette — symptom
                                           # boundaries are inherently fuzzier than
                                           # leaf outlines, even for human annotators
