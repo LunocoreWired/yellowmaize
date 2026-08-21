@@ -187,7 +187,7 @@ yellowmaize/                                   ← Project root (WSL2 working di
 ├── validate_masks.py             ← Step 6
 ├── validate_gold_standard.py     ← Steps 6c / 6d / 10b
 ├── train_teacher.py              ← Step 7
-├── train_symptom_model.py        ← Step 7b
+├── train_symptom_model.py        ← Step 7b (active/production Symptom Teacher script)
 ├── factory_master.py             ← Step 8
 ├── validate_factory.py           ← Step 8b (optional)
 ├── train_student.py              ← Steps 9 + 10
@@ -201,12 +201,19 @@ yellowmaize/                                   ← Project root (WSL2 working di
 ├── build_deployment_package.py   ← Step 15
 ├── generate_report.py            ← Step 16
 │
+├── diagnose_manifest.py               ← Ad hoc: audits global_split_manifest.csv row/category duplication
+├── check_precision_recall.py          ← Ad hoc: per-class (MSV/MLN) precision/recall/FP-rate on Symptom Teacher
+├── visualize_msv_fp.py                ← Ad hoc: worst-IoU MSV overlay panels (boundary fuzz vs. real FP)
+├── train_symptom_model_experiment.py  ← Frozen pre-boundary-loss reference copy (see note below)
+│
 ├── global_split_manifest.csv     ← AUTO: partition_dataset.py
 ├── tier1_manifest.csv            ← AUTO: sample_15000.py
 └── tier1_qa_report.csv           ← AUTO: generate_tier1_masks.py
 ```
 
 > **`sample_yolo_annotations.py` is deprecated and unused.** Do not run it. `YOLO_IMAGES_DIR`, `YOLO_ANNOTATIONS_DIR`, and `YOLO_ANNOTATION_FILE` in `config.py` all point to `data/gold_standard/` paths. `train_yolo_detector.py` derives bounding boxes from the `annotations.json` produced by `sample_gold_standard.py` — no separate YOLO annotation step.
+
+> **`train_symptom_model_experiment.py` is a frozen snapshot of `train_symptom_model.py`** taken before the boundary-aware loss term and the composite (`val_iou − HEALTHY_ACT_PENALTY_WEIGHT×healthy_act`) checkpoint criterion were added (it has `BOUNDARY_LOSS_LAMBDA = 0.0` and selects checkpoints by raw `val_iou` alone). It is never run directly to produce the deployed checkpoint — `train_symptom_model.py` is. It stays in the repo because `check_precision_recall.py` and `visualize_msv_fp.py` still import their dataset/model classes and constants from it (`from train_symptom_model_experiment import ...`), so their `random.shuffle(records)` val-split reconstruction reproduces the exact split used by older `--skip-ae` runs. Diagnosing a checkpoint trained by the *current* `train_symptom_model.py` with these two scripts will reconstruct an approximately — not exactly — matching split.
 
 ---
 
@@ -279,9 +286,13 @@ python validate_factory.py --all-modes
 # STEP 9 — Student Stage 1: encoder ablation (5 variants × Mode B)
 python train_student.py --stage 1
 # → Check logs/student_comparison_stage1.csv for best encoder
+# → As of the last completed Stage 1 run, config.py's STUDENT_BEST_VARIANT
+#   is "mobilenet_v3_small" (auto-written by select_best_pipeline.py) —
+#   NOT mobilenet_v2_cbam. Substitute whatever STUDENT_BEST_VARIANT
+#   currently holds; don't assume mobilenet_v2_cbam won.
 
 # STEP 10 — Student Stage 2: mode ablation (best encoder × 4 modes)
-python train_student.py --stage 2 --encoder mobilenet_v2_cbam
+python train_student.py --stage 2 --encoder mobilenet_v3_small
 python generate_charts.py --student          # optional
 
 python validate_student.py                   # optional qualitative check
@@ -332,6 +343,10 @@ python generate_report.py
 | `validate_student.py` | 5c | Qualitative Student prediction panels (optional) |
 | `validate_symptom.py` | any | Symptom Teacher vs LAB comparison figures |
 | `generate_charts.py` | any | logs/ CSVs → reports/charts/ PNGs |
+| `diagnose_manifest.py` | ad hoc | Audits `global_split_manifest.csv` for filename/category duplication patterns before deciding on a fix |
+| `check_precision_recall.py` | ad hoc | Per-class (MSV/MLN) precision, recall, FP-rate for the Symptom Teacher checkpoint at the training-time 0.5 IoU threshold |
+| `visualize_msv_fp.py` | ad hoc | Worst-IoU MSV overlay panels — diagnoses boundary-fuzz false positives vs. genuine spatial confusion |
+| `train_symptom_model_experiment.py` | n/a — not run | Frozen pre-boundary-loss reference copy of `train_symptom_model.py`, kept only so `check_precision_recall.py`/`visualize_msv_fp.py` reconstruct the matching val split |
 | `select_best_pipeline.py` | 6 | Select winners, promote checkpoints, auto-update config.py |
 | `evaluate_xai.py` | 7 | Grad-CAM / Grad-CAM++ / Score-CAM comparison |
 | `evaluate_severity.py` | 8 | Inter-rater reliability (Kappa + Spearman ρ) |
@@ -374,3 +389,5 @@ python generate_report.py
 - **`sample_yolo_annotations.py` is deprecated** — do not run it.
 - **`SYMPTOM_TEACHER_DEPLOYED = True`** in config.py — Factory uses Symptom Teacher for symptom masking. The LAB-based `compute_lab_hard_mask()`/`compute_lab_soft_confidence()` activates as fallback if checkpoints are missing. The HSV-band functions (`compute_hsv_hard_mask`/`compute_hsv_soft_confidence`, using `HSV_MSV_RANGES`/`HSV_MLN_RANGES`) are dead code — never called anywhere — do not treat them as the active fallback.
 - **`data/symptom_extra/images/`** — optional, manually populated. Only needed if the 501 gold-standard images don't reach the 400-annotation minimum for symptom training.
+- **`train_symptom_model.py`'s active base loss is `focal_tversky_loss` (`EXPERIMENTAL_LOSS_MODE = "focal_tversky"`), plus a distance-weighted boundary BCE term (`BOUNDARY_LOSS_LAMBDA = 0.2`)** — not the plain Dice+Focal loss (`dice_focal_loss`, still present and selectable via `EXPERIMENTAL_LOSS_MODE = "default"`, but not the active mode). Checkpoint selection uses `composite_score = val_iou − HEALTHY_ACT_PENALTY_WEIGHT × healthy_act`, not raw `val_iou`.
+- **`STUDENT_BEST_VARIANT` in config.py currently reads `"mobilenet_v3_small"`** (written automatically by `select_best_pipeline.py` after Stage 1) — `mobilenet_v2_cbam` was the hypothesized/expected winner going in, not the encoder Stage 1 actually selected. Always read the live value from `config.py` rather than assuming either name.

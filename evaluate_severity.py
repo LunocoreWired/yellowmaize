@@ -8,7 +8,11 @@
      1. Sample 60 test-split images (20 per class).
      2. Two raters independently assign 0–3 severity scores.
      3. Compute inter-rater Cohen's Kappa (human agreement).
-     4. Compute Spearman correlation between human ratings and HSV severity.
+     4. Compute Spearman correlation between human ratings and Factory
+        pseudo-label severity (the pipeline's automated severity %, sourced
+        from the Symptom Teacher via factory_master.py — not HSV
+        thresholding; the HSV-band functions in factory_master.py are
+        dead code and were never the actual source).
 
    A Spearman ρ ≥ 0.60 supports "moderate correlation with expert assessment."
    If ρ < 0.50, the severity disclaimer must be made stronger in Chapter 4.
@@ -96,7 +100,7 @@ def generate_sample() -> None:
                         "source_path": row["source_path"],
                         "stem":        stem,
                         "category":    cls,
-                        "hsv_severity":round(sev, 2),
+                        "factory_severity":round(sev, 2),
                     })
 
         n_sample = min(SEVERITY_EVAL_N_IMAGES, len(valid))
@@ -108,7 +112,7 @@ def generate_sample() -> None:
     fieldnames = [
         "stem", "source_path", "category",
         "factory_mode",  # recorded so same images rated even if mode changes
-        "hsv_severity",
+        "factory_severity",
         "rater1_score",  # FILL IN: 0, 1, 2, or 3
         "rater2_score",  # FILL IN: 0, 1, 2, or 3
         "notes",
@@ -122,7 +126,7 @@ def generate_sample() -> None:
                 "source_path":  row["source_path"],
                 "category":     row["category"],
                 "factory_mode": mode,
-                "hsv_severity": row["hsv_severity"],
+                "factory_severity": row["factory_severity"],
                 "rater1_score": "",
                 "rater2_score": "",
                 "notes":        "",
@@ -198,7 +202,8 @@ def cohen_kappa(r1: np.ndarray, r2: np.ndarray,
 def spearman_correlation(x: np.ndarray, y: np.ndarray) -> float:
     """
     Spearman rank correlation coefficient.
-    Measures monotonic relationship between HSV severity and human ratings.
+    Measures monotonic relationship between Factory pseudo-label severity
+    and human ratings.
     """
     from scipy.stats import spearmanr
     rho, pval = spearmanr(x, y)
@@ -208,7 +213,7 @@ def spearman_correlation(x: np.ndarray, y: np.ndarray) -> float:
 def analyze_ratings() -> None:
     """
     Analyze rater scores from filled-in severity_sample.csv.
-    Compute inter-rater Cohen's Kappa and Spearman ρ vs HSV severity.
+    Compute inter-rater Cohen's Kappa and Spearman ρ vs Factory pseudo-label severity.
     """
     if not SAMPLE_CSV.exists():
         print(f"[FATAL] {SAMPLE_CSV} not found. Run --sample first.")
@@ -222,19 +227,19 @@ def analyze_ratings() -> None:
         print(f"[WARN] {missing} rater scores are missing. "
               f"Proceeding with available data.")
 
-    df = df.dropna(subset=["rater1_score", "rater2_score", "hsv_severity"])
+    df = df.dropna(subset=["rater1_score", "rater2_score", "factory_severity"])
     if df.empty:
         print("[FATAL] No complete rows found. Fill in rater scores first.")
         return
 
     r1  = df["rater1_score"].astype(int).values
     r2  = df["rater2_score"].astype(int).values
-    hsv = df["hsv_severity"].astype(float).values
+    factory_sev = df["factory_severity"].astype(float).values
 
     # Average human rating (normalized to [0,1])
     human_avg  = (r1 + r2) / 2.0
     human_norm = human_avg / SEVERITY_EVAL_SCALE_MAX
-    hsv_norm   = hsv / 100.0
+    factory_norm   = factory_sev / 100.0
 
     # Inter-rater agreement
     kappa = cohen_kappa(r1, r2)
@@ -243,12 +248,12 @@ def analyze_ratings() -> None:
     # Spearman correlation
     try:
         from scipy.stats import spearmanr
-        rho, pval = spearmanr(human_norm, hsv_norm)
+        rho, pval = spearmanr(human_norm, factory_norm)
     except ImportError:
         # Manual Spearman if scipy unavailable
         rho  = np.corrcoef(
             pd.Series(human_norm).rank(),
-            pd.Series(hsv_norm).rank()
+            pd.Series(factory_norm).rank()
         )[0, 1]
         pval = float("nan")
 
@@ -263,18 +268,18 @@ def analyze_ratings() -> None:
     else:
         print(f"    [GOOD] Kappa ≥ 0.60 — substantial agreement.")
 
-    print(f"\n  HSV severity vs. human rating:")
+    print(f"\n  Factory pseudo-label severity vs. human rating:")
     print(f"    Spearman ρ    : {rho:.4f}")
     print(f"    p-value       : {pval:.4f}" if not np.isnan(pval) else "    p-value: N/A")
     if abs(rho) >= 0.60:
         print(f"    [GOOD] ρ ≥ 0.60 — moderate-to-strong correlation.")
-        print(f"           HSV severity is a reasonable proxy for human assessment.")
+        print(f"           Factory pseudo-label severity is a reasonable proxy for human assessment.")
     elif abs(rho) >= 0.40:
         print(f"    [OK]   ρ 0.40–0.60 — weak-to-moderate correlation.")
         print(f"           Strengthen severity disclaimer in Chapter 4.")
     else:
         print(f"    [WARN] ρ < 0.40 — weak correlation.")
-        print(f"           HSV severity is a poor proxy. Revise severity framing.")
+        print(f"           Factory pseudo-label severity is a poor proxy. Revise severity framing.")
 
     # Per-class Spearman
     print(f"\n  Per-class Spearman ρ:")
@@ -285,13 +290,13 @@ def analyze_ratings() -> None:
             continue
         h_cls    = ((cls_df["rater1_score"] + cls_df["rater2_score"]) / 2.0 /
                     SEVERITY_EVAL_SCALE_MAX).values
-        hsv_cls  = (cls_df["hsv_severity"] / 100.0).values
+        factory_cls  = (cls_df["factory_severity"] / 100.0).values
         try:
             from scipy.stats import spearmanr as sr
-            rho_c, _ = sr(h_cls, hsv_cls)
+            rho_c, _ = sr(h_cls, factory_cls)
         except ImportError:
             rho_c = np.corrcoef(
-                pd.Series(h_cls).rank(), pd.Series(hsv_cls).rank())[0, 1]
+                pd.Series(h_cls).rank(), pd.Series(factory_cls).rank())[0, 1]
         print(f"    {cls:<12}: ρ = {rho_c:.4f}")
 
     # Write per-image analysis
@@ -307,9 +312,9 @@ def analyze_ratings() -> None:
             "rater2":         r2v,
             "avg_human":      round((r1v + r2v) / 2.0, 2),
             "agree":          int(r1v == r2v),
-            "hsv_severity":   round(float(row["hsv_severity"]), 2),
+            "factory_severity":   round(float(row["factory_severity"]), 2),
             "human_norm":     round((r1v + r2v) / 2.0 / SEVERITY_EVAL_SCALE_MAX, 4),
-            "hsv_norm":       round(float(row["hsv_severity"]) / 100.0, 4),
+            "factory_norm":       round(float(row["factory_severity"]) / 100.0, 4),
         })
 
     with open(ANALYSIS_CSV, "w", newline="", encoding="utf-8") as f:
@@ -327,7 +332,7 @@ def analyze_ratings() -> None:
         "spearman_rho":   round(float(rho), 4),
         "spearman_pval":  round(float(pval), 4) if not np.isnan(pval) else "nan",
         "rating_scale":   f"0–{SEVERITY_EVAL_SCALE_MAX}",
-        "hsv_scale":      "0–100%",
+        "factory_scale":      "0–100%",
     }
     with open(RELIAB_CSV, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=reliab.keys())
@@ -342,7 +347,7 @@ def analyze_ratings() -> None:
     interp = ("moderate" if abs(rho) >= 0.60 else
               "weak-to-moderate" if abs(rho) >= 0.40 else "weak")
     print(f"\n  Suggested Chapter 4 sentence:")
-    print(f"  \"HSV-derived severity scores showed {interp} correlation")
+    print(f"  \"Factory pseudo-label severity scores showed {interp} correlation")
     print(f"   (Spearman ρ = {rho:.3f}) with expert visual ratings on a")
     print(f"   {len(df)}-image sample rated by two independent assessors")
     print(f"   (Cohen's κ = {kappa:.3f}), supporting their use as a training")

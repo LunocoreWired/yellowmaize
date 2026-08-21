@@ -445,12 +445,71 @@ Input size : 512×512 (SYMPTOM_IMG_SIZE)
 Batch      : 4
 Epochs     : 60
 Optimizer  : AdamW(lr=1e-4, wd=1e-4)
-Loss       : 0.6×DiceLoss + 0.4×FocalLoss(gamma=2.0, pos_weight=5.0)
-             Focal loss upweights sparse foreground pixels (thin streaks)
 Patience   : 10
 Target IoU : ≥ 0.70 (SYMPTOM_IOU_TARGET_MEAN)
 Checkpoints: checkpoints/healthy_ae/healthy_ae_best.pth
              checkpoints/symptom/symptom_teacher_best.pth
+```
+
+### 11.3b Active Loss (EXPERIMENTAL_LOSS_MODE = "focal_tversky")
+`train_symptom_model.py` defines three loss modes via `symptom_loss()`; the active one is set by the module-level constant `EXPERIMENTAL_LOSS_MODE`, currently `"focal_tversky"` — **not** the original Dice+Focal formulation:
+```python
+# focal_tversky_loss() — Abraham & Khan (2019 ISBI, arxiv.org/abs/1810.07842)
+# Per-channel (MSV=0, MLN=1): alpha=(0.4, 0.5)  beta=(0.6, 0.5)  gamma=0.75
+# tversky = (tp + smooth) / (tp + alpha*fp + beta*fn + smooth)
+# loss_c  = (1 - tversky).clamp(min=1e-6) ** gamma
+# MSV's higher beta penalizes false negatives harder than MLN's — targets
+# the thin/sparse-streak under-prediction pattern seen across prior runs.
+# MLN kept near-balanced (alpha=beta=0.5) since it doesn't show the pattern.
+
+# Boundary-weighted BCE term, added on top:
+if BOUNDARY_LOSS_LAMBDA > 0:            # BOUNDARY_LOSS_LAMBDA = 0.2
+    loss += BOUNDARY_LOSS_LAMBDA * boundary_weighted_bce(logits, target)
+# boundary_weighted_bce(): per-image/per-channel distance-transform weight
+# map — 1.0 at the mask boundary, decaying linearly to BOUNDARY_WEIGHT_FLOOR
+# (0.1) at BOUNDARY_WIDTH_PX (15px) away, floor beyond that; all-zero
+# (HEALTHY) masks get a flat BOUNDARY_WEIGHT_FLOOR map. Multiplies
+# per-pixel BCE before averaging.
+```
+**Why the boundary term exists:** pure Focal Tversky has no dense per-pixel term at all, so on a fully-empty (HEALTHY) mask its only signal is the aggregate FP ratio inside the Tversky fraction, which saturates quickly and under-penalizes small/sparse false-positive blobs. `symptom_teacher_metrics.csv` showed `HEALTHY_act` (mean predicted-foreground fraction on HEALTHY validation images — should be ~0) fluctuating as high as 0.37 during training with the boundary term off. Enabling it (at `BOUNDARY_LOSS_LAMBDA = 0.2`, the value an earlier code comment had already flagged as the first-guess starting point) gives real, non-saturating dense BCE pressure specifically on HEALTHY images.
+
+The original loss (`dice_focal_loss()` — `SYMPTOM_DICE_WEIGHT×DiceLoss + SYMPTOM_FOCAL_WEIGHT×FocalLoss(gamma=SYMPTOM_FOCAL_GAMMA, pos_weight=SYMPTOM_FOCAL_POS_WEIGHT)`, i.e. 0.6×Dice + 0.4×Focal(gamma=2.0, pos_weight=5.0)) is still implemented and reachable via `EXPERIMENTAL_LOSS_MODE = "default"`, plus an `"msv_upweight"` variant (MSV pos_weight ×1.5, tested, did not help — kept for reference only). Neither is the active mode.
+
+### 11.3c Checkpoint Selection — Composite Score
+`train_symptom_model.py` does **not** select the best checkpoint by raw `val_iou`. It computes:
+```python
+composite_score = val_iou - HEALTHY_ACT_PENALTY_WEIGHT * healthy_act
+# HEALTHY_ACT_PENALTY_WEIGHT = 1.0 (config.py)
+# val_iou     = mean IoU over MSV+MLN validation images (symptom regions only)
+# healthy_act = mean predicted-foreground fraction on HEALTHY validation images
+```
+This was introduced because `val_iou` alone never reflects false-positive suppression on HEALTHY images. Evidence from `symptom_teacher_metrics.csv`: the previous val-IoU-only criterion would have kept epoch 25 (val_iou=0.610, healthy_act=0.048) over epoch 39 (val_iou=0.602 — nearly identical — but healthy_act=0.008, a 5.8× lower false-positive rate). The composite score correctly prefers epoch 39. Checkpoints saved via `torch.save()` now also record `healthy_act` and `composite_score` alongside `val_iou`.
+
+### 11.3d Diagnostic Scripts (not part of the executed pipeline)
+Two ad hoc scripts sit alongside `train_symptom_model.py` for post-hoc diagnosis of a trained Symptom Teacher checkpoint. Both import their `SymptomDataset`/`SymptomTeacher`/`HealthyAE`/constants from **`train_symptom_model_experiment.py`**, a frozen snapshot of this script taken *before* the boundary loss and composite checkpoint criterion existed (`BOUNDARY_LOSS_LAMBDA = 0.0` there, checkpoint selection by raw `val_iou`). This is deliberate, not an oversight: it lets `random.shuffle(records)` reconstruct the exact val split used by older `--skip-ae` training runs. `train_symptom_model_experiment.py` itself is never executed to produce a deployed checkpoint.
+
+```
+check_precision_recall.py
+  Loads symptom_teacher_best.pth + healthy_ae_best.pth. Reports precision,
+  recall, and false-positive rate separately for MSV and MLN at the 0.5
+  threshold. Distinguishes "high recall, mediocre precision" (loose
+  over-predicted blobs) from "precision ≈ recall" (genuinely tighter
+  segmentation) — i.e. whether an IoU gain reflects real improvement or
+  just recall bias from beta=0.6 on the MSV Tversky term.
+
+visualize_msv_fp.py
+  Same checkpoints. Ranks MSV validation samples by IoU (worst first) and
+  renders Original | GT | Prediction | Overlay panels (green=missed/FN,
+  cyan=correct/TP, red=false-positive) to reports/msv_fp_diagnosis/.
+  READ: a thin red halo hugging real streak edges is boundary fuzziness
+  (low concern — even human annotators disagree here); red pixels
+  scattered on clean tissue/veins is genuine confusion (a real problem).
+
+diagnose_manifest.py
+  Unrelated to the Symptom Teacher — audits global_split_manifest.csv for
+  filename/category duplication patterns (multiple rows per filename with
+  different categories, exact filename+category dupes) before deciding on
+  a fix. Run standalone, prints to console only.
 ```
 
 ### 11.4 Annotation Format (CVAT COCO 1.0)
@@ -636,12 +695,14 @@ Shared Encoder (MobileNetV2 or variant)
 | V# | Encoder | CBAM | TFLite |
 |---|---|---|---|
 | V1 | mobilenet_v2 | No | Yes |
-| **V2** | **mobilenet_v2_cbam** | **Yes** | **Yes** |
-| V3 | mobilenet_v3_small | No | Yes |
+| V2 | mobilenet_v2_cbam | Yes | Yes |
+| **V3** | **mobilenet_v3_small** | **No** | **Yes** |
 | V4 | efficientnet_b0 | No | Yes |
 | V6 | efficientnet_b0_cbam | Yes | Yes |
 
 V5 (MobileViT-XXS) removed — `torch.einsum` self-attention causes TFLite subgraph errors.
+
+**Stage 1 result:** `mobilenet_v2_cbam` (V2) was the hypothesized winner going in — CBAM at the skip connections was the core architectural contribution — but `config.py`'s `STUDENT_BEST_VARIANT` currently reads **`"mobilenet_v3_small"` (V3)**, auto-written by `select_best_pipeline.py` from `logs/student_comparison_stage1.csv` after the last completed Stage 1 run. Stage 2, deployment, and every downstream script (`export_tflite.py`, `build_deployment_package.py`, `validate_student.py`, XAI target-layer lookup, etc.) resolve the encoder from `STUDENT_BEST_VARIANT`/`STUDENT_FACTORY_MODE` at runtime — always read the live config value rather than assuming either encoder name is deployed.
 
 ### 13.3 CBAM Implementation
 ```python
@@ -1032,6 +1093,16 @@ Every script calls `set_seeds(42)`: random, numpy, torch, cuda, cudnn.determinis
 ### 21.4 Timing
 Wall-clock duration logged in every script. Student: 220 CPU passes (20 warmup + 200 measured) → mean ms, std ms, FPS. Teacher: 20 CPU passes per variant.
 
+### 21.5 Ad Hoc / Diagnostic Scripts
+Four scripts sit outside the numbered pipeline — not referenced by `PROJECT_STRUCTURE.md`'s execution order, not consumed by `generate_report.py`, run manually and read from the console (or write a small standalone output) rather than feeding the next pipeline stage:
+
+| Script | Reads | Purpose |
+|---|---|---|
+| `diagnose_manifest.py` | `global_split_manifest.csv` | Characterizes filename/category duplication (per-filename category counts, exact filename+category dupes) before deciding on a fix. Console-only. |
+| `check_precision_recall.py` | `symptom_teacher_best.pth`, `healthy_ae_best.pth` | Per-class (MSV/MLN) precision, recall, false-positive rate at the 0.5 threshold — separates over-prediction from genuine boundary-tightness gains. Console-only. |
+| `visualize_msv_fp.py` | Same checkpoints | Worst-IoU MSV overlay panels (`reports/msv_fp_diagnosis/`) — distinguishes boundary fuzziness from genuine spatial confusion. |
+| `train_symptom_model_experiment.py` | n/a — not executed for deployment | Frozen snapshot of `train_symptom_model.py` predating the boundary loss + composite checkpoint criterion; kept only so the two diagnostics above reconstruct a matching val split. See PART 11.3d. |
+
 ---
 
 ## PART 22 — EXECUTION REFERENCE
@@ -1071,7 +1142,10 @@ python factory_master.py                             # Step 8
 python validate_factory.py --all-modes               # Step 8b (optional, recommended)
 
 python train_student.py --stage 1                    # Step 9
-python train_student.py --stage 2 --encoder mobilenet_v2_cbam   # Step 10
+# → check logs/student_comparison_stage1.csv / config.py's STUDENT_BEST_VARIANT
+#   for the actual winning encoder before Step 10 (last recorded: mobilenet_v3_small,
+#   not the hypothesized mobilenet_v2_cbam — see PART 13.2)
+python train_student.py --stage 2 --encoder mobilenet_v3_small  # Step 10
 python generate_charts.py --student                  # optional
 python validate_student.py                           # optional
 python validate_gold_standard.py                     # Step 10b
@@ -1107,7 +1181,8 @@ python generate_report.py                            # Step 16
 | Woo et al. (2018) ECCV | CBAM |
 | Ke et al. (2020) | Soft pseudo-label segmentation targets |
 | Jiang et al. (2018) ICML | MentorNet — reliability-weighted curriculum |
-| Lin et al. (2017) ICCV | Focal loss (Symptom Teacher) |
+| Lin et al. (2017) ICCV | Focal loss (Symptom Teacher, non-active `dice_focal_loss` mode) |
+| Abraham & Khan (2019) ISBI, arxiv.org/abs/1810.07842 | Focal Tversky loss — active Symptom Teacher base loss |
 | Cruz et al. (2024) | First confirmed MSV in the Philippines |
 | Mushayi et al. (2025) | MSV / HEALTHY confusion — asymmetric prior basis |
 | Soto et al. (1982); Sime et al. (2021) Agriculture 11(2):130 | MSV 1-5 severity scale (CIMMYT_MSV_BRACKETS) |
