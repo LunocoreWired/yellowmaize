@@ -1,3 +1,4 @@
 artifact,HEALTHY_mean_iou,HEALTHY_std_iou,HEALTHY_n,MSV_mean_iou,MSV_std_iou,MSV_n,MLN_mean_iou,MLN_std_iou,MLN_n,overall_mean_iou,overall_std_iou,n_total,n_below_warn,target_met
-sam2,-1,-1,0,-1,-1,0,-1,-1,0,-1,-1,0,0,False
-teacher,-1,-1,0,-1,-1,0,-1,-1,0,-1,-1,0,0,False
+sam2,0.9542,0.1208,95,0.9516,0.1308,99,0.953,0.1198,100,0.9529,0.1239,294,15,True
+teacher,0.9593,0.1451,95,0.9767,0.0657,100,0.9601,0.1176,100,0.9654,0.114,295,11,True
+student,0.7508,0.1202,95,0.7766,0.069,100,0.7437,0.1243,100,0.7572,0.1082,295,110,False
