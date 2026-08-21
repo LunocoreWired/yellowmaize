@@ -48,4 +48,5 @@ global_split_manifest.pre_path_fix.csv
 .vscode/
 .idea/
 .DS_Store
-Thumbs.dbreports/*.html
+Thumbs.db
+reports/*.html
