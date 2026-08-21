@@ -1444,8 +1444,16 @@ def train_one(encoder_variant: str, factory_mode: str, stage: int = 1) -> dict:
         "encoder":       encoder_variant,
         "mode":          factory_mode,
         "best_composite":round(best_composite, 4),
-        **{f"test_{k}": v for k, v in test_results.items()
-           if k.startswith("test_")},
+        # FIX: evaluate_test_split()'s returned dict keys (sil_mIoU, sym_mIoU,
+        # msv_f1, mln_f1, msv_roc_auc, macro_f1, composite, etc.) are NOT
+        # prefixed with "test_" themselves — they're just the test-set metric
+        # names. The old `if k.startswith("test_")` filter checked the
+        # ALREADY-unprefixed key for a prefix it could never have, so it
+        # silently dropped every single metric — the comparison CSV ended up
+        # with only encoder/mode/best_composite, which is why
+        # generate_charts.py's _student_comparison_bar() always skipped with
+        # "no expected columns found" despite training completing normally.
+        **{f"test_{k}": v for k, v in test_results.items()},
     }
 
 
