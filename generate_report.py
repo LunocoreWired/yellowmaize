@@ -565,7 +565,7 @@ def chart_severity_scatter_inline(df: pd.DataFrame) -> str:
     colors = {"HEALTHY": "#2ecc71", "MSV": "#3498db", "MLN": "#e74c3c"}
     for cls in classes_present:
         cdf = df[df["category"] == cls] if "category" in df.columns else df
-        ax.scatter(cdf["human_norm"], cdf["hsv_norm"], s=30, alpha=0.7,
+        ax.scatter(cdf["human_norm"], cdf["factory_norm"], s=30, alpha=0.7,
                   color=colors.get(cls, "#95a5a6"), label=cls,
                   edgecolors="white", linewidths=0.3)
     ax.plot([0, 1], [0, 1], color="#888888", linestyle="--", linewidth=1,
@@ -573,8 +573,8 @@ def chart_severity_scatter_inline(df: pd.DataFrame) -> str:
     ax.set_xlim(-0.02, 1.02)
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel("Human-rated severity (normalized)")
-    ax.set_ylabel("HSV-derived severity (normalized)")
-    ax.set_title("Severity Reliability — Human vs. HSV-Derived")
+    ax.set_ylabel("Factory pseudo-label severity (normalized)")
+    ax.set_title("Severity Reliability — Human vs. Factory Pseudo-Label")
     ax.legend(fontsize=8)
     ax.set_aspect("equal")
     fig.tight_layout()
@@ -695,7 +695,13 @@ def build_symptom() -> str:
     lab_csv = REPORTS_DIR / "symptom_vs_lab_comparison.csv"
     if lab_csv.exists():
         ldf = pd.read_csv(lab_csv)
-        if not ldf.empty:
+        if ldf.empty:
+            html += "<p style='color:#666;font-size:0.85rem'>symptom_vs_lab_comparison.csv is empty.</p>"
+        elif "iou_lab" not in ldf.columns or "iou_symptom_teacher" not in ldf.columns:
+            html += ("<p style='color:#666;font-size:0.85rem'>symptom_vs_lab_comparison.csv "
+                     "has no iou_lab/iou_symptom_teacher columns — likely produced with "
+                     "--skip-lab. Re-run validate_symptom.py without that flag for Table 4.13.</p>")
+        else:
             html += "<h3>Symptom Teacher vs. legacy LAB/HSV (vs. human ground truth)</h3>"
 
             overall_lab = ldf["iou_lab"].mean()
@@ -726,18 +732,59 @@ def build_symptom() -> str:
                 chart_bar_comparison, chart_df, "class",
                 ["Legacy LAB", "Symptom Teacher"],
                 "Symptom Teacher vs. Legacy LAB — Mean IoU by Class", ylabel="Mean IoU")
-        else:
-            html += "<p style='color:#666;font-size:0.85rem'>symptom_vs_lab_comparison.csv is empty.</p>"
     else:
         html += "<p style='color:#666;font-size:0.85rem'>LAB comparison not yet run — run validate_symptom.py.</p>"
 
-    # Qualitative overlays — Figures 4.16, 4.17, 4.18
+    # Student comparison (Table 4.14) — same CSV, populated only when
+    # validate_symptom.py successfully loaded a Student checkpoint (see
+    # load_student()'s stage1/stage2 checkpoint resolution). Guarded
+    # separately from the LAB block above since --skip-lab and
+    # --skip-student are independent flags — a CSV can have one set of
+    # columns without the other.
+    if lab_csv.exists():
+        sdf = pd.read_csv(lab_csv)
+        if not sdf.empty and "iou_student" in sdf.columns:
+            html += "<h3>Human vs. Student — symptom mask, classification, severity (Table 4.14)</h3>"
+
+            overall_student_iou = sdf["iou_student"].mean()
+            cards = [metric_card(f"{overall_student_iou:.3f}", "Mean IoU — Student symptom mask", "")]
+            if "cls_correct" in sdf.columns:
+                acc = 100 * sdf["cls_correct"].mean()
+                cards.append(metric_card(f"{acc:.1f}%", "Classification accuracy", "good" if acc >= 80 else "warn" if acc >= 60 else "bad"))
+            if "severity_abs_error" in sdf.columns:
+                sev_valid = sdf.dropna(subset=["severity_abs_error"])
+                if not sev_valid.empty:
+                    mae = sev_valid["severity_abs_error"].mean()
+                    cards.append(metric_card(f"{mae:.2f} pts", "Severity MAE (percentage points)", ""))
+            html += f'<div class="grid3">{"".join(cards)}</div>'
+
+            student_classes = sorted([c for c in sdf["category"].unique().tolist() if c != "HEALTHY"])
+            if student_classes:
+                student_rows = []
+                for cls in student_classes:
+                    cdf = sdf[sdf["category"] == cls]
+                    row = {"class": cls, "Student IoU": cdf["iou_student"].mean()}
+                    if "cls_correct" in sdf.columns:
+                        row["Classification acc. (%)"] = 100 * cdf["cls_correct"].mean()
+                    student_rows.append(row)
+                student_df = pd.DataFrame(student_rows)
+                html += df_to_table(student_df)
+
+            html += "<p style='color:#666;font-size:0.85rem'>Severity % here is the Student's own regression head, compared against human symptom-pixel-area / human leaf-pixel-area from the same CVAT export — not the Factory pseudo-label severity used elsewhere (see evaluate_severity.py).</p>"
+        elif not sdf.empty:
+            html += ("<p style='color:#666;font-size:0.85rem'>symptom_vs_lab_comparison.csv "
+                     "has no iou_student column — Student comparison was skipped "
+                     "(--skip-student, or no Student checkpoint found). Re-run "
+                     "validate_symptom.py once a Student checkpoint exists for Table 4.14.</p>")
+
+    # Qualitative overlays — Figures 4.16, 4.17, 4.18, 4.19
     overlay_dir = REPORTS_DIR / "symptom_overlays"
     if overlay_dir.exists():
         overlay_specs = [
             ("*_ae_anomaly.jpg", "HealthyAE reconstruction and anomaly map (Figure 4.16)"),
             ("*_human_vs_pred.jpg", "Human symptom mask vs. predicted mask (Figure 4.17)"),
             ("*_lab_vs_teacher.jpg", "Symptom Teacher vs. LAB/HSV comparison (Figure 4.18)"),
+            ("*_human_vs_student.jpg", "Human symptom mask vs. Student prediction (Figure 4.19)"),
         ]
         for pattern, heading in overlay_specs:
             imgs = sorted(overlay_dir.glob(pattern))[:6]
@@ -1267,13 +1314,13 @@ def build_severity() -> str:
 
     html = f"""<div class="grid3">
 {metric_card(f"{kappa:.3f}",           "Cohen's Kappa (inter-rater)", kappa_q)}
-{metric_card(f"{rho:.3f}",             "Spearman ρ (HSV vs human)",   rho_q)}
+{metric_card(f"{rho:.3f}",             "Spearman ρ (Factory vs human)", rho_q)}
 {metric_card(str(row.get('n_images','N/A')), "Images rated")}
 </div>"""
 
     interp = ("moderate-to-strong" if abs(rho) >= 0.6 else
               "weak-to-moderate"   if abs(rho) >= 0.4 else "weak")
-    html += f'<div class="note">HSV-derived severity scores showed <strong>{interp} correlation (ρ = {rho:.3f})</strong> with expert visual ratings. Severity MAE should be interpreted as consistency with the HSV-derived proxy, not absolute agronomic accuracy.</div>'
+    html += f'<div class="note">Factory pseudo-label severity scores showed <strong>{interp} correlation (ρ = {rho:.3f})</strong> with expert visual ratings. Severity MAE should be interpreted as consistency with the Factory pseudo-label proxy (sourced from the Symptom Teacher), not absolute agronomic accuracy.</div>'
 
     tbl_df = pd.DataFrame([{k: v for k, v in row.items()}])
     html += df_to_table(tbl_df)
@@ -1284,8 +1331,8 @@ def build_severity() -> str:
     analysis_csv = REPORTS_DIR / "severity_analysis.csv"
     if analysis_csv.exists():
         adf = pd.read_csv(analysis_csv)
-        if not adf.empty and "human_norm" in adf.columns and "hsv_norm" in adf.columns:
-            html += "<h3>Human vs. HSV-derived severity (per image)</h3>"
+        if not adf.empty and "human_norm" in adf.columns and "factory_norm" in adf.columns:
+            html += "<h3>Human vs. Factory pseudo-label severity (per image)</h3>"
             html += safe_chart(chart_severity_scatter_inline, adf)
 
     return html

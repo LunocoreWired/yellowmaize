@@ -31,7 +31,9 @@
    Symptom Teacher:
      logs/healthy_ae_metrics.csv          (per-epoch loss + recon_std collapse check)
      logs/symptom_teacher_metrics.csv     (per-epoch loss/IoU/suppression)
-     reports/symptom_vs_lab_comparison.csv (LAB vs. Symptom Teacher IoU)
+     reports/symptom_vs_lab_comparison.csv (LAB vs. Symptom Teacher IoU, and — when
+                                             produced without --skip-student —
+                                             Student vs. human IoU/classification/severity)
 
    Student:
      logs/student_comparison_stage1.csv   (encoder ablation)
@@ -60,9 +62,10 @@
    Symptom Teacher:
      healthy_ae_training_curves.png       — reconstruction loss + collapse check (recon_std)
      symptom_training_curves.png          — loss, val/MSV/MLN IoU, HEALTHY suppression
-     symptom_vs_lab_bar.png                — LAB vs. Symptom Teacher IoU per class
+     symptom_vs_lab_bar.png                — LAB vs. Symptom Teacher IoU per class (Table 4.13)
+     symptom_vs_student_bar.png            — Student symptom IoU + classification accuracy (Table 4.14)
      (qualitative overlays are saved separately by validate_symptom.py to
-      reports/symptom_overlays/ — Figures 4.16-4.18, not generate_charts.py output)
+      reports/symptom_overlays/ — Figures 4.16-4.19, not generate_charts.py output)
 
    Student:
      student_stage1_comparison_bar.png    — encoder ablation multi-metric bar
@@ -706,6 +709,10 @@ def chart_healthy_ae_training_curve():
     if df.empty:
         print(f"  [SKIP] {csv_path.name} is empty.")
         return
+    if "iou_lab" not in df.columns or "iou_symptom_teacher" not in df.columns:
+        print(f"  [SKIP] {csv_path.name} missing iou_lab/iou_symptom_teacher "
+              "(likely produced with --skip-lab).")
+        return
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
     apply_dark_style(fig, axes)
@@ -874,6 +881,81 @@ def chart_symptom_vs_lab():
     save_chart(fig, "symptom_vs_lab_bar.png")
 
 
+def chart_symptom_vs_student():
+    """
+    Table 4.14 companion figure: Student's symptom-channel IoU vs. human
+    ground truth, per class, from the SAME reports/symptom_vs_lab_comparison.csv
+    validate_symptom.py writes (iou_student/cls_correct/severity_* columns —
+    populated only when validate_symptom.py successfully loads a Student
+    checkpoint; see load_student()'s stage1/stage2 checkpoint resolution).
+    Guarded separately from chart_symptom_vs_lab() since a run with
+    --skip-student (or a missing Student checkpoint) produces a CSV with
+    iou_lab/iou_symptom_teacher but no iou_student column at all.
+    """
+    csv_path = REPORTS_DIR / "symptom_vs_lab_comparison.csv"
+    if not csv_path.exists():
+        print(f"  [SKIP] {csv_path.name} not found "
+              "(run validate_symptom.py first).")
+        return
+
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        print(f"  [SKIP] {csv_path.name} is empty.")
+        return
+    if "iou_student" not in df.columns:
+        print(f"  [SKIP] {csv_path.name} has no iou_student column "
+              "(run validate_symptom.py without --skip-student, and "
+              "confirm a Student checkpoint was found).")
+        return
+
+    classes = sorted([c for c in df["category"].unique().tolist() if c != "HEALTHY"])
+    iou_means = [df[df["category"] == c]["iou_student"].mean() for c in classes]
+    overall_iou = df["iou_student"].mean()
+    classes_x = classes + ["Overall"]
+    iou_means = iou_means + [overall_iou]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 5))
+    apply_dark_style(fig, ax1)
+    apply_dark_style(fig, ax2)
+
+    x = np.arange(len(classes_x))
+    bars = ax1.bar(x, iou_means, width=0.5, color="#8B5CF6", alpha=0.9, zorder=3)
+    for bar in bars:
+        h = bar.get_height()
+        ax1.text(bar.get_x() + bar.get_width() / 2, h + 0.015, f"{h:.3f}",
+                 ha="center", va="bottom", fontsize=8, color=TEXT_COLOR)
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(classes_x, color=TEXT_COLOR)
+    ax1.set_ylabel("Mean IoU (Student symptom channel) vs. human", color=TEXT_COLOR)
+    ax1.set_ylim(0, max(iou_means) * 1.25 if iou_means else 1)
+    ax1.set_title("Student Symptom IoU vs. Human", color=TEXT_COLOR, fontsize=10, pad=10)
+
+    if "cls_correct" in df.columns:
+        acc_by_class = [100 * df[df["category"] == c]["cls_correct"].mean() for c in classes]
+        overall_acc = 100 * df["cls_correct"].mean()
+        acc_x = classes + ["Overall"]
+        acc_vals = acc_by_class + [overall_acc]
+        bars2 = ax2.bar(np.arange(len(acc_x)), acc_vals, width=0.5,
+                        color="#10B981", alpha=0.9, zorder=3)
+        for bar in bars2:
+            h = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width() / 2, h + 1.0, f"{h:.1f}%",
+                     ha="center", va="bottom", fontsize=8, color=TEXT_COLOR)
+        ax2.set_xticks(np.arange(len(acc_x)))
+        ax2.set_xticklabels(acc_x, color=TEXT_COLOR)
+        ax2.set_ylabel("Classification accuracy (%)", color=TEXT_COLOR)
+        ax2.set_ylim(0, 105)
+        ax2.set_title("Student Classification Accuracy\n(on symptom-annotated images)",
+                      color=TEXT_COLOR, fontsize=10, pad=10)
+    else:
+        ax2.axis("off")
+
+    fig.suptitle("Table 4.14 — Human vs. Student (symptom-annotated images)",
+                color=TEXT_COLOR, fontsize=12)
+    fig.tight_layout()
+    save_chart(fig, "symptom_vs_student_bar.png")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STUDENT CHARTS
 
@@ -900,20 +982,32 @@ def _student_comparison_bar(csv_path: Path, stage: int):
     groups  = df[group_col].tolist()
     n       = len(groups)
 
-    # Metrics to plot — use test-level columns when available, fall back to val
+    # Metrics to plot — test_-prefixed columns are what train_student.py's
+    # comparison-CSV writer actually produces (see the "test_{k}" prefixing
+    # fix in train_one()/evaluate_severity.py's sibling fix in train_student.py).
+    # Older CSVs written before that fix only ever had encoder/mode/
+    # best_composite — those rows will just skip every metric below and this
+    # function will print "no expected columns found", same as before.
     metric_map = [
-        ("sil_mIoU",    "sil_mIoU",    "Silhouette\nmIoU",   "#3B82F6"),
-        ("sym_mIoU",    "sym_mIoU",    "Symptom\nmIoU",      "#10B981"),
-        ("msv_f1",      "msv_f1",      "MSV F1",             "#F59E0B"),
-        ("mln_f1",      "mln_f1",      "MLN F1",             "#EC4899"),
-        ("msv_roc_auc", "msv_roc_auc", "MSV ROC-AUC",        "#14B8A6"),
-        ("macro_f1",    "macro_f1",    "Macro F1",           "#EF4444"),
-        ("composite",   "composite",   "Composite",          "#8B5CF6"),
+        ("sil_mIoU",    "Silhouette\nmIoU",   "#3B82F6"),
+        ("sym_mIoU",    "Symptom\nmIoU",      "#10B981"),
+        ("msv_f1",      "MSV F1",             "#F59E0B"),
+        ("mln_f1",      "MLN F1",             "#EC4899"),
+        ("msv_roc_auc", "MSV ROC-AUC",        "#14B8A6"),
+        ("macro_f1",    "Macro F1",           "#EF4444"),
+        ("composite",   "Composite",          "#8B5CF6"),
     ]
 
-    # Find which columns actually exist
-    available = [(key, col, lbl, clr) for key, col, lbl, clr in metric_map
-                 if col in df.columns]
+    # Resolve each metric to whichever column actually exists: prefer the
+    # test_-prefixed column (current writer), fall back to the bare name
+    # (in case of a hand-edited or differently-produced CSV).
+    available = []
+    for key, lbl, clr in metric_map:
+        for candidate in (f"test_{key}", key):
+            if candidate in df.columns:
+                available.append((key, candidate, lbl, clr))
+                break
+
     if not available:
         print(f"  [SKIP] Stage {stage} comparison — no expected columns found.")
         return
@@ -948,9 +1042,13 @@ def _student_comparison_bar(csv_path: Path, stage: int):
                   else "Mode Ablation (Stage 2, Best Encoder)"
     ax.set_title(f"Student — {title_stage}", color=TEXT_COLOR, fontsize=12, pad=12)
 
-    # Highlight best by composite if column present
-    if "composite" in df.columns:
-        comp_vals = [safe_float(df["composite"].iloc[i]) for i in range(n)]
+    # Highlight best by composite if column present (prefer test_composite,
+    # the current writer's actual column name; fall back to best_composite,
+    # which reflects the val-set score used for checkpoint selection).
+    composite_col = next((c for c in ("test_composite", "composite", "best_composite")
+                          if c in df.columns), None)
+    if composite_col:
+        comp_vals = [safe_float(df[composite_col].iloc[i]) for i in range(n)]
         best_idx  = int(np.argmax(comp_vals))
         ax.axvspan(best_idx - 0.42, best_idx + 0.42, alpha=0.07,
                    color=ACCENT, zorder=1)
@@ -1310,11 +1408,12 @@ def chart_student_metrics_heatmap():
 def chart_severity_scatter():
     """
     Scatter plot: human-rated severity (averaged across two raters) versus
-    HSV-derived severity, one point per rated image, colored by class, with
-    a diagonal reference line (perfect agreement). Previously this section
-    only showed aggregate Cohen's kappa and Spearman rho as numbers —
-    the per-image relationship those numbers summarize was never actually
-    shown as a figure.
+    Factory pseudo-label severity (sourced from the Symptom Teacher via
+    factory_master.py — see evaluate_severity.py), one point per rated
+    image, colored by class, with a diagonal reference line (perfect
+    agreement). Previously this section only showed aggregate Cohen's kappa
+    and Spearman rho as numbers — the per-image relationship those numbers
+    summarize was never actually shown as a figure.
     """
     csv_path = REPORTS_DIR / "severity_analysis.csv"
     if not csv_path.exists():
@@ -1323,7 +1422,7 @@ def chart_severity_scatter():
         return
 
     df = pd.read_csv(csv_path)
-    if df.empty or "human_norm" not in df.columns or "hsv_norm" not in df.columns:
+    if df.empty or "human_norm" not in df.columns or "factory_norm" not in df.columns:
         print(f"  [SKIP] {csv_path.name} missing expected columns.")
         return
 
@@ -1333,7 +1432,7 @@ def chart_severity_scatter():
     classes_present = sorted(df["category"].unique().tolist()) if "category" in df.columns else ["all"]
     for i, cls in enumerate(classes_present):
         cdf = df[df["category"] == cls] if "category" in df.columns else df
-        ax.scatter(cdf["human_norm"], cdf["hsv_norm"], s=35, alpha=0.75,
+        ax.scatter(cdf["human_norm"], cdf["factory_norm"], s=35, alpha=0.75,
                   color=get_color(cls, i), label=cls, zorder=3,
                   edgecolors=BG_COLOR, linewidths=0.4)
 
@@ -1343,8 +1442,8 @@ def chart_severity_scatter():
     ax.set_xlim(-0.02, 1.02)
     ax.set_ylim(-0.02, 1.02)
     ax.set_xlabel("Human-rated severity (normalized, avg of 2 raters)", color=TEXT_COLOR)
-    ax.set_ylabel("HSV-derived severity (normalized)", color=TEXT_COLOR)
-    ax.set_title("Severity Reliability — Human vs. HSV-Derived",
+    ax.set_ylabel("Factory pseudo-label severity (normalized)", color=TEXT_COLOR)
+    ax.set_title("Severity Reliability — Human vs. Factory Pseudo-Label",
                 color=TEXT_COLOR, fontsize=11, pad=12)
     ax.legend(fontsize=8, labelcolor=TEXT_COLOR, facecolor=GRID_COLOR,
              edgecolor="#334155", framealpha=0.3)
@@ -1380,6 +1479,7 @@ def run_symptom():
     chart_healthy_ae_training_curve()
     chart_symptom_training_curves()
     chart_symptom_vs_lab()
+    chart_symptom_vs_student()
 
 
 def run_student():
