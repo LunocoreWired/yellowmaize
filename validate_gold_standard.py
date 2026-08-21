@@ -132,26 +132,64 @@ def load_teacher(variant: str = None) -> nn.Module:
     print(f"  Teacher loaded: {actual_variant}  ({ckpt_path.name})")
     return model
 
-def load_student(encoder_variant: str) -> nn.Module:
+def resolve_best_student() -> tuple[str, str]:
+    """
+    Re-derive the actual Stage 2 winning (encoder, mode) from
+    logs/student_comparison_stage2.csv, the same way evaluate_xai.py does,
+    instead of trusting config.py's STUDENT_BEST_VARIANT/STUDENT_FACTORY_MODE
+    directly. Those config values are only auto-updated by
+    select_best_pipeline.py (Step 11) — if this script is run at Step 10b,
+    BEFORE Step 11, config.py may still hold stale/default values.
+    Falls back to config.py's values if the CSV isn't available yet.
+    """
+    from config import LOGS_DIR
+    stage2_csv = LOGS_DIR / "student_comparison_stage2.csv"
+    if stage2_csv.exists():
+        df = pd.read_csv(stage2_csv)
+        if not df.empty and "best_composite" in df.columns:
+            best_row = df.loc[df["best_composite"].astype(float).idxmax()]
+            return str(best_row["encoder"]), str(best_row["mode"])
+    return STUDENT_BEST_VARIANT, STUDENT_FACTORY_MODE
+
+
+def load_student(encoder_variant: str, mode: str = None) -> nn.Module:
     try:
         from train_student import StudentModel
     except ImportError:
         raise ImportError("Could not import StudentModel from train_student.py.")
-    
+
     use_cbam = "cbam" in encoder_variant
     model = StudentModel(encoder_name=encoder_variant, use_cbam=use_cbam)
 
-    mode = STUDENT_FACTORY_MODE
-    ckpt_path = STUDENT_CKPT_DIR / f"student_{encoder_variant}_{mode}_best.pth"
-    if not ckpt_path.exists():
-        ckpt_path = STUDENT_CKPT_DIR / f"student_{encoder_variant}_mode_b_best.pth"
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Student checkpoint not found for {encoder_variant}.")
+    if mode is None:
+        mode = STUDENT_FACTORY_MODE
+
+    # Checkpoints live under stage1/ or stage2/, never flat in STUDENT_CKPT_DIR
+    # (train_student.py writes BOTH stages into stage-specific subfolders).
+    # mode_b is reused from Stage 1 (same seed => identical run) and was never
+    # re-saved in stage2/, so check stage1/ first for mode_b and stage2/ first
+    # for every other mode — then fall back to the other subfolder just in case.
+    ckpt_filename = f"student_{encoder_variant}_{mode}_best.pth"
+    search_order = ["stage1", "stage2"] if mode == "mode_b" else ["stage2", "stage1"]
+
+    ckpt_path = None
+    for subdir in search_order:
+        candidate = STUDENT_CKPT_DIR / subdir / ckpt_filename
+        if candidate.exists():
+            ckpt_path = candidate
+            break
+
+    if ckpt_path is None:
+        raise FileNotFoundError(
+            f"Student checkpoint not found for {encoder_variant}/{mode}. "
+            f"Checked: {STUDENT_CKPT_DIR / search_order[0] / ckpt_filename}  "
+            f"and: {STUDENT_CKPT_DIR / search_order[1] / ckpt_filename}"
+        )
 
     ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     model.eval().to(DEVICE)
-    print(f"  Student loaded: {encoder_variant}  ({ckpt_path.name})")
+    print(f"  Student loaded: {encoder_variant} / {mode}  ({ckpt_path})")
     return model
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -303,9 +341,12 @@ def main() -> None:
         except FileNotFoundError as e:
             print(f"  [WARN] {e}")
 
-        print(f"\n  Loading Student ({STUDENT_BEST_VARIANT}) ... ")
+        print(f"\n  Loading Student ... ")
         try:
-            student_model = load_student(STUDENT_BEST_VARIANT)
+            best_variant, best_mode = resolve_best_student()
+            print(f"  Resolved best Student from student_comparison_stage2.csv: "
+                  f"{best_variant} / {best_mode}")
+            student_model = load_student(best_variant, best_mode)
         except (FileNotFoundError, ImportError) as e:
             print(f"  [WARN] {e}")
 

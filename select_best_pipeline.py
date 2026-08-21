@@ -263,8 +263,9 @@ def get_tflite_size(variant: str, mode: str) -> float | None:
                 if pd.notna(v):
                     return float(v)
     # Estimate from checkpoint size (~3× for FP16 conversion overhead)
+    # Checkpoints live under stage1/ or stage2/, never flat in STUDENT_CKPT_DIR.
     for ckpt_path in [
-        STUDENT_CKPT_DIR / f"student_{variant}_{mode}_best.pth",
+        STUDENT_CKPT_DIR / "stage2" / f"student_{variant}_{mode}_best.pth",
         STUDENT_CKPT_DIR / "stage1" / f"student_{variant}_{mode}_best.pth",
     ]:
         if ckpt_path.exists():
@@ -417,10 +418,14 @@ def promote_checkpoints(best_bouncer: dict | None,
     if best_student:
         variant = best_student.get("encoder", best_student.get("variant", ""))
         mode    = best_student.get("mode", "mode_b")
-        # Check Stage 2 first, then Stage 1
-        src = STUDENT_CKPT_DIR / f"student_{variant}_{mode}_best.pth"
+        # Checkpoints live under stage1/ or stage2/, never flat in STUDENT_CKPT_DIR.
+        # mode_b is reused from Stage 1 (never re-saved in stage2/), so check
+        # stage1/ first for mode_b and stage2/ first for every other mode.
+        ckpt_filename = f"student_{variant}_{mode}_best.pth"
+        search_order = ["stage1", "stage2"] if mode == "mode_b" else ["stage2", "stage1"]
+        src = STUDENT_CKPT_DIR / search_order[0] / ckpt_filename
         if not src.exists():
-            src = STUDENT_CKPT_DIR / "stage1" / f"student_{variant}_{mode}_best.pth"
+            src = STUDENT_CKPT_DIR / search_order[1] / ckpt_filename
         dest = FINAL_DIR / "student_best.pth"
         if copy_canonical(src, dest, f"Student ({variant}, {mode})"):
             paths["student"] = dest
