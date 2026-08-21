@@ -223,7 +223,25 @@ def draw_human_vs_pred_panel(img_rgb, human_mask, pred_prob, iou, category, stem
 # MSV/MLN classification accuracy, (3) severity % regression accuracy against
 # a human-derived severity % (human symptom pixels / human leaf pixels).
 
-def load_student(encoder_variant: str = STUDENT_BEST_VARIANT):
+def resolve_best_student() -> tuple[str, str]:
+    """
+    Re-derive the actual Stage 2 winning (encoder, mode) from
+    logs/student_comparison_stage2.csv, the same way evaluate_xai.py does,
+    instead of trusting config.py's STUDENT_BEST_VARIANT/STUDENT_FACTORY_MODE
+    directly (those are only auto-updated by select_best_pipeline.py).
+    Falls back to config.py's values if the CSV isn't available yet.
+    """
+    from config import LOGS_DIR
+    stage2_csv = LOGS_DIR / "student_comparison_stage2.csv"
+    if stage2_csv.exists():
+        df = pd.read_csv(stage2_csv)
+        if not df.empty and "best_composite" in df.columns:
+            best_row = df.loc[df["best_composite"].astype(float).idxmax()]
+            return str(best_row["encoder"]), str(best_row["mode"])
+    return STUDENT_BEST_VARIANT, STUDENT_FACTORY_MODE
+
+
+def load_student(encoder_variant: str = STUDENT_BEST_VARIANT, mode: str = None):
     """
     Mirrors validate_gold_standard.py's load_student() exactly, so behavior
     (checkpoint resolution, CBAM detection) matches that script.
@@ -236,17 +254,34 @@ def load_student(encoder_variant: str = STUDENT_BEST_VARIANT):
     use_cbam = "cbam" in encoder_variant
     model = StudentModel(encoder_name=encoder_variant, use_cbam=use_cbam)
 
-    mode = STUDENT_FACTORY_MODE
-    ckpt_path = STUDENT_CKPT_DIR / f"student_{encoder_variant}_{mode}_best.pth"
-    if not ckpt_path.exists():
-        ckpt_path = STUDENT_CKPT_DIR / f"student_{encoder_variant}_mode_b_best.pth"
-    if not ckpt_path.exists():
-        raise FileNotFoundError(f"Student checkpoint not found for {encoder_variant}.")
+    if mode is None:
+        mode = STUDENT_FACTORY_MODE
+
+    # Checkpoints live under stage1/ or stage2/, never flat in STUDENT_CKPT_DIR
+    # (train_student.py writes BOTH stages into stage-specific subfolders).
+    # mode_b is reused from Stage 1 (never re-saved in stage2/), so check
+    # stage1/ first for mode_b and stage2/ first for every other mode.
+    ckpt_filename = f"student_{encoder_variant}_{mode}_best.pth"
+    search_order = ["stage1", "stage2"] if mode == "mode_b" else ["stage2", "stage1"]
+
+    ckpt_path = None
+    for subdir in search_order:
+        candidate = STUDENT_CKPT_DIR / subdir / ckpt_filename
+        if candidate.exists():
+            ckpt_path = candidate
+            break
+
+    if ckpt_path is None:
+        raise FileNotFoundError(
+            f"Student checkpoint not found for {encoder_variant}/{mode}. "
+            f"Checked: {STUDENT_CKPT_DIR / search_order[0] / ckpt_filename}  "
+            f"and: {STUDENT_CKPT_DIR / search_order[1] / ckpt_filename}"
+        )
 
     ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
     model.load_state_dict(ckpt["model_state"])
     model.eval().to(DEVICE)
-    print(f"  Student loaded: {encoder_variant}  ({ckpt_path.name})")
+    print(f"  Student loaded: {encoder_variant} / {mode}  ({ckpt_path})")
     return model
 
 
@@ -413,8 +448,11 @@ def main() -> None:
                         help="Skip Figure 4.18 and Table 4.13 (LAB comparison)")
     parser.add_argument("--skip-student", action="store_true",
                         help="Skip Figure 4.19 and Table 4.14 (Student comparison)")
-    parser.add_argument("--student-variant", type=str, default=STUDENT_BEST_VARIANT,
-                        help="Student encoder variant to load (default: STUDENT_BEST_VARIANT)")
+    parser.add_argument("--student-variant", type=str, default=None,
+                        help="Student encoder variant to load "
+                             "(default: auto-resolved from "
+                             "logs/student_comparison_stage2.csv, "
+                             "falling back to STUDENT_BEST_VARIANT)")
     args = parser.parse_args()
 
     random.seed(SEED)
@@ -459,7 +497,14 @@ def main() -> None:
     leaf_masks_for_severity = {}
     if not args.skip_student:
         try:
-            student_model = load_student(args.student_variant)
+            resolved_variant, resolved_mode = resolve_best_student()
+            variant = args.student_variant or resolved_variant
+            # If the user explicitly picked a different variant than the
+            # resolved one, we can't assume the resolved mode still applies —
+            # fall back to STUDENT_FACTORY_MODE in that case.
+            mode = resolved_mode if variant == resolved_variant else STUDENT_FACTORY_MODE
+            print(f"  Resolved Student: {variant} / {mode}")
+            student_model = load_student(variant, mode)
             leaf_masks_for_severity = _load_leaf_masks(Path(SYMPTOM_ANNOTATION_FILE), records)
         except (FileNotFoundError, ImportError) as e:
             print(f"  [WARN] Could not load Student ({e}) — "
